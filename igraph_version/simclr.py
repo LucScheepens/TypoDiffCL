@@ -4,6 +4,7 @@ import torch
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
+import time
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -117,11 +118,7 @@ def nt_xent_loss(z1, z2, temperature=0.5):
     return loss.mean()
 
 
-import time
-import os
-import random
-import torch
-from torch_geometric.data import Batch
+
 
 
 def train_simclr_fast(

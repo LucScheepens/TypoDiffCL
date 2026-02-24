@@ -139,12 +139,12 @@ def extract_laundering_networks_igraph(
 
         seen_laundering_nodes.update(core_nodes)
 
-        print(
-            f"Laundering network from {start_node}: "
-            f"{len(component_nodes)} nodes, "
-            f"{len(transactions)} transactions, "
-            f"{len(collapsed_nodes)} collapsed hubs"
-        )
+        # print(
+        #     f"Laundering network from {start_node}: "
+        #     f"{len(component_nodes)} nodes, "
+        #     f"{len(transactions)} transactions, "
+        #     f"{len(collapsed_nodes)} collapsed hubs"
+        # )
 
         if len(networks) >= max_networks:
             break
@@ -255,12 +255,12 @@ def extract_non_laundering_networks_igraph(
         networks.append(network)
         used_nodes.update(component_nodes)
 
-        print(
-            f"Non-laundering network from {start_node}: "
-            f"{len(component_nodes)} nodes, "
-            f"{len(transactions)} transactions, "
-            f"{len(collapsed_nodes)} collapsed hubs"
-        )
+        # print(
+        #     f"Non-laundering network from {start_node}: "
+        #     f"{len(component_nodes)} nodes, "
+        #     f"{len(transactions)} transactions, "
+        #     f"{len(collapsed_nodes)} collapsed hubs"
+        # )
 
         if len(networks) >= max_networks:
             break
