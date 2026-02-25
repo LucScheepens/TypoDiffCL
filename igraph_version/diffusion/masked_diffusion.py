@@ -397,7 +397,7 @@ class GaussianDiffusion:
             model_kwargs = {}
 
         node_mask = model_kwargs.get("node_mask", None)
-
+        print("node_mask in training_losses:", node_mask)
 
         if noise is None:
             noise = th.randn_like(x_start)

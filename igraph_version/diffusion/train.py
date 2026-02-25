@@ -123,10 +123,8 @@ for epoch in range(EPOCHS):
         adj = adj.to(DEVICE, non_blocking=True)
         node_mask = node_mask.to(DEVICE, non_blocking=True)
 
-
         # Mask adj
         adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
-
 
         B = x.shape[0]
 
