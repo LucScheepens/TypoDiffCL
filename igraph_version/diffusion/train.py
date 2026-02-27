@@ -23,7 +23,7 @@ scaler = GradScaler()
 # Config
 # ----------------------------------
 
-BATCH_SIZE = 32          # you can increase now
+BATCH_SIZE = 32
 LR = 2e-4
 EPOCHS = 50
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -31,6 +31,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NODE_DIM = 3
 HIDDEN = 128
 TIMESTEPS = 1000
+MAX_NODES = 300          # drop graphs larger than this to avoid O(N²) adj blow-up
 
 
 # ----------------------------------
@@ -61,7 +62,7 @@ if "cached_dataset.pt" not in os.listdir():
     
     preprocess(networks)
 
-dataset = CachedDataset("cached_dataset.pt")
+dataset = CachedDataset("cached_dataset.pt", max_nodes=MAX_NODES)
 
 
 loader = DataLoader(

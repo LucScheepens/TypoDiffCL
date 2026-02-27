@@ -74,9 +74,16 @@ from torch.utils.data import Dataset
 
 class CachedDataset(Dataset):
 
-    def __init__(self, path):
+    def __init__(self, path, max_nodes=None):
 
-        self.data = torch.load(path)
+        data = torch.load(path)
+
+        if max_nodes is not None:
+            before = len(data)
+            data = [(x, adj) for x, adj in data if x.shape[0] <= max_nodes]
+            print(f"Filtered dataset: {before} → {len(data)} graphs (max_nodes={max_nodes})")
+
+        self.data = data
 
 
     def __len__(self):
