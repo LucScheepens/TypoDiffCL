@@ -46,7 +46,8 @@ def extract_laundering_networks_igraph(
     df,
     max_depth=5,
     max_networks=10,
-    collapse_threshold=10
+    collapse_threshold=10,
+    max_nodes = None
 ):
     """
     Extract laundering-centered networks with surrounding non-laundering nodes
@@ -90,7 +91,7 @@ def extract_laundering_networks_igraph(
 
         queue = deque((v, 0) for v in core_nodes)
 
-        while queue:
+        while queue and (max_nodes is None or len(visited) < max_nodes):
             node, depth = queue.popleft()
 
             if node in visited:
@@ -162,7 +163,8 @@ def extract_non_laundering_networks_igraph(
     max_networks=10,
     collapse_threshold=10,
     min_size=10,
-    random_seed=42
+    random_seed=42,
+    max_nodes = None
 ):
     """
     Extract non-laundering networks that contain NO laundering nodes.
@@ -203,7 +205,7 @@ def extract_non_laundering_networks_igraph(
         collapsed_nodes = set()
         queue = deque([(start_node, 0)])
 
-        while queue:
+        while queue and (max_nodes is None or len(visited) < max_nodes):
             node, depth = queue.popleft()
 
             if node in visited:

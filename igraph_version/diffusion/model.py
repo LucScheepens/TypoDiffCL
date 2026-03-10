@@ -94,10 +94,12 @@ class GNNBlock(nn.Module):
         self.conv1 = MaskedGraphConv(dim, dim)
         self.conv2 = MaskedGraphConv(dim, dim)
 
-        self.time_proj = nn.Linear(time_dim, dim)
+        # AdaLN: project time to scale+shift for each of the 2 norms
+        self.time_proj = nn.Linear(time_dim, dim * 4)
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        # elementwise_affine=False — AdaLN supplies the affine transform
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
 
 
     def forward(self, x, adj, t_emb, node_mask):
@@ -107,17 +109,16 @@ class GNNBlock(nn.Module):
         t_emb : [B, T]
         """
 
+        # AdaLN scale + shift for norm1 and norm2
+        t = self.time_proj(t_emb)               # [B, 4*dim]
+        s1, b1, s2, b2 = t.chunk(4, dim=-1)     # each [B, dim]
+
         h = self.conv1(x, adj, node_mask)
-
-        # Add time embedding
-        h = h + self.time_proj(t_emb)[:, None, :]
-
-        h = self.norm1(h)
+        h = self.norm1(h) * (1 + s1[:, None, :]) + b1[:, None, :]
         h = F.silu(h)
 
         h = self.conv2(h, adj, node_mask)
-
-        h = self.norm2(h)
+        h = self.norm2(h) * (1 + s2[:, None, :]) + b2[:, None, :]
         h = F.silu(h)
 
         return x + h
@@ -169,14 +170,22 @@ class DiffusionGNN(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, node_dim)
 
+        # Adjacency prediction: inner-product decoder on projected node embeddings
+        self.adj_proj = nn.Linear(hidden_dim, hidden_dim)
+
 
     def forward(self, x, t, adj=None, node_mask=None):
 
         """
         x         : [B, N, F]
         t         : [B]
-        adj       : [B, N, N]
+        adj       : [B, N, N]  — noisy adj used for message passing
         node_mask : [B, N]
+
+        Returns
+        -------
+        out      : [B, N, F]   predicted noise / x_start per node feature
+        adj_pred : [B, N, N]   predicted clean adjacency (sigmoid, symmetric)
         """
 
         if node_mask is not None:
@@ -198,12 +207,21 @@ class DiffusionGNN(nn.Module):
             h = block(h, adj, t_emb, node_mask)
 
 
-        # Predict noise
+        # Predict node features (noise or x_start depending on mode)
         out = self.output_proj(h)
-
 
         if node_mask is not None:
             out = out * node_mask.unsqueeze(-1)
 
 
-        return out
+        # Predict adjacency via inner-product decoder
+        h_adj = self.adj_proj(h)                                        # [B, N, H]
+        adj_logits = torch.bmm(h_adj, h_adj.transpose(1, 2))           # [B, N, N]
+        adj_pred = torch.sigmoid(adj_logits)
+        adj_pred = (adj_pred + adj_pred.transpose(1, 2)) / 2           # enforce symmetry
+
+        if node_mask is not None:
+            adj_pred = adj_pred * node_mask[:, :, None] * node_mask[:, None, :]
+
+
+        return out, adj_pred

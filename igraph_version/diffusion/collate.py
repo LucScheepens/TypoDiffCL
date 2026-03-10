@@ -1,6 +1,6 @@
 import torch
 
-def collate_fn(batch):
+def collate_fn(batch, hard_max_nodes=None):
 
     xs, adjs = zip(*batch)
 
@@ -8,6 +8,8 @@ def collate_fn(batch):
     F = xs[0].shape[1]
 
     max_nodes = max(x.shape[0] for x in xs)
+    if hard_max_nodes is not None:
+        max_nodes = min(max_nodes, hard_max_nodes)
 
     x_pad = torch.zeros(B, max_nodes, F)
     adj_pad = torch.zeros(B, max_nodes, max_nodes)

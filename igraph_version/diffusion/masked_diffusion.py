@@ -169,7 +169,7 @@ class GaussianDiffusion:
 
     # Forward Diffusion (Masked)
 
-    def q_sample(self, x_start, t, noise=None, node_mask=None):
+    def q_sample(self, x_start, t, noise=None, node_mask=None, adj_start=None):
 
         if noise is None:
             noise = th.randn_like(x_start)
@@ -181,15 +181,44 @@ class GaussianDiffusion:
             x_start = x_start * mask
             noise = noise * mask
 
-        return (
+        # Gaussian forward process for continuous features (indices 1+)
+        x_t_cont = (
             _extract_into_tensor(
-                self.sqrt_alphas_cumprod, t, x_start.shape
-            ) * x_start
+                self.sqrt_alphas_cumprod, t, x_start[..., 1:].shape
+            ) * x_start[..., 1:]
             +
             _extract_into_tensor(
-                self.sqrt_one_minus_alphas_cumprod, t, x_start.shape
-            ) * noise
+                self.sqrt_one_minus_alphas_cumprod, t, x_start[..., 1:].shape
+            ) * noise[..., 1:]
         )
+
+        # Bernoulli forward process for binary laundering feature (index 0):
+        # with probability alpha_bar_t keep the original bit, else draw uniform {0,1}
+        keep_prob = _extract_into_tensor(
+            self.alphas_cumprod, t, x_start[..., 0:1].shape
+        ).clamp(0.0, 1.0)
+        keep     = th.bernoulli(keep_prob)
+        rand_bit = th.bernoulli(th.full_like(x_start[..., 0:1], 0.5))
+        x_t_bin  = keep * x_start[..., 0:1] + (1 - keep) * rand_bit
+
+        x_t = th.cat([x_t_bin, x_t_cont], dim=-1)
+
+        if adj_start is None:
+            return x_t
+
+        # Bernoulli forward process for adjacency (binary edges)
+        keep_prob_adj = _extract_into_tensor(
+            self.alphas_cumprod, t, adj_start.shape
+        ).clamp(0.0, 1.0)
+        keep_adj = th.bernoulli(keep_prob_adj)
+        rand_adj  = th.bernoulli(th.full_like(adj_start, 0.5))
+        adj_t = keep_adj * adj_start + (1 - keep_adj) * rand_adj
+        adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2          # keep symmetric
+
+        if node_mask is not None:
+            adj_t = adj_t * node_mask[:, :, None] * node_mask[:, None, :]
+
+        return x_t, adj_t
 
 
     # Reverse Prediction
@@ -232,7 +261,7 @@ class GaussianDiffusion:
         if node_mask is not None:
             x = x * node_mask.unsqueeze(-1)
 
-        model_output = model(
+        model_output_x, adj_pred = model(
             x,
             self._scale_timesteps(t),
             **model_kwargs
@@ -240,20 +269,27 @@ class GaussianDiffusion:
 
         if self.model_mean_type == ModelMeanType.EPSILON:
 
-            pred_xstart = self._predict_xstart_from_eps(
-                x, t, model_output
+            # Feature 0: model predicts x_start directly (binary, clamp to [0,1])
+            pred_xstart_bin  = model_output_x[..., 0:1].clamp(0.0, 1.0)
+            # Features 1+: model predicts epsilon, recover x_start via standard formula
+            pred_xstart_cont = self._predict_xstart_from_eps(
+                x[..., 1:], t, model_output_x[..., 1:]
             )
+            pred_xstart = th.cat([pred_xstart_bin, pred_xstart_cont], dim=-1)
 
         elif self.model_mean_type == ModelMeanType.START_X:
 
-            pred_xstart = model_output
+            pred_xstart = model_output_x
 
         else:
             raise NotImplementedError()
 
 
         if clip_denoised:
-            pred_xstart = pred_xstart.clamp(-1, 1)
+            pred_xstart = th.cat([
+                pred_xstart[..., 0:1].clamp(0.0, 1.0),
+                pred_xstart[..., 1:],
+            ], dim=-1)
 
 
         if node_mask is not None:
@@ -285,6 +321,7 @@ class GaussianDiffusion:
             "variance": model_variance,
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
+            "adj_pred": adj_pred,
         }
 
 
@@ -337,9 +374,21 @@ class GaussianDiffusion:
             sample = sample * mask
 
 
+        # Adjacency reverse step: predict-x0-and-resample (Bernoulli)
+        adj_pred = out["adj_pred"]
+        nonzero_adj = (t != 0).float().view(-1, 1, 1)
+        adj_stoch   = th.bernoulli(adj_pred.clamp(0.0, 1.0))
+        adj_determ  = (adj_pred > 0.5).float()
+        adj_sample  = th.where(nonzero_adj.bool(), adj_stoch, adj_determ)
+        adj_sample  = (adj_sample + adj_sample.transpose(-1, -2)) / 2  # symmetric
+
+        if node_mask is not None:
+            adj_sample = adj_sample * node_mask[:, :, None] * node_mask[:, None, :]
+
         return {
             "sample": sample,
             "pred_xstart": out["pred_xstart"],
+            "adj_sample": adj_sample,
         }
 
 
@@ -351,9 +400,15 @@ class GaussianDiffusion:
         self,
         model,
         shape,
+        adj_shape=None,
         model_kwargs=None,
         device=None,
     ):
+        """
+        shape     : (B, N, F) for node features
+        adj_shape : (B, N, N) — pass this to generate the adjacency from noise.
+                    If None, adj must be supplied in model_kwargs (old behaviour).
+        """
 
         if device is None:
             device = next(model.parameters()).device
@@ -363,6 +418,15 @@ class GaussianDiffusion:
 
         x = th.randn(*shape, device=device)
 
+        # Initialise adjacency from Bernoulli(0.5) when generating graphs
+        adj = None
+        if adj_shape is not None:
+            adj = th.bernoulli(th.full(adj_shape, 0.5, device=device))
+            adj = (adj + adj.transpose(-1, -2)) / 2
+            node_mask = model_kwargs.get("node_mask")
+            if node_mask is not None:
+                adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
+
         for i in reversed(range(self.num_timesteps)):
 
             t = th.tensor(
@@ -370,17 +434,25 @@ class GaussianDiffusion:
                 device=device
             )
 
+            current_kwargs = {**model_kwargs}
+            if adj is not None:
+                current_kwargs["adj"] = adj
+
             with th.no_grad():
 
                 out = self.p_sample(
                     model,
                     x,
                     t,
-                    model_kwargs=model_kwargs,
+                    model_kwargs=current_kwargs,
                 )
 
                 x = out["sample"]
+                if adj is not None:
+                    adj = out["adj_sample"]
 
+        if adj is not None:
+            return x, adj
         return x
 
 
@@ -391,6 +463,10 @@ class GaussianDiffusion:
         t,
         model_kwargs=None,
         noise=None,
+        adj_start=None,
+        adj_loss_weight=0.5,
+        deg_loss_weight=0.1,
+        laund_loss_weight=1.0,
     ):
 
         if model_kwargs is None:
@@ -401,25 +477,28 @@ class GaussianDiffusion:
         if noise is None:
             noise = th.randn_like(x_start)
 
+        # Corrupt node features (and adj when provided)
+        if adj_start is not None:
+            x_t, adj_t = self.q_sample(
+                x_start, t, noise=noise, node_mask=node_mask, adj_start=adj_start
+            )
+            # Pass noisy adj to the model for message passing
+            training_kwargs = {**model_kwargs, "adj": adj_t}
+        else:
+            x_t = self.q_sample(x_start, t, noise=noise, node_mask=node_mask)
+            training_kwargs = model_kwargs
 
-        x_t = self.q_sample(
-            x_start,
-            t,
-            noise=noise,
-            node_mask=node_mask,
-        )
-
-
-        model_output = model(
+        model_output_x, adj_pred = model(
             x_t,
             self._scale_timesteps(t),
-            **model_kwargs
+            **training_kwargs
         )
-
 
         if self.model_mean_type == ModelMeanType.EPSILON:
 
-            target = noise
+            # Feature 0 (laundering): model predicts x_start directly (binary recovery)
+            # Features 1+ (continuous): model predicts epsilon (Gaussian denoising)
+            target = th.cat([x_start[..., 0:1], noise[..., 1:]], dim=-1)
 
         elif self.model_mean_type == ModelMeanType.START_X:
 
@@ -429,24 +508,93 @@ class GaussianDiffusion:
             raise NotImplementedError()
 
 
-        mse = (target - model_output) ** 2
-
+        # --- Feature 0 (laundering label): weighted BCE with logits ---
+        # MSE on a binary feature with class imbalance causes the model to
+        # predict ~0 for all nodes. Weighted BCE forces it to learn the rare class.
+        laund_logits = model_output_x[..., 0]   # [B, N] — treated as logit
+        laund_true   = x_start[..., 0]          # [B, N] — binary {0, 1}
 
         if node_mask is not None:
+            n_nodes = node_mask.sum(dim=-1).clamp(min=1)              # [B]
+            n_pos   = (laund_true * node_mask).sum(dim=-1).clamp(min=1)
+        else:
+            n_nodes = th.tensor(float(laund_true.shape[-1]), device=laund_true.device).expand(laund_true.shape[0])
+            n_pos   = laund_true.sum(dim=-1).clamp(min=1)
 
+        n_neg       = (n_nodes - n_pos).clamp(min=1)
+        pos_w_laund = (n_neg / n_pos).clamp(1.0, 50.0)               # [B]
+
+        eps = 1e-6
+        laund_prob = th.sigmoid(laund_logits).clamp(eps, 1.0 - eps)
+        laund_bce  = -(
+            pos_w_laund[:, None] * laund_true   * th.log(laund_prob)
+            + (1.0 - laund_true) * th.log(1.0 - laund_prob)
+        )                                                              # [B, N]
+
+        if node_mask is not None:
+            laund_loss = (laund_bce * node_mask).sum(dim=-1) / n_nodes
+        else:
+            laund_loss = laund_bce.mean(dim=-1)
+
+        # --- Features 1+ (continuous): MSE on epsilon / x_start ---
+        mse_cont = (target[..., 1:] - model_output_x[..., 1:]) ** 2  # [B, N, F-1]
+
+        if node_mask is not None:
             mask = node_mask.unsqueeze(-1)
+            cont_loss = (
+                (mse_cont * mask).sum(dim=[1, 2])
+                / mask.sum(dim=[1, 2]).clamp(min=1)
+            )
+        else:
+            cont_loss = mse_cont.mean(dim=[1, 2])
 
-            mse = mse * mask
+        loss = cont_loss + laund_loss_weight * laund_loss
 
-            loss = (
-                mse.sum(dim=[1, 2])
-                /
-                mask.sum(dim=[1, 2]).clamp(min=1)
+
+        # Adjacency reconstruction: weighted BCE (handles sparsity imbalance)
+        if adj_start is not None:
+            if node_mask is not None:
+                mask2d = node_mask[:, :, None] * node_mask[:, None, :]
+                n_valid = mask2d.sum(dim=[1, 2]).clamp(min=1)
+                n_pos   = (adj_start * mask2d).sum(dim=[1, 2]).clamp(min=1)
+            else:
+                n_valid = th.tensor(
+                    float(adj_start.shape[-1] ** 2), device=adj_start.device
+                ).expand(adj_start.shape[0])
+                n_pos = adj_start.sum(dim=[1, 2]).clamp(min=1)
+
+            # pos_weight: upweight positive (edge) class to counter sparsity
+            pos_w = ((n_valid - n_pos) / n_pos).clamp(1.0, 50.0)  # [B]
+
+            eps = 1e-6
+            adj_pred_c = adj_pred.clamp(eps, 1.0 - eps)
+            bce = -(
+                pos_w[:, None, None] * adj_start * th.log(adj_pred_c)
+                + (1.0 - adj_start) * th.log(1.0 - adj_pred_c)
             )
 
-        else:
+            if node_mask is not None:
+                adj_loss = (bce * mask2d).sum(dim=[1, 2]) / n_valid
+            else:
+                adj_loss = bce.mean(dim=[1, 2])
 
-            loss = mean_flat(mse)
+            loss = loss + adj_loss_weight * adj_loss
+
+            # Degree distribution matching: soft degree of adj_pred vs adj_start
+            # Penalises wrong per-node degree, capturing local graph topology
+            deg_pred = adj_pred.sum(dim=-1)   # [B, N]
+            deg_true = adj_start.sum(dim=-1)  # [B, N]
+            deg_mse  = (deg_pred - deg_true) ** 2
+
+            if node_mask is not None:
+                deg_loss = (
+                    (deg_mse * node_mask).sum(dim=-1)
+                    / node_mask.sum(dim=-1).clamp(min=1)
+                )
+            else:
+                deg_loss = deg_mse.mean(dim=-1)
+
+            loss = loss + deg_loss_weight * deg_loss
 
 
         return {
