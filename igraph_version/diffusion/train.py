@@ -32,10 +32,10 @@ EPOCHS        = 300
 WARMUP_EPOCHS = 15
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
-NODE_DIM      = 6
+NODE_DIM      = 7
 HIDDEN        = 128
 TIMESTEPS     = 500
-MAX_NODES     = 150
+MAX_NODES     = 300
 ADJ_LOSS_W    = 0.3
 DEG_LOSS_W    = 0.1
 LAUND_LOSS_W  = 2.0    # upweight laundering BCE — rare class needs stronger signal
@@ -73,7 +73,7 @@ if __name__ == "__main__":
     # -- Dataset -------------------------------------------------------------
 
     if _needs_rebuild():
-        CSV_PATH = str(BASE_DIR.parents[2] / "data" / "IBM" / "Hi-Small_Trans.csv")
+        CSV_PATH = str(BASE_DIR.parents[2] / 'grad' / "data" / "IBM" / "Hi-Small_Trans.csv")
         df_full  = preprocess_df(CSV_PATH)
         print(f"Loaded {len(df_full)} rows  [{time.time()-start_time:.1f}s]")
 

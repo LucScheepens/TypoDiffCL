@@ -172,6 +172,7 @@ class DiffusionGNN(nn.Module):
 
         # Adjacency prediction: inner-product decoder on projected node embeddings
         self.adj_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.adj_norm = nn.LayerNorm(hidden_dim)
 
 
     def forward(self, x, t, adj=None, node_mask=None):
@@ -214,9 +215,11 @@ class DiffusionGNN(nn.Module):
             out = out * node_mask.unsqueeze(-1)
 
 
-        # Predict adjacency via inner-product decoder
-        h_adj = self.adj_proj(h)                                        # [B, N, H]
-        adj_logits = torch.bmm(h_adj, h_adj.transpose(1, 2))           # [B, N, N]
+        # Predict adjacency via scaled inner-product decoder
+        # LayerNorm bounds vector norms to ~sqrt(hidden_dim) regardless of activation growth
+        h_adj = self.adj_norm(self.adj_proj(h))                         # [B, N, H]
+        scale = math.sqrt(h_adj.shape[-1])
+        adj_logits = torch.bmm(h_adj, h_adj.transpose(1, 2)) / scale   # [B, N, N]
         adj_pred = torch.sigmoid(adj_logits)
         adj_pred = (adj_pred + adj_pred.transpose(1, 2)) / 2           # enforce symmetry
 

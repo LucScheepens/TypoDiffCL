@@ -581,9 +581,13 @@ class GaussianDiffusion:
             loss = loss + adj_loss_weight * adj_loss
 
             # Degree distribution matching: soft degree of adj_pred vs adj_start
-            # Penalises wrong per-node degree, capturing local graph topology
-            deg_pred = adj_pred.sum(dim=-1)   # [B, N]
-            deg_true = adj_start.sum(dim=-1)  # [B, N]
+            # Normalise by n_nodes so loss is in [0, 1] instead of [0, N²]
+            if node_mask is not None:
+                n_nodes_float = node_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # [B, 1]
+            else:
+                n_nodes_float = float(adj_pred.shape[-1])
+            deg_pred = adj_pred.sum(dim=-1) / n_nodes_float   # fractional degree [B, N]
+            deg_true = adj_start.sum(dim=-1) / n_nodes_float  # fractional degree [B, N]
             deg_mse  = (deg_pred - deg_true) ** 2
 
             if node_mask is not None:

@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 
-FEATURE_NAMES = ["Laundering", "Degree", "Depth", "Betweenness", "Clustering", "PageRank"]
+FEATURE_NAMES = ["Laundering", "Degree", "Depth", "Betweenness", "Clustering", "PageRank", "Assortativity"]
 
 
 # ---------------------------------------------------------------------------

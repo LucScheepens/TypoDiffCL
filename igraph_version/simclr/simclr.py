@@ -1,6 +1,12 @@
 import os
+import sys
 import random
 import torch
+
+# Make the diffusion package importable from the sibling directory
+_DIFF_DIR = Path(__file__).resolve().parent.parent / "diffusion"
+
+from pathlib import Path
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
@@ -10,6 +16,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from augmentation import augment_network_view_fast, build_igraph_from_transactions
+from diffusion.diff_util import network_to_dense
+
+
+if str(_DIFF_DIR) not in sys.path:
+    sys.path.insert(0, str(_DIFF_DIR))
 
 def prepare_networks(networks, full_df):
     full_graph = build_igraph_from_transactions(full_df)
@@ -121,6 +132,81 @@ def nt_xent_loss(z1, z2, temperature=0.5):
 
 
 
+def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
+                    max_nodes=300, t_frac=0.3, device="cpu"):
+    """
+    Generate one augmented view via the diffusion model.
+
+    Strategy: forward-noise the graph to timestep t, then run a single
+    model forward pass to recover x_0 and adj_pred.  This is O(1) inference
+    (no iterative denoising loop) so it adds negligible overhead to SimCLR.
+
+    Returns a PyG Data object with 3 node features compatible with GraphEncoder:
+        [degree, degree, laundering_probability]
+    """
+
+    x, adj = network_to_dense(network)
+    n = x.shape[0]
+
+    if n > max_nodes:
+        # Graph too large for the diffusion model — fall back silently
+        return None
+
+    # Pad to max_nodes and build node mask
+    x_pad    = torch.zeros(1, max_nodes, 7)
+    adj_pad  = torch.zeros(1, max_nodes, max_nodes)
+    mask     = torch.zeros(1, max_nodes)
+    x_pad[0, :n]       = x
+    adj_pad[0, :n, :n] = adj
+    mask[0, :n]        = 1.0
+
+    # Normalise continuous features (match train.py)
+    x_norm = x_pad.clone()
+    x_norm[:, :, 1:] = (x_pad[:, :, 1:] - x_mean[1:]) / x_std[1:]
+    x_norm = x_norm * mask.unsqueeze(-1)
+    adj_pad = adj_pad * mask[:, :, None] * mask[:, None, :]
+
+    x_norm  = x_norm.to(device)
+    adj_pad = adj_pad.to(device)
+    mask    = mask.to(device)
+
+    # Choose noise level
+    t_abs = max(1, int(t_frac * diffusion.num_timesteps))
+    t     = torch.tensor([t_abs], device=device)
+
+    # Forward diffusion: corrupt features and adjacency
+    x_t, adj_t = diffusion.q_sample(x_norm, t, node_mask=mask, adj_start=adj_pad)
+
+    # Single-step denoising: one forward pass to predict x_0 and adj
+    was_training = diffusion_model.training
+    diffusion_model.eval()
+    with torch.no_grad():
+        eps_pred, adj_pred = diffusion_model(
+            x_t, diffusion._scale_timesteps(t),
+            adj=adj_t, node_mask=mask,
+        )
+        # Recover x_0 for continuous features from predicted epsilon
+        x0_cont = diffusion._predict_xstart_from_eps(x_t[..., 1:], t, eps_pred[..., 1:])
+        # Binary laundering feature: model predicts x_start directly
+        x0_bin  = eps_pred[..., 0:1].clamp(0.0, 1.0)
+    if was_training:
+        diffusion_model.train()
+
+    # Extract valid-node slice
+    x0_node  = torch.cat([x0_bin, x0_cont], dim=-1)[0, :n]   # [n, 7]
+    adj_node = adj_pred[0, :n, :n]                             # [n, n], values in [0,1]
+
+    # Build PyG-compatible node features: (degree, degree, laundering_prob)
+    deg   = adj_node.sum(dim=-1)           # soft degree [n]
+    laund = x0_node[:, 0]                  # laundering probability [n]
+    x_pyg = torch.stack([deg, deg, laund], dim=-1)  # [n, 3]
+
+    # Build edge_index from thresholded adjacency
+    edge_index = (adj_node > 0.5).nonzero(as_tuple=False).T.contiguous()  # [2, E]
+
+    return Data(x=x_pyg.cpu(), edge_index=edge_index.cpu())
+
+
 def train_simclr_fast(
     networks,
     full_df,
@@ -131,7 +217,14 @@ def train_simclr_fast(
     batch_size=8,
     epochs=50,
     checkpoint_dir="model_checkpoints",
-    checkpoint_interval=10
+    checkpoint_interval=10,
+    diffusion_model=None,
+    diffusion=None,
+    x_mean=None,
+    x_std=None,
+    p_diffusion=0.3,
+    diffusion_t_frac=0.3,
+    max_nodes=300,
 ):
     encoder.train()
     projector.train()
@@ -164,13 +257,30 @@ def train_simclr_fast(
 
             batch = networks[i:i + batch_size]
 
+            use_diffusion = (
+                diffusion_model is not None
+                and diffusion is not None
+                and x_mean is not None
+                and x_std is not None
+            )
+
             views1 = []
             views2 = []
             for net in batch:
                 v1 = augment_network_view_fast(net, full_graph)
-                v2 = augment_network_view_fast(net, full_graph)
-
                 views1.append(network_to_pyg_data_fast(v1))
+
+                # View 2: use diffusion augmentation with probability p_diffusion
+                if use_diffusion and random.random() < p_diffusion:
+                    diff_view = _diffusion_view(
+                        net, diffusion_model, diffusion,
+                        x_mean, x_std, max_nodes, diffusion_t_frac, device,
+                    )
+                    if diff_view is not None:
+                        views2.append(diff_view)
+                        continue
+                # Fall back to standard structural augmentation
+                v2 = augment_network_view_fast(net, full_graph)
                 views2.append(network_to_pyg_data_fast(v2))
 
             data1 = Batch.from_data_list(views1).to(device)
