@@ -5,3 +5,5 @@ networkx==2.6.3
 scipy==1.7.3
 torch==1.12.1+cu113
 dgl-cu113==0.8.1
+igraph==0.9.8
+torchvision

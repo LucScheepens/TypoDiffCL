@@ -2,11 +2,19 @@ import os
 import sys
 import random
 import torch
+from pathlib import Path
+
 
 # Make the diffusion package importable from the sibling directory
 _DIFF_DIR = Path(__file__).resolve().parent.parent / "diffusion"
 
-from pathlib import Path
+if str(_DIFF_DIR) not in sys.path:
+    sys.path.insert(0, str(_DIFF_DIR))
+
+
+BASE_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BASE_DIR.parent)) 
+
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, global_mean_pool
@@ -19,8 +27,7 @@ from augmentation import augment_network_view_fast, build_igraph_from_transactio
 from diffusion.diff_util import network_to_dense
 
 
-if str(_DIFF_DIR) not in sys.path:
-    sys.path.insert(0, str(_DIFF_DIR))
+
 
 def prepare_networks(networks, full_df):
     full_graph = build_igraph_from_transactions(full_df)

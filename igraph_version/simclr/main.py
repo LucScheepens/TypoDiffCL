@@ -49,7 +49,7 @@ def load_diffusion(device):
 
 
 if __name__ == "__main__":
-    CSV_PATH = BASE_DIR.parents[2] / "data" / "IBM" / "Hi-Small_Trans.csv"
+    CSV_PATH = BASE_DIR.parents[1] / "data" / "IBM" / "Hi-Small_Trans.csv"
     df_full  = preprocess_df(str(CSV_PATH))
 
     with_laund_networks = extract_laundering_networks_igraph(
