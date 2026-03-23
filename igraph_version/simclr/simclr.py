@@ -33,40 +33,59 @@ def prepare_networks(networks, full_df):
     full_graph = build_igraph_from_transactions(full_df)
 
     for net in networks:
-        net["graph"] = build_igraph_from_transactions(net["transactions"])
+        if "graph" not in net or net["graph"] is None:
+            net["graph"] = build_igraph_from_transactions(net["transactions"])
 
     return full_graph
 
 
 def network_to_pyg_data_fast(network):
-    nodes = list(network["nodes"])
-    node_idx = {n: i for i, n in enumerate(nodes)}
+    g = network["graph"]
+    n = g.vcount()
+    has_names = "name" in g.vs.attributes()
+    names = [int(g.vs[i]["name"]) for i in range(n)] if has_names else list(range(n))
+    laundering = network["laundering_nodes"]
 
-    tx = network["transactions"]
+    elist = g.get_edgelist()
+    if elist:
+        srcs, dsts = zip(*elist)
+        edge_index = torch.tensor(
+            [list(srcs) + list(dsts), list(dsts) + list(srcs)],
+            dtype=torch.long,
+        )
+    else:
+        edge_index = torch.zeros(2, 0, dtype=torch.long)
 
-    src = tx["From_Account_int"].map(node_idx)
-    dst = tx["To_Account_int"].map(node_idx)
+    # Use precomputed 7-D features if available and size matches this graph
+    if "x_dense" in network and network["x_dense"] is not None and network["x_dense"].shape[0] == n:
+        x = network["x_dense"].clone()
+        # Refresh degree and laundering in case augmentation changed them
+        degrees = g.degree()
+        max_deg = max(max(degrees), 1)
+        for i in range(n):
+            x[i, 0] = float(names[i] in laundering)
+            x[i, 1] = degrees[i] / max_deg
+    else:
+        import math as _math
+        degrees = g.degree()
+        max_deg = max(max(degrees), 1)
+        depths = network.get("node_depths", {})
+        max_depth = max(depths.values(), default=0) if depths else 0
+        clustering = g.transitivity_local_undirected(mode="zero")
+        pagerank = g.pagerank()
+        _assort = g.assortativity_degree(directed=False)
+        assort = 0.0 if (_assort is None or _math.isnan(_assort)) else float(_assort)
 
-    mask = src.notna() & dst.notna()
-    src = src[mask].astype(int)
-    dst = dst[mask].astype(int)
-
-    edge_index = torch.stack([
-        torch.cat([torch.tensor(src.values), torch.tensor(dst.values)]),
-        torch.cat([torch.tensor(dst.values), torch.tensor(src.values)])
-    ], dim=0).long()
-
-    in_deg = tx["To_Account_int"].value_counts()
-    out_deg = tx["From_Account_int"].value_counts()
-
-    x = torch.tensor([
-        [
-            in_deg.get(n, 0),
-            out_deg.get(n, 0),
-            1 if n in network["laundering_nodes"] else 0
-        ]
-        for n in nodes
-    ], dtype=torch.float)
+        x = torch.zeros(n, 7)
+        for i in range(n):
+            node_id = names[i]
+            x[i, 0] = float(node_id in laundering)
+            x[i, 1] = degrees[i] / max_deg
+            x[i, 2] = depths.get(node_id, 0) / max(max_depth, 1) if has_names else 0.0
+            x[i, 3] = 0.0  # betweenness skipped for speed
+            x[i, 4] = clustering[i]
+            x[i, 5] = pagerank[i]
+            x[i, 6] = assort
 
     return Data(x=x, edge_index=edge_index)
 
@@ -152,7 +171,12 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
         [degree, degree, laundering_probability]
     """
 
-    x, adj = network_to_dense(network)
+    # Use precomputed features if available (avoids expensive betweenness/pagerank recompute)
+    if "x_dense" in network and "adj_dense" in network:
+        x   = network["x_dense"]
+        adj = network["adj_dense"]
+    else:
+        x, adj = network_to_dense(network)
     n = x.shape[0]
 
     if n > max_nodes:
@@ -167,15 +191,16 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
     adj_pad[0, :n, :n] = adj
     mask[0, :n]        = 1.0
 
+    # Move to device before any computation involving x_mean/x_std
+    x_pad   = x_pad.to(device)
+    adj_pad = adj_pad.to(device)
+    mask    = mask.to(device)
+
     # Normalise continuous features (match train.py)
     x_norm = x_pad.clone()
     x_norm[:, :, 1:] = (x_pad[:, :, 1:] - x_mean[1:]) / x_std[1:]
     x_norm = x_norm * mask.unsqueeze(-1)
     adj_pad = adj_pad * mask[:, :, None] * mask[:, None, :]
-
-    x_norm  = x_norm.to(device)
-    adj_pad = adj_pad.to(device)
-    mask    = mask.to(device)
 
     # Choose noise level
     t_abs = max(1, int(t_frac * diffusion.num_timesteps))
@@ -203,15 +228,19 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
     x0_node  = torch.cat([x0_bin, x0_cont], dim=-1)[0, :n]   # [n, 7]
     adj_node = adj_pred[0, :n, :n]                             # [n, n], values in [0,1]
 
-    # Build PyG-compatible node features: (degree, degree, laundering_prob)
-    deg   = adj_node.sum(dim=-1)           # soft degree [n]
-    laund = x0_node[:, 0]                  # laundering probability [n]
-    x_pyg = torch.stack([deg, deg, laund], dim=-1)  # [n, 3]
+    # Build 7-D node features matching training scale (denormalize diffusion space)
+    x_feat = x0_node.clone()                                     # [n, 7]
+    x_feat[:, 1:] = x_feat[:, 1:] * x_std[1:].to(device) + x_mean[1:].to(device)
+    x_feat[:, 0]  = x0_node[:, 0].clamp(0.0, 1.0)              # laundering prob
+    # Override degree (feature 1) with soft adjacency degree, normalised to [0,1]
+    deg   = adj_node.sum(dim=-1)
+    max_d = deg.detach().max().clamp(min=1.0)
+    x_feat[:, 1] = deg / max_d
 
     # Build edge_index from thresholded adjacency
     edge_index = (adj_node > 0.5).nonzero(as_tuple=False).T.contiguous()  # [2, E]
 
-    return Data(x=x_pyg.cpu(), edge_index=edge_index.cpu())
+    return Data(x=x_feat.cpu(), edge_index=edge_index.cpu())
 
 
 def train_simclr_fast(
@@ -236,8 +265,8 @@ def train_simclr_fast(
     encoder.train()
     projector.train()
 
-    # 🔥 Build graphs ONCE
-    full_graph = prepare_networks(networks, full_df)
+    # Build full_graph once; per-network graphs reused from cache if already present
+    # full_graph = prepare_networks(networks, full_df)
 
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -246,7 +275,14 @@ def train_simclr_fast(
     best_projector_state = None
     best_epoch = None
 
-    # ⏱️ Timing containers
+    # Compute once outside all loopsplot_simclr_latent_space_laundering_vs_clean
+    use_diffusion = (
+        diffusion_model is not None
+        and diffusion is not None
+        and x_mean is not None
+        and x_std is not None
+    )
+
     start_time = time.time()
     epoch_times = []
     total_batches = 0
@@ -259,22 +295,14 @@ def train_simclr_fast(
         total_loss = 0.0
 
         for i in range(0, len(networks), batch_size):
-            batch_start = time.time()
             total_batches += 1
 
             batch = networks[i:i + batch_size]
 
-            use_diffusion = (
-                diffusion_model is not None
-                and diffusion is not None
-                and x_mean is not None
-                and x_std is not None
-            )
-
             views1 = []
             views2 = []
             for net in batch:
-                v1 = augment_network_view_fast(net, full_graph)
+                v1 = augment_network_view_fast(net)
                 views1.append(network_to_pyg_data_fast(v1))
 
                 # View 2: use diffusion augmentation with probability p_diffusion
@@ -286,8 +314,8 @@ def train_simclr_fast(
                     if diff_view is not None:
                         views2.append(diff_view)
                         continue
-                # Fall back to standard structural augmentation
-                v2 = augment_network_view_fast(net, full_graph)
+                # Fall back to structural augmentation (diffusion disabled, skipped, or graph too large)
+                v2 = augment_network_view_fast(net)
                 views2.append(network_to_pyg_data_fast(v2))
 
             data1 = Batch.from_data_list(views1).to(device)

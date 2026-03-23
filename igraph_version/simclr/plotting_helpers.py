@@ -10,6 +10,8 @@ from torch_geometric.data import Batch
 from augmentation import augment_network_view_fast
 from simclr import GraphEncoder, prepare_networks, network_to_pyg_data_fast
 
+_CHECKPOINT_DIR = Path(__file__).resolve().parent / "model_checkpoints"
+
 
 def plot_graph_from_dict_igraph(graph_dict, save_path=None, show=True, dpi=300):
     """
@@ -135,9 +137,9 @@ def plot_simclr_latent_space_laundering_vs_clean(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    checkpoint = torch.load("model_checkpoints/best_model_run1.pt", map_location=device)
+    checkpoint = torch.load(_CHECKPOINT_DIR / "best_model.pt", map_location=device)
 
-    encoder = GraphEncoder(in_dim=3, hidden_dim=64, out_dim=128).to(device)
+    encoder = GraphEncoder(in_dim=7, hidden_dim=64, out_dim=128).to(device)
     encoder.load_state_dict(checkpoint["encoder_state_dict"])
     encoder.eval()
 
@@ -174,25 +176,27 @@ def plot_simclr_latent_space_laundering_vs_clean(
 
     H_2d = reducer.fit_transform(H)
 
-    plt.figure(figsize=(8, 8))
+    fig, ax = plt.subplots(figsize=(8, 8))
 
-    scatter = plt.scatter(
+    scatter = ax.scatter(
         H_2d[:, 0],
         H_2d[:, 1],
         c=labels,
-        cmap="coolwarm",   # blue = non-laundering, red = laundering
+        cmap="coolwarm",
         s=30,
-        alpha=0.85
+        alpha=0.85,
     )
 
-    plt.title("SimCLR Encoder Latent Space\nRed = Laundering Networks | Blue = Clean Networks")
-    plt.xticks([])
-    plt.yticks([])
+    ax.set_title("SimCLR Encoder Latent Space\nRed = Laundering Networks | Blue = Clean Networks")
+    ax.set_xticks([])
+    ax.set_yticks([])
 
-    cbar = plt.colorbar(scatter, ticks=[0, 1])
+    cbar = fig.colorbar(scatter, ax=ax, ticks=[0, 1])
     cbar.ax.set_yticklabels(["No laundering nodes", "Has laundering nodes"])
 
-    plt.tight_layout()
-    plt.show()
+    fig.tight_layout()
+    save_path = _CHECKPOINT_DIR.parent / "simclr_latent_space_laundering_vs_clean.png"
+    fig.savefig(save_path, dpi=300)
+    print(f"Saved plot to {save_path}")
 
-    plt.savefig("simclr_latent_space_laundering_vs_clean.png", dpi=300)
+    return fig

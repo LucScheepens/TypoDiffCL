@@ -1,4 +1,5 @@
 import math
+import numpy as np
 import torch
 from masked_diffusion import GaussianDiffusion
 from masked_diffusion import ModelMeanType, ModelVarType, LossType
@@ -69,10 +70,7 @@ def network_to_dense(net):
         x[i, 5] = pagerank_raw[i]                                 # pagerank
         x[i, 6] = assortativity                                   # assortativity [-1,1]
 
-    adj = torch.zeros(n, n)
-    for i, j in graph.get_edgelist():
-        adj[i, j] = 1
-        adj[j, i] = 1
+    adj = torch.from_numpy(np.array(graph.get_adjacency().data, dtype=np.float32))
 
     return x, adj
 

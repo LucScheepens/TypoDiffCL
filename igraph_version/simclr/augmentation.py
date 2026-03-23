@@ -1,7 +1,6 @@
 import random
 from collections import deque
-import igraph as ig 
-import pandas as pd
+import igraph as ig
 import time
 import copy
 
@@ -156,7 +155,7 @@ def add_nodes(
 
 def augment_network_view_fast(
     network,
-    full_graph,
+    full_graph = None,
     p_crop=0.6,
     p_edge_drop=0.2,
     p_node_add=0.2,
@@ -168,7 +167,7 @@ def augment_network_view_fast(
     if random_seed is not None:
         random.seed(random_seed)
 
-    aug_net = copy.deepcopy(network)
+    aug_net = {**network}  # shallow copy — augmentation fns always return new dicts/graphs
 
     if random.random() < p_crop:
         ratio = random.uniform(*crop_ratio_range)
@@ -181,15 +180,5 @@ def augment_network_view_fast(
     #     aug_net = add_nodes(
     #         aug_net, full_graph=full_graph, max_new_nodes=max_new_nodes
     #     )
-
-    # --- Rebuild transactions once at the end ---
-    edges = [(e.source, e.target) for e in aug_net["graph"].es]
-    tx = pd.DataFrame([
-        {"From_Account_int": aug_net["graph"].vs[s]["name"],
-         "To_Account_int": aug_net["graph"].vs[t]["name"]}
-        for s, t in edges
-    ])
-
-    aug_net["transactions"] = tx
 
     return aug_net
