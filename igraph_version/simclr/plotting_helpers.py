@@ -139,7 +139,7 @@ def plot_simclr_latent_space_laundering_vs_clean(
 
     checkpoint = torch.load(_CHECKPOINT_DIR / "best_model.pt", map_location=device)
 
-    encoder = GraphEncoder(in_dim=7, hidden_dim=64, out_dim=128).to(device)
+    encoder = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
     encoder.load_state_dict(checkpoint["encoder_state_dict"])
     encoder.eval()
 
@@ -149,7 +149,7 @@ def plot_simclr_latent_space_laundering_vs_clean(
     labels = []   # 1 = laundering present, 0 = none
 
     for net in networks:
-        v = augment_network_view_fast(net, full_graph)
+        v = augment_network_view_fast(net)
         graphs.append(network_to_pyg_data_fast(v))
 
         has_laundering = len(net["laundering_nodes"]) > 0

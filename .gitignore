@@ -10,13 +10,14 @@ igraph_version/laundering_plots/
 igraph_version/non_laundering_plots/
 igraph_version/pattern_plots/
 pattern_plots/  
+results/
 entity_pattern_plots/
 suspicious_plots/
 config/base_cfg.yaml
 graphs/
 cached_dataset.pt
 logs
-
+model_checkpoints/
 nohup.out
 
 methods/stagn/test_gnn.ipynb
@@ -28,6 +29,7 @@ __pycache__/
 
 # C extensions
 *.so
+*.pt
 
 # Distribution / packaging
 .Python

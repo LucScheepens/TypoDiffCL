@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 
-FEATURE_NAMES = ["Laundering", "Degree", "Depth", "Betweenness", "Clustering", "PageRank", "Assortativity"]
+FEATURE_NAMES = ["Laundering", "Degree", "Betweenness", "Clustering", "PageRank", "Assortativity"]
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,84 @@ def _denorm(x_norm, x_mean, x_std):
     return out
 
 
-def _denoise_from_t(model, diffusion, x_t, adj_t, node_mask, start_t, device):
+def _make_clip_bounds(x_mean, x_std, device):
+    """
+    Compute per-feature normalised bounds from original feature ranges.
+
+    All features except assortativity (last) live in [0, 1] in original scale.
+    Assortativity lives in [-1, 1].  Normalising by (orig - mean) / std gives
+    the valid range in the model's input space.  These bounds are passed to the
+    reverse-diffusion loop so that pred_xstart is clamped to a physically valid
+    range at every step, preventing error compounding for low-std features like
+    PageRank (std ≈ 0.005) and Assortativity.
+    """
+    F   = x_mean.shape[0] - 1               # number of continuous features (indices 1+)
+    lb  = torch.zeros(F)
+    ub  = torch.ones(F)
+    lb[-1] = -1.0                            # assortativity lower bound
+    mean_c = x_mean[1:].cpu()
+    std_c  = x_std[1:].cpu()
+    clip_lo = ((lb - mean_c) / std_c).to(device)
+    clip_hi = ((ub - mean_c) / std_c).to(device)
+    return clip_lo, clip_hi
+
+
+def _enforce_connectivity(adj_bin, node_mask=None):
+    """
+    Ensure every active node belongs to a single connected component.
+
+    If the thresholded adjacency has multiple components, the function adds the
+    minimum number of edges (one per component boundary) by chaining components
+    in arbitrary order.  The added edges respect the node_mask — padding nodes
+    are never touched.
+
+    Parameters
+    ----------
+    adj_bin   : [N, N] float32 tensor — binary adjacency (0/1), on any device.
+    node_mask : [N] float32 tensor or None — 1 for real nodes, 0 for padding.
+
+    Returns
+    -------
+    adj_conn  : [N, N] float32 tensor — connected binary adjacency, same device.
+    n_added   : int — number of edges added (0 if already connected).
+    """
+    device = adj_bin.device
+    N = adj_bin.shape[0]
+
+    if node_mask is not None:
+        active_idx = node_mask.bool().nonzero(as_tuple=True)[0].cpu().tolist()
+    else:
+        active_idx = list(range(N))
+
+    if len(active_idx) == 0:
+        return adj_bin, 0
+
+    # Build NetworkX graph over active nodes only
+    sub = adj_bin[active_idx][:, active_idx].cpu().numpy()
+    G   = nx.from_numpy_array(sub)
+    components = list(nx.connected_components(G))
+
+    if len(components) == 1:
+        return adj_bin, 0
+
+    # Chain components: connect component[i] to component[i+1] with one edge
+    adj_conn = adj_bin.clone()
+    n_added  = 0
+    for i in range(len(components) - 1):
+        # Pick the first node from each consecutive component pair
+        u_sub = min(components[i])        # index into active_idx
+        v_sub = min(components[i + 1])
+        u = active_idx[u_sub]
+        v = active_idx[v_sub]
+        adj_conn[u, v] = 1.0
+        adj_conn[v, u] = 1.0
+        n_added += 1
+
+    return adj_conn, n_added
+
+
+def _denoise_from_t(model, diffusion, x_t, adj_t, node_mask, start_t, device,
+                    clip_bounds=None):
     """Run reverse diffusion from timestep `start_t` down to 0."""
     x   = x_t.clone()
     adj = adj_t.clone()
@@ -38,6 +115,7 @@ def _denoise_from_t(model, diffusion, x_t, adj_t, node_mask, start_t, device):
             out = diffusion.p_sample(
                 model, x, t,
                 model_kwargs={"adj": adj, "node_mask": node_mask},
+                clip_bounds=clip_bounds,
             )
             x   = out["sample"]
             adj = out["adj_sample"]
@@ -103,7 +181,7 @@ def plot_forward_corruption(diffusion, x_batch_norm, node_mask, timesteps, devic
 
 def plot_encode_decode(model, diffusion, x_batch_norm, adj_batch, node_mask,
                        x_mean, x_std, device, save_path,
-                       t_encode=50, feature_names=None):
+                       t_encode=50, feature_names=None, clip_bounds=None):
     """
     Corrupt a graph to timestep `t_encode`, then run the reverse chain back to 0.
     Saves a side-by-side comparison of original / noisy / reconstructed features and adjacency.
@@ -130,7 +208,8 @@ def plot_encode_decode(model, diffusion, x_batch_norm, adj_batch, node_mask,
         )
 
     x_recon_norm, adj_recon = _denoise_from_t(
-        model, diffusion, x_noisy_norm, adj_noisy, node_mask, t_encode, device
+        model, diffusion, x_noisy_norm, adj_noisy, node_mask, t_encode, device,
+        clip_bounds=clip_bounds,
     )
 
     x_orig_d  = _denorm(x_batch_norm[0].cpu(), x_mean, x_std)
@@ -198,6 +277,11 @@ def plot_full_generation(model, diffusion, x_batch_norm, adj_batch, node_mask,
         feature_names = FEATURE_NAMES
 
     model.eval()
+    clip_bounds = _make_clip_bounds(x_mean, x_std, device)
+    # Use the reference graph's edge density as the initial noise level so the
+    # generation loop starts from a realistically sparse adjacency rather than
+    # Bernoulli(0.5), which causes a dense-init → dense-prediction feedback loop.
+    adj_init_p = adj_batch[0].float().mean().item()
     with torch.no_grad():
         x_gen_norm, adj_gen = diffusion.p_sample_loop(
             model,
@@ -205,10 +289,17 @@ def plot_full_generation(model, diffusion, x_batch_norm, adj_batch, node_mask,
             adj_shape=adj_batch.shape,
             model_kwargs={"node_mask": node_mask},
             device=device,
+            adj_init_p=adj_init_p,
+            adj_gamma=2.0,
+            clip_bounds=clip_bounds,
         )
 
     x_orig_d = _denorm(x_batch_norm[0].cpu(), x_mean, x_std)
     x_gen_d  = _denorm(x_gen_norm[0].cpu(), x_mean, x_std)
+
+    # Threshold and enforce connectivity on the generated adjacency
+    adj_gen_bin = (adj_gen[0] > 0.5).float()
+    adj_gen_bin, n_edges_added = _enforce_connectivity(adj_gen_bin, node_mask[0])
 
     # --- node features ---
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -231,13 +322,14 @@ def plot_full_generation(model, diffusion, x_batch_norm, adj_batch, node_mask,
     plt.close(fig)
 
     # --- adjacency ---
+    conn_label = f"Generated adj (connected, +{n_edges_added} edges)" if n_edges_added else "Generated adj"
     fig, axes = plt.subplots(1, 2, figsize=(10, 4))
     for ax, title, mat in zip(
         axes,
-        ["Original adj", "Generated adj"],
-        [adj_batch, (adj_gen > 0.5).float()],
+        ["Original adj", conn_label],
+        [adj_batch[0].cpu().float(), adj_gen_bin.cpu()],
     ):
-        ax.imshow(mat[0].cpu().float().numpy(), cmap="Blues", vmin=0, vmax=1)
+        ax.imshow(mat.numpy(), cmap="Blues", vmin=0, vmax=1)
         ax.set_title(title, fontsize=11)
         ax.axis("off")
     plt.suptitle("Full generation: adjacency matrix", fontsize=13)
@@ -250,7 +342,7 @@ def plot_full_generation(model, diffusion, x_batch_norm, adj_batch, node_mask,
     orig_np = x_orig_d.numpy()
     gen_np  = x_gen_d.numpy()
     orig_density = adj_batch[0].mean().item()
-    gen_density  = (adj_gen[0] > 0.5).float().mean().item()
+    gen_density  = adj_gen_bin.mean().item()
 
     stats_path = save_path.replace(".png", "_stats.txt")
     with open(stats_path, "w") as f:
@@ -259,10 +351,12 @@ def plot_full_generation(model, diffusion, x_batch_norm, adj_batch, node_mask,
             f.write(f"{name:<14} {orig_np[:, i].mean():>10.3f} {gen_np[:, i].mean():>10.3f} "
                     f"{orig_np[:, i].std():>10.3f} {gen_np[:, i].std():>10.3f}\n")
         f.write(f"\nEdge density — original: {orig_density:.3f}  generated: {gen_density:.3f}\n")
+        if n_edges_added:
+            f.write(f"Connectivity edges added: {n_edges_added}\n")
 
 
 def plot_loss_curve(model, diffusion, x_batch_norm, adj_batch, node_mask,
-                    timesteps, adj_loss_w, deg_loss_w, device, save_path,
+                    timesteps, adj_loss_w, device, save_path,
                     laund_loss_w=2.0, k_samples=8):
     """
     Plot the denoising loss as a function of timestep t.
@@ -275,7 +369,6 @@ def plot_loss_curve(model, diffusion, x_batch_norm, adj_batch, node_mask,
         node_mask:          [1, N] binary mask.
         timesteps:          Total number of diffusion timesteps.
         adj_loss_w:         Adjacency loss weight passed to training_losses.
-        deg_loss_w:         Degree loss weight passed to training_losses.
         device:             Torch device string.
         save_path:          File path to save the figure.
         k_samples:          Noise samples averaged per timestep.
@@ -295,7 +388,7 @@ def plot_loss_curve(model, diffusion, x_batch_norm, adj_batch, node_mask,
                     adj_start=adj_batch,
                     model_kwargs={"node_mask": node_mask},
                     adj_loss_weight=adj_loss_w,
-                    deg_loss_weight=deg_loss_w,
+                    density_loss_weight=1.0,
                     laund_loss_weight=laund_loss_w,
                 )
                 k_losses.append(loss_dict["loss"].item())
@@ -320,7 +413,8 @@ def plot_loss_curve(model, diffusion, x_batch_norm, adj_batch, node_mask,
 
 
 def plot_graph_viz(model, diffusion, x_batch_norm, adj_batch, adj_orig, x_orig,
-                   node_mask, device, save_path, t_viz=50, feature_names=None):
+                   node_mask, device, save_path, t_viz=50, feature_names=None,
+                   clip_bounds=None):
     """
     Draw the original graph and the encode→decode reconstruction side by side,
     with nodes coloured by laundering label.
@@ -348,7 +442,8 @@ def plot_graph_viz(model, diffusion, x_batch_norm, adj_batch, adj_orig, x_orig,
         )
 
     x_recon_viz, _ = _denoise_from_t(
-        model, diffusion, x_noisy_viz, adj_noisy_viz, node_mask, t_viz, device
+        model, diffusion, x_noisy_viz, adj_noisy_viz, node_mask, t_viz, device,
+        clip_bounds=clip_bounds,
     )
 
     G   = nx.from_numpy_array(adj_orig.cpu().numpy())
@@ -390,7 +485,7 @@ def plot_graph_viz(model, diffusion, x_batch_norm, adj_batch, adj_orig, x_orig,
 
 
 def run_all_visualizations(model, diffusion, dataset, x_mean, x_std,
-                            timesteps, adj_loss_w, deg_loss_w, device,
+                            timesteps, adj_loss_w, device,
                             graphs_dir, epoch, laund_loss_w=2.0, feature_names=None):
     """
     Pick one sample from the dataset and run all five visualizations.
@@ -402,7 +497,6 @@ def run_all_visualizations(model, diffusion, dataset, x_mean, x_std,
         x_mean, x_std:      Normalisation stats (CPU tensors, shape [F]).
         timesteps:          Total diffusion timesteps.
         adj_loss_w:         Adjacency loss weight.
-        deg_loss_w:         Degree loss weight.
         device:             Torch device string.
         graphs_dir:         Directory to write images into.
         epoch:              Current epoch number (used in filenames).
@@ -421,6 +515,7 @@ def run_all_visualizations(model, diffusion, dataset, x_mean, x_std,
     x_batch_norm[:, :, 1:] = (x_batch[:, :, 1:] - x_mean.to(device)[1:]) / x_std.to(device)[1:]
 
     tag = f"epoch{epoch:04d}"
+    clip_bounds = _make_clip_bounds(x_mean, x_std, device)
 
     plot_forward_corruption(
         diffusion, x_batch_norm, node_mask, timesteps, device,
@@ -433,6 +528,7 @@ def run_all_visualizations(model, diffusion, dataset, x_mean, x_std,
         x_mean, x_std, device,
         save_path=os.path.join(graphs_dir, f"encode_decode_{tag}.png"),
         feature_names=feature_names,
+        clip_bounds=clip_bounds,
     )
 
     plot_full_generation(
@@ -444,7 +540,7 @@ def run_all_visualizations(model, diffusion, dataset, x_mean, x_std,
 
     plot_loss_curve(
         model, diffusion, x_batch_norm, adj_batch, node_mask,
-        timesteps, adj_loss_w, deg_loss_w, device,
+        timesteps, adj_loss_w, device,
         save_path=os.path.join(graphs_dir, f"loss_curve_{tag}.png"),
         laund_loss_w=laund_loss_w,
     )
@@ -454,6 +550,7 @@ def run_all_visualizations(model, diffusion, dataset, x_mean, x_std,
         node_mask, device,
         save_path=os.path.join(graphs_dir, f"graph_viz_{tag}.png"),
         feature_names=feature_names,
+        clip_bounds=clip_bounds,
     )
 
     print(f"  [viz] saved 7 figures to {graphs_dir}/ (epoch {epoch})")

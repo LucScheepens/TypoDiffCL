@@ -17,6 +17,38 @@ def build_igraph_from_transactions(tx_df):
     return g
 
 
+def _get_or_build_graph(network):
+    """
+    Return a copy of the network's igraph graph.
+    If the network dict has no 'graph' key (as produced by util.py),
+    build a directed graph from the 'transactions' DataFrame instead.
+    Node 'name' attributes are integer account IDs.
+    """
+    if "graph" in network:
+        return network["graph"].copy()
+
+    txs = network["transactions"]
+    nodes = network["nodes"]
+
+    if len(txs) > 0:
+        g = ig.Graph.DataFrame(
+            txs[["From_Account_int", "To_Account_int"]],
+            directed=True,
+            use_vids=False,
+        )
+        # Add isolated nodes that appear in the node set but have no transactions
+        existing = {v["name"] for v in g.vs}
+        for n in nodes:
+            if n not in existing:
+                g.add_vertex(name=n)
+    else:
+        g = ig.Graph(directed=True)
+        for n in sorted(nodes):
+            g.add_vertex(name=n)
+
+    return g
+
+
 def crop_network(network, crop_ratio=0.8, random_seed=None):
     if random_seed is not None:
         random.seed(random_seed)
@@ -57,112 +89,165 @@ def crop_network(network, crop_ratio=0.8, random_seed=None):
 
 
 def delete_random_edges(network, delete_frac=0.15, random_seed=None):
-    """Delete edges in the graph but skip updating transactions."""
+    """
+    Delete random edges without disconnecting the network.
+    Bridge detection runs on the undirected view so it works correctly
+    for directed graphs produced by util.py.
+    """
     if random_seed is not None:
         random.seed(random_seed)
 
-    g = network["graph"].copy()
+    g = _get_or_build_graph(network)
     if g.ecount() < 2:
-        return network
+        return {**network, "graph": g}
 
-    bridges = set(g.bridges())
-    non_bridges = [i for i in range(g.ecount()) if i not in bridges]
+    # Bridges on the undirected view — O(V+E), fast
+    g_undir = g.as_undirected(combine_edges="first")
+    bridge_pairs = set()
+    for eid in g_undir.bridges():
+        e = g_undir.es[eid]
+        bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+
+    # Any directed edge whose undirected pair is a bridge is excluded
+    non_bridges = [
+        e.index for e in g.es
+        if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
+    ]
     if not non_bridges:
-        return network
+        return {**network, "graph": g}
 
-    target_deletions = int(len(non_bridges) * delete_frac)
+    target = max(1, int(len(non_bridges) * delete_frac))
     random.shuffle(non_bridges)
-    delete_eids = non_bridges[:target_deletions]
+    g.delete_edges(non_bridges[:target])
 
-    g.delete_edges(delete_eids)
+    return {**network, "graph": g}
+
+
+def delete_nodes(network, delete_frac=0.15, random_seed=None):
+    """
+    Delete random nodes from the network without disconnecting it.
+    Articulation points (whose removal would split the graph) and
+    laundering nodes are never deleted.
+    """
+    if random_seed is not None:
+        random.seed(random_seed)
+
+    g = _get_or_build_graph(network)
+    if g.vcount() < 3:
+        return {**network, "graph": g}
+
+    # Find articulation points on the undirected version
+    g_undir = g.as_undirected(combine_edges="first")
+    art_point_vids = set(g_undir.articulation_points())
+
+    laundering_names = network["laundering_nodes"]
+
+    # Eligible: not an articulation point and not a laundering node
+    deletable_vids = [
+        v.index for v in g.vs
+        if v.index not in art_point_vids
+        and v["name"] not in laundering_names
+    ]
+
+    if not deletable_vids:
+        return {**network, "graph": g}
+
+    target = max(1, int(len(deletable_vids) * delete_frac))
+    random.shuffle(deletable_vids)
+    to_delete = deletable_vids[:target]
+
+    deleted_names = {g.vs[vid]["name"] for vid in to_delete}
+    g.delete_vertices(to_delete)
+
+    remaining = network["nodes"] - deleted_names
 
     return {
         **network,
-        "graph": g
+        "nodes": remaining,
+        "laundering_nodes": network["laundering_nodes"] - deleted_names,
+        "collapsed_nodes": network["collapsed_nodes"] - deleted_names,
+        "node_depths": {n: d for n, d in network["node_depths"].items() if n not in deleted_names},
+        "graph": g,
     }
 
 
-def add_nodes(
-    network,
-    full_graph,
-    max_new_nodes=10,
-    max_depth=2,
-    collapse_threshold=10,
-    random_seed=None
-):
+def add_nodes(network, num_new_nodes=5, random_seed=None):
+    """
+    Insert new nodes within the network by subdividing random edges.
+    Each selected edge (u → v) is replaced by (u → w, w → v) where w
+    is a new synthetic node. This places nodes *inside* the existing
+    topology rather than appending external ones.
+    """
     if random_seed is not None:
         random.seed(random_seed)
 
-    g = network["graph"].copy()
-    current_nodes = set(network["nodes"])
-    collapsed_nodes = set(network["collapsed_nodes"])
+    g = _get_or_build_graph(network)
+    if g.ecount() == 0:
+        return {**network, "graph": g}
+
+    # Pick a synthetic ID range that cannot clash with real account IDs
+    existing_names = {v["name"] for v in g.vs}
+    new_id = max(existing_names) + 1
+
     new_nodes = set()
+    node_depths = dict(network["node_depths"])
 
-    from collections import deque
-    boundary = list(current_nodes)
-    random.shuffle(boundary)
-    queue = deque((n, 0) for n in boundary)
-
-    while queue and len(new_nodes) < max_new_nodes:
-        node, depth = queue.popleft()
-        if depth >= max_depth:
-            continue
-        try:
-            vid = full_graph.vs.find(name=node).index
-        except ValueError:
-            continue
-
-        neighbors = {full_graph.vs[v]["name"] for v in full_graph.neighbors(vid)}
-        if len(neighbors) > collapse_threshold:
-            collapsed_nodes.add(node)
-            continue
-
-        for nbr in neighbors:
-            if nbr not in current_nodes and nbr not in new_nodes:
-                new_nodes.add(nbr)
-                queue.append((nbr, depth + 1))
-                if len(new_nodes) >= max_new_nodes:
-                    break
-
-    for n in new_nodes:
-        if n not in g.vs["name"]:
-            g.add_vertex(name=n)
-
-    # Add edges
+    # Build name→vid dict once — O(V) instead of O(V) per find() call
     name_to_vid = {v["name"]: v.index for v in g.vs}
-    edges_to_add = []
-    for n in new_nodes:
-        try:
-            vid = full_graph.vs.find(name=n).index
-        except ValueError:
+
+    # Snapshot (src_name, tgt_name) pairs before any structural changes
+    all_eids = list(range(g.ecount()))
+    random.shuffle(all_eids)
+    edge_pairs = [
+        (g.vs[g.es[eid].source]["name"], g.vs[g.es[eid].target]["name"])
+        for eid in all_eids[:min(num_new_nodes, len(all_eids))]
+    ]
+
+    for src_name, tgt_name in edge_pairs:
+        src_vid = name_to_vid.get(src_name)
+        tgt_vid = name_to_vid.get(tgt_name)
+        if src_vid is None or tgt_vid is None:
             continue
-        for nbr_vid in full_graph.neighbors(vid):
-            nbr = full_graph.vs[nbr_vid]["name"]
-            if nbr in current_nodes or nbr in new_nodes:
-                if n in name_to_vid and nbr in name_to_vid:
-                    edges_to_add.append((name_to_vid[n], name_to_vid[nbr]))
-    if edges_to_add:
-        g.add_edges(edges_to_add)
+
+        try:
+            eid = g.get_eid(src_vid, tgt_vid)
+        except ig.InternalError:
+            continue
+
+        # add_vertex always appends → new index is vcount()-1, no find() needed
+        g.add_vertex(name=new_id)
+        new_vid = g.vcount() - 1
+        name_to_vid[new_id] = new_vid
+
+        g.delete_edges(eid)
+        g.add_edges([(src_vid, new_vid), (new_vid, tgt_vid)])
+
+        new_nodes.add(new_id)
+        d_src = node_depths.get(src_name)
+        d_tgt = node_depths.get(tgt_name)
+        node_depths[new_id] = (d_src + d_tgt + 1) // 2 if (d_src is not None and d_tgt is not None) else None
+
+        new_id += 1
 
     return {
         **network,
-        "nodes": current_nodes | new_nodes,
-        "collapsed_nodes": collapsed_nodes,
-        "node_depths": {**network["node_depths"], **{n: None for n in new_nodes}},
-        "graph": g
+        "nodes": network["nodes"] | new_nodes,
+        "node_depths": node_depths,
+        "graph": g,
     }
 
 
 def augment_network_view_fast(
     network,
-    full_graph = None,
     p_crop=0.6,
     p_edge_drop=0.2,
+    p_node_delete=0.2,
     p_node_add=0.2,
     crop_ratio_range=(0.6, 0.9),
     edge_drop_range=(0.05, 0.2),
-    max_new_nodes=10,
-    random_seed=None
+    node_delete_frac=0.15,
+    num_new_nodes=5,
+    random_seed=None,
 ):
     if random_seed is not None:
         random.seed(random_seed)
@@ -173,12 +258,14 @@ def augment_network_view_fast(
         ratio = random.uniform(*crop_ratio_range)
         aug_net = crop_network(aug_net, crop_ratio=ratio)
 
-    # if random.random() < p_edge_drop:
-    #     frac = random.uniform(*edge_drop_range)
-    #     aug_net = delete_random_edges(aug_net, delete_frac=frac)    
-    # if random.random() < p_node_add:
-    #     aug_net = add_nodes(
-    #         aug_net, full_graph=full_graph, max_new_nodes=max_new_nodes
-    #     )
+    if random.random() < p_edge_drop:
+        frac = random.uniform(*edge_drop_range)
+        aug_net = delete_random_edges(aug_net, delete_frac=frac)
+
+    if random.random() < p_node_delete:
+        aug_net = delete_nodes(aug_net, delete_frac=node_delete_frac)
+
+    if random.random() < p_node_add:
+        aug_net = add_nodes(aug_net, num_new_nodes=num_new_nodes)
 
     return aug_net

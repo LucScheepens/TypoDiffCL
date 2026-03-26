@@ -69,23 +69,20 @@ def network_to_pyg_data_fast(network):
         import math as _math
         degrees = g.degree()
         max_deg = max(max(degrees), 1)
-        depths = network.get("node_depths", {})
-        max_depth = max(depths.values(), default=0) if depths else 0
         clustering = g.transitivity_local_undirected(mode="zero")
         pagerank = g.pagerank()
         _assort = g.assortativity_degree(directed=False)
         assort = 0.0 if (_assort is None or _math.isnan(_assort)) else float(_assort)
 
-        x = torch.zeros(n, 7)
+        x = torch.zeros(n, 6)
         for i in range(n):
             node_id = names[i]
             x[i, 0] = float(node_id in laundering)
             x[i, 1] = degrees[i] / max_deg
-            x[i, 2] = depths.get(node_id, 0) / max(max_depth, 1) if has_names else 0.0
-            x[i, 3] = 0.0  # betweenness skipped for speed
-            x[i, 4] = clustering[i]
-            x[i, 5] = pagerank[i]
-            x[i, 6] = assort
+            x[i, 2] = 0.0  # betweenness skipped for speed
+            x[i, 3] = clustering[i]
+            x[i, 4] = pagerank[i]
+            x[i, 5] = assort
 
     return Data(x=x, edge_index=edge_index)
 
@@ -155,6 +152,48 @@ def nt_xent_loss(z1, z2, temperature=0.5):
     return loss.mean()
 
 
+def sup_con_loss(z, labels, temperature=0.07):
+    """
+    Supervised Contrastive Loss (Khosla et al., 2020).
+
+    z      : [N, D]  embeddings (will be L2-normalised internally)
+    labels : [N]     integer class labels (0 = clean, 1 = laundering)
+
+    All same-class pairs act as positives; all cross-class pairs act as
+    negatives.  Uses a lower temperature than NT-Xent (0.07 vs 0.5) to
+    create tighter, better-separated clusters.
+
+    Returns scalar loss, or 0 if the batch has no valid positive pairs
+    (e.g. all samples belong to the same class).
+    """
+    z = F.normalize(z, dim=1)
+    N = z.shape[0]
+
+    sim = torch.matmul(z, z.T) / temperature           # [N, N]
+
+    self_mask = torch.eye(N, dtype=torch.bool, device=z.device)
+    labels    = labels.view(-1)
+    pos_mask  = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~self_mask  # [N, N]
+
+    if pos_mask.sum() == 0:
+        return torch.tensor(0.0, device=z.device)
+
+    # Numerical stability: subtract per-row max (excluding self)
+    sim_no_self = sim.masked_fill(self_mask, -1e9)
+    sim = sim - sim_no_self.max(dim=1, keepdim=True).values.detach()
+
+    exp_sim   = torch.exp(sim).masked_fill(self_mask, 0.0)   # zero out self
+    log_denom = torch.log(exp_sim.sum(dim=1, keepdim=True).clamp(min=1e-8))
+
+    log_prob        = sim - log_denom                          # [N, N]
+    n_pos           = pos_mask.float().sum(dim=1).clamp(min=1)
+    loss_per_anchor = -(log_prob * pos_mask.float()).sum(dim=1) / n_pos
+
+    # Only average over anchors that actually have a positive pair
+    has_pos = pos_mask.any(dim=1)
+    return loss_per_anchor[has_pos].mean()
+
+
 
 
 
@@ -184,7 +223,7 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
         return None
 
     # Pad to max_nodes and build node mask
-    x_pad    = torch.zeros(1, max_nodes, 7)
+    x_pad    = torch.zeros(1, max_nodes, 6)
     adj_pad  = torch.zeros(1, max_nodes, max_nodes)
     mask     = torch.zeros(1, max_nodes)
     x_pad[0, :n]       = x
@@ -213,7 +252,7 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
     was_training = diffusion_model.training
     diffusion_model.eval()
     with torch.no_grad():
-        eps_pred, adj_pred = diffusion_model(
+        eps_pred, adj_pred, _ = diffusion_model(
             x_t, diffusion._scale_timesteps(t),
             adj=adj_t, node_mask=mask,
         )
@@ -225,11 +264,11 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
         diffusion_model.train()
 
     # Extract valid-node slice
-    x0_node  = torch.cat([x0_bin, x0_cont], dim=-1)[0, :n]   # [n, 7]
+    x0_node  = torch.cat([x0_bin, x0_cont], dim=-1)[0, :n]   # [n, 6]
     adj_node = adj_pred[0, :n, :n]                             # [n, n], values in [0,1]
 
-    # Build 7-D node features matching training scale (denormalize diffusion space)
-    x_feat = x0_node.clone()                                     # [n, 7]
+    # Build 6-D node features matching training scale (denormalize diffusion space)
+    x_feat = x0_node.clone()                                     # [n, 6]
     x_feat[:, 1:] = x_feat[:, 1:] * x_std[1:].to(device) + x_mean[1:].to(device)
     x_feat[:, 0]  = x0_node[:, 0].clamp(0.0, 1.0)              # laundering prob
     # Override degree (feature 1) with soft adjacency degree, normalised to [0,1]
@@ -261,6 +300,8 @@ def train_simclr_fast(
     p_diffusion=0.3,
     diffusion_t_frac=0.3,
     max_nodes=300,
+    supcon_weight=0.5,
+    supcon_temperature=0.07,
 ):
     encoder.train()
     projector.train()
@@ -294,6 +335,9 @@ def train_simclr_fast(
         random.shuffle(networks)
         total_loss = 0.0
 
+        total_ntxent = 0.0
+        total_supcon  = 0.0
+
         for i in range(0, len(networks), batch_size):
             total_batches += 1
 
@@ -318,6 +362,12 @@ def train_simclr_fast(
                 v2 = augment_network_view_fast(net)
                 views2.append(network_to_pyg_data_fast(v2))
 
+            # Binary labels for the batch (1 = laundering present, 0 = clean)
+            labels = torch.tensor(
+                [int(len(net["laundering_nodes"]) > 0) for net in batch],
+                dtype=torch.long, device=device,
+            )
+
             data1 = Batch.from_data_list(views1).to(device)
             data2 = Batch.from_data_list(views2).to(device)
 
@@ -329,17 +379,36 @@ def train_simclr_fast(
             z1 = projector(h1)
             z2 = projector(h2)
 
-            loss = nt_xent_loss(z1, z2)
+            ntxent = nt_xent_loss(z1, z2)
+
+            # Supervised contrastive term: both views share the same label.
+            # Concatenating them doubles the effective batch so every
+            # same-class pair (across and within views) acts as a positive.
+            if supcon_weight > 0.0:
+                z_all      = torch.cat([z1, z2], dim=0)
+                labels_all = torch.cat([labels, labels], dim=0)
+                sc         = sup_con_loss(z_all, labels_all, temperature=supcon_temperature)
+            else:
+                sc = torch.tensor(0.0, device=device)
+
+            loss = ntxent + supcon_weight * sc
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item()
+            total_loss   += loss.item()
+            total_ntxent += ntxent.item()
+            total_supcon  += sc.item()
 
-        avg_loss = total_loss / ((len(networks) + batch_size - 1) // batch_size)
+        n_batches = (len(networks) + batch_size - 1) // batch_size
+        avg_loss   = total_loss   / n_batches
+        avg_ntxent = total_ntxent / n_batches
+        avg_supcon = total_supcon  / n_batches
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
 
-        print(f"Epoch {epoch + 1}: avg loss = {avg_loss:.4f} | time = {epoch_time:.2f}s")
+        print(f"Epoch {epoch + 1}: loss={avg_loss:.4f} "
+              f"(nt_xent={avg_ntxent:.4f}, supcon={avg_supcon:.4f}) "
+              f"| time={epoch_time:.2f}s")
 
         # ✅ Save checkpoint every N epochs
         if (epoch + 1) % checkpoint_interval == 0:

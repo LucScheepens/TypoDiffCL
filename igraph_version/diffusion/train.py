@@ -15,6 +15,7 @@ from collate import collate_fn
 from dataset import CachedDataset
 from diff_util import create_diffusion, preprocess
 from model import DiffusionGNN
+from resample import LossSecondMomentResampler
 from visualizations import run_all_visualizations
 
 from simclr.augmentation import build_igraph_from_transactions
@@ -25,20 +26,23 @@ from simclr.util import (
 )
 
 
-BATCH_SIZE    = 16
+BATCH_SIZE    = 32
 ACCUM_STEPS   = 1
 LR            = 2e-4
 EPOCHS        = 300
 WARMUP_EPOCHS = 15
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
-NODE_DIM      = 7
+NODE_DIM      = 6
 HIDDEN        = 128
 TIMESTEPS     = 500
 MAX_NODES     = 300
-ADJ_LOSS_W    = 0.3
-DEG_LOSS_W    = 0.1
-LAUND_LOSS_W  = 2.0    # upweight laundering BCE — rare class needs stronger signal
+ADJ_LOSS_W          = 0.3
+DENSITY_LOSS_W      = 3.0   # penalise predicted density != true density (symmetric)
+NODE_EXIST_LOSS_W   = 1.0   # reconstruct node mask from corrupted input
+MASK_DROPOUT_RATE   = 0.15  # max fraction of nodes dropped at t=T  (was 0.4 — too noisy)
+GHOST_NODE_RATE     = 0.10  # max fraction of padding slots injected as ghost nodes at t=T (was 0.3)
+LAUND_LOSS_W        = 2.0   # upweight laundering BCE — rare class needs stronger signal
 MAX_GRAD_NORM = 1.0
 
 VIZ_INTERVAL  = 50
@@ -131,6 +135,10 @@ if __name__ == "__main__":
     diffusion = create_diffusion(TIMESTEPS)
     print(f"Model on {DEVICE}  |  params: {sum(p.numel() for p in model.parameters()):,}")
 
+    # Loss-aware timestep sampler: upweights timesteps with high loss variance so
+    # training focuses on the hardest parts of the denoising chain (Nichol & Dhariwal 2021).
+    schedule_sampler = LossSecondMomentResampler(diffusion)
+
     optimizer = Adam(model.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -157,7 +165,7 @@ if __name__ == "__main__":
             adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
 
             B = x_norm.shape[0]
-            t = torch.randint(0, diffusion.num_timesteps, (B,), device=DEVICE)
+            t, iw = schedule_sampler.sample(B, DEVICE)   # importance-sampled timesteps
 
             with torch.amp.autocast(device_type=DEVICE, enabled=USE_AMP):
                 loss_dict = diffusion.training_losses(
@@ -167,12 +175,19 @@ if __name__ == "__main__":
                     adj_start=adj,
                     model_kwargs={"node_mask": node_mask},
                     adj_loss_weight=ADJ_LOSS_W,
-                    deg_loss_weight=DEG_LOSS_W,
+                    density_loss_weight=DENSITY_LOSS_W,
+                    node_exist_loss_weight=NODE_EXIST_LOSS_W,
+                    mask_dropout_rate=MASK_DROPOUT_RATE,
+                    ghost_node_rate=GHOST_NODE_RATE,
                     laund_loss_weight=LAUND_LOSS_W,
                 )
-                loss = loss_dict["loss"].mean() / ACCUM_STEPS
+                # Multiply per-sample losses by importance-correction weights so
+                # the gradient estimate remains unbiased despite non-uniform sampling.
+                loss = (loss_dict["loss"] * iw).mean() / ACCUM_STEPS
 
             scaler.scale(loss).backward()
+            # Update sampler with raw (un-weighted) per-sample losses
+            schedule_sampler.update(t.tolist(), loss_dict["loss"].detach().tolist())
 
             if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(loader):
                 scaler.unscale_(optimizer)
@@ -205,7 +220,6 @@ if __name__ == "__main__":
                 x_mean.cpu(), x_std.cpu(),
                 timesteps=TIMESTEPS,
                 adj_loss_w=ADJ_LOSS_W,
-                deg_loss_w=DEG_LOSS_W,
                 laund_loss_w=LAUND_LOSS_W,
                 device=DEVICE,
                 graphs_dir=GRAPHS_DIR,

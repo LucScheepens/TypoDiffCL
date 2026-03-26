@@ -170,9 +170,25 @@ class DiffusionGNN(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(hidden_dim, node_dim)
 
-        # Adjacency prediction: inner-product decoder on projected node embeddings
-        self.adj_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.adj_norm = nn.LayerNorm(hidden_dim)
+        # Adjacency decoder: decomposed bilinear form.
+        # logit(i,j) = h_i^T W h_j  +  u^T h_i  +  u^T h_j  +  bias
+        # Separating pairwise (bilinear) and per-node (unary) terms avoids the
+        # symmetric inner-product's collapse: when embeddings over-smooth to the
+        # same vector the bilinear term saturates, but unary + bias still
+        # controls the global density prior.  W is not constrained to be
+        # symmetric, giving strictly more expressiveness than inner-product.
+        D_e = hidden_dim // 4                                # 32 for hidden=128
+        self.adj_proj  = nn.Linear(hidden_dim, D_e)
+        self.adj_bilin = nn.Linear(D_e, D_e, bias=False)    # W in h_i^T W h_j
+        self.adj_lin   = nn.Linear(D_e, 1,   bias=False)    # unary: u^T h
+        self.adj_bias  = nn.Parameter(torch.tensor(-2.25))  # ≈ logit(0.095) sparse prior
+        nn.init.normal_(self.adj_bilin.weight, std=0.01)
+        nn.init.normal_(self.adj_lin.weight,   std=0.01)
+        nn.init.normal_(self.adj_proj.weight,  std=0.02)
+
+        # Node existence prediction: learned from the same node embeddings.
+        # Predicts a logit per node — whether that node should be active.
+        self.node_existence_head = nn.Linear(hidden_dim, 1)
 
 
     def forward(self, x, t, adj=None, node_mask=None):
@@ -215,16 +231,19 @@ class DiffusionGNN(nn.Module):
             out = out * node_mask.unsqueeze(-1)
 
 
-        # Predict adjacency via scaled inner-product decoder
-        # LayerNorm bounds vector norms to ~sqrt(hidden_dim) regardless of activation growth
-        h_adj = self.adj_norm(self.adj_proj(h))                         # [B, N, H]
-        scale = math.sqrt(h_adj.shape[-1])
-        adj_logits = torch.bmm(h_adj, h_adj.transpose(1, 2)) / scale   # [B, N, N]
+        # Adjacency prediction via decomposed bilinear form (no large intermediate tensors)
+        h_e   = F.silu(self.adj_proj(h))                          # [B, N, D_e]
+        bilin = torch.bmm(self.adj_bilin(h_e), h_e.transpose(1, 2))  # [B, N, N]
+        bilin = (bilin + bilin.transpose(1, 2)) / 2               # symmetrise W
+        unary = self.adj_lin(h_e).squeeze(-1)                     # [B, N]
+        adj_logits = bilin + unary.unsqueeze(2) + unary.unsqueeze(1) + self.adj_bias
         adj_pred = torch.sigmoid(adj_logits)
-        adj_pred = (adj_pred + adj_pred.transpose(1, 2)) / 2           # enforce symmetry
+        adj_pred = (adj_pred + adj_pred.transpose(1, 2)) / 2     # enforce symmetry
 
         if node_mask is not None:
             adj_pred = adj_pred * node_mask[:, :, None] * node_mask[:, None, :]
 
+        # Node existence logits — raw (not sigmoid'd), one per padded position
+        node_logits = self.node_existence_head(h).squeeze(-1)   # [B, N]
 
-        return out, adj_pred
+        return out, adj_pred, node_logits

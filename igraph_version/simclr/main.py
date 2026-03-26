@@ -85,7 +85,7 @@ def load_diffusion(device):
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    diff_model = DiffusionGNN(node_dim=7, hidden_dim=128, num_layers=4).to(device)
+    diff_model = DiffusionGNN(node_dim=6, hidden_dim=128, num_layers=4).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
 
@@ -108,7 +108,7 @@ if __name__ == "__main__":
     # Load the trained diffusion model (optional — falls back gracefully if absent)
     diff_model, diffusion, x_mean, x_std = load_diffusion(device)
 
-    encoder   = GraphEncoder(in_dim=7, hidden_dim=64, out_dim=128).to(device)
+    encoder   = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
     projector = ProjectionHead(in_dim=128, proj_dim=64).to(device)
 
     optimizer = torch.optim.Adam(

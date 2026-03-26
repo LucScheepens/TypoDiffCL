@@ -136,8 +136,9 @@ class GaussianDiffusion:
 
         alphas = 1.0 - betas
 
-        self.alphas_cumprod = np.cumprod(alphas)
+        self.alphas_cumprod      = np.cumprod(alphas)
         self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
+        self.alphas_cumprod_next = np.append(self.alphas_cumprod[1:], 0.0)  # for DDIM reverse
 
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1 - self.alphas_cumprod)
@@ -206,12 +207,24 @@ class GaussianDiffusion:
         if adj_start is None:
             return x_t
 
-        # Bernoulli forward process for adjacency (binary edges)
+        # Bernoulli forward process for adjacency (binary edges).
+        # Stationary distribution uses the actual batch edge density rather than
+        # 0.5: if real graphs are ~5% dense, converging toward 50% noise forces the
+        # model to reconstruct sparse from very dense inputs, which biases it toward
+        # over-predicting edges. Using the true density as the noise floor avoids this.
         keep_prob_adj = _extract_into_tensor(
             self.alphas_cumprod, t, adj_start.shape
         ).clamp(0.0, 1.0)
         keep_adj = th.bernoulli(keep_prob_adj)
-        rand_adj  = th.bernoulli(th.full_like(adj_start, 0.5))
+        with th.no_grad():
+            if node_mask is not None:
+                mask2d_s = node_mask[:, :, None] * node_mask[:, None, :]
+                n_act = mask2d_s.sum().clamp(min=1)
+                p_edge = (adj_start * mask2d_s).sum() / n_act
+            else:
+                p_edge = adj_start.mean()
+            p_edge = p_edge.clamp(0.01, 0.5)
+        rand_adj  = th.bernoulli(th.full_like(adj_start, p_edge.item()))
         adj_t = keep_adj * adj_start + (1 - keep_adj) * rand_adj
         adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2          # keep symmetric
 
@@ -235,6 +248,15 @@ class GaussianDiffusion:
             ) * eps
         )
 
+    def _predict_eps_from_xstart(self, x_t, t, pred_xstart):
+        """Inverse of _predict_xstart_from_eps — re-derives eps given x_0 prediction."""
+        return (
+            _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
+            - pred_xstart
+        ) / _extract_into_tensor(
+            self.sqrt_recipm1_alphas_cumprod, t, x_t.shape
+        ).clamp(min=1e-8)
+
 
     def _scale_timesteps(self, t):
 
@@ -251,6 +273,7 @@ class GaussianDiffusion:
         t,
         clip_denoised=True,
         model_kwargs=None,
+        clip_bounds=None,
     ):
 
         if model_kwargs is None:
@@ -261,7 +284,7 @@ class GaussianDiffusion:
         if node_mask is not None:
             x = x * node_mask.unsqueeze(-1)
 
-        model_output_x, adj_pred = model(
+        model_output_x, adj_pred, node_logits = model(
             x,
             self._scale_timesteps(t),
             **model_kwargs
@@ -286,10 +309,17 @@ class GaussianDiffusion:
 
 
         if clip_denoised:
-            pred_xstart = th.cat([
-                pred_xstart[..., 0:1].clamp(0.0, 1.0),
-                pred_xstart[..., 1:],
-            ], dim=-1)
+            # Feature 0: binary, always clamp to [0,1].
+            # Features 1+: clamp to the valid normalised range derived from the
+            # original feature bounds.  Without this, small eps-prediction errors
+            # compound over 500 steps and diverge — especially for features with
+            # tiny std (PageRank ~0.005, Assortativity near-zero), where a unit
+            # normalised error maps to hundreds in original scale.
+            cont = pred_xstart[..., 1:]
+            if clip_bounds is not None:
+                lo, hi = clip_bounds   # each [F-1], broadcastable to [B, N, F-1]
+                cont = cont.clamp(lo, hi)
+            pred_xstart = th.cat([pred_xstart[..., 0:1].clamp(0.0, 1.0), cont], dim=-1)
 
 
         if node_mask is not None:
@@ -322,6 +352,7 @@ class GaussianDiffusion:
             "log_variance": model_log_variance,
             "pred_xstart": pred_xstart,
             "adj_pred": adj_pred,
+            "node_logits": node_logits,
         }
 
 
@@ -332,7 +363,15 @@ class GaussianDiffusion:
         x,
         t,
         model_kwargs=None,
+        adj_gamma=1.0,
+        clip_bounds=None,
     ):
+        """
+        adj_gamma : exponent applied to adj_pred before Bernoulli sampling.
+            Values > 1 squash mid-range probabilities toward 0 (sparse bias).
+            Default 1.0 = no effect.  Set to ~2.0 in the generation loop to
+            counteract the decoder's tendency to predict near-uniform mid values.
+        """
 
         if model_kwargs is None:
             model_kwargs = {}
@@ -344,6 +383,7 @@ class GaussianDiffusion:
             x,
             t,
             model_kwargs=model_kwargs,
+            clip_bounds=clip_bounds,
         )
 
 
@@ -374,8 +414,13 @@ class GaussianDiffusion:
             sample = sample * mask
 
 
-        # Adjacency reverse step: predict-x0-and-resample (Bernoulli)
+        # Adjacency reverse step: predict-x0-and-resample (Bernoulli).
+        # Gamma compression pushes mid-range adj_pred values toward 0, preventing
+        # the positive-feedback loop where dense initial adj → similar node
+        # embeddings → high dot-products → even denser adj_pred → fully connected.
         adj_pred = out["adj_pred"]
+        if adj_gamma != 1.0:
+            adj_pred = adj_pred.clamp(0.0, 1.0) ** adj_gamma
         nonzero_adj = (t != 0).float().view(-1, 1, 1)
         adj_stoch   = th.bernoulli(adj_pred.clamp(0.0, 1.0))
         adj_determ  = (adj_pred > 0.5).float()
@@ -403,11 +448,22 @@ class GaussianDiffusion:
         adj_shape=None,
         model_kwargs=None,
         device=None,
+        adj_init_p=None,
+        adj_gamma=2.0,
+        clip_bounds=None,
     ):
         """
-        shape     : (B, N, F) for node features
-        adj_shape : (B, N, N) — pass this to generate the adjacency from noise.
-                    If None, adj must be supplied in model_kwargs (old behaviour).
+        shape      : (B, N, F) for node features
+        adj_shape  : (B, N, N) — pass to generate adjacency from noise.
+                     If None, adj must be supplied in model_kwargs.
+        adj_init_p : initial Bernoulli probability for adj noise.
+                     Should match the training stationary distribution — i.e.
+                     the true edge density of the dataset.  Defaults to 0.5 if
+                     not provided, but passing the real density (e.g. 0.05-0.15)
+                     avoids the dense-initialisation feedback loop.
+        adj_gamma  : exponent applied to adj_pred at each denoising step.
+                     Values > 1 squash mid-range predictions toward 0 (sparse
+                     bias).  Default 2.0.
         """
 
         if device is None:
@@ -418,10 +474,13 @@ class GaussianDiffusion:
 
         x = th.randn(*shape, device=device)
 
-        # Initialise adjacency from Bernoulli(0.5) when generating graphs
+        # Initialise adjacency.  Using the true edge density instead of 0.5
+        # avoids the positive-feedback loop: dense init → mixed embeddings →
+        # high dot-products → denser adj_pred → fully connected generation.
         adj = None
         if adj_shape is not None:
-            adj = th.bernoulli(th.full(adj_shape, 0.5, device=device))
+            init_p = float(adj_init_p) if adj_init_p is not None else 0.5
+            adj = th.bernoulli(th.full(adj_shape, init_p, device=device))
             adj = (adj + adj.transpose(-1, -2)) / 2
             node_mask = model_kwargs.get("node_mask")
             if node_mask is not None:
@@ -445,11 +504,147 @@ class GaussianDiffusion:
                     x,
                     t,
                     model_kwargs=current_kwargs,
+                    adj_gamma=adj_gamma,
+                    clip_bounds=clip_bounds,
                 )
 
                 x = out["sample"]
                 if adj is not None:
                     adj = out["adj_sample"]
+
+        if adj is not None:
+            return x, adj
+        return x
+
+
+    # ========================================================
+    # DDIM Sampling Loop
+    # ========================================================
+
+    def ddim_sample_loop(
+        self,
+        model,
+        shape,
+        adj_shape=None,
+        model_kwargs=None,
+        device=None,
+        adj_init_p=None,
+        adj_gamma=2.0,
+        ddim_steps=50,
+        eta=0.0,
+        clip_bounds=None,
+    ):
+        """
+        Generate a sample using DDIM (Song et al. 2020) with `ddim_steps` ≤ T.
+
+        DDIM replaces the stochastic ancestral sampler with a (near-)deterministic
+        ODE, allowing generation in far fewer steps than T without retraining.
+
+        Parameters
+        ----------
+        ddim_steps : number of denoising steps (≤ T).  50 gives ~10× speedup
+                     over the full 500-step ancestral chain with minimal quality loss.
+        eta        : stochasticity level.  0.0 = fully deterministic DDIM;
+                     1.0 = DDPM-equivalent noise at each step.
+        adj_init_p : initial Bernoulli density for adj noise (should equal the
+                     training dataset's edge density, e.g. 0.10).
+        adj_gamma  : gamma compression applied to adj_pred before sampling.
+
+        Note: DDIM applies to the continuous node features only.  The adjacency
+        keeps the Bernoulli predict-x0-and-resample step (DDIM is for Gaussians).
+        The binary laundering feature (index 0) also uses direct prediction.
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        if model_kwargs is None:
+            model_kwargs = {}
+
+        # Select ddim_steps evenly-spaced timesteps in [0, T-1] and reverse them
+        indices = list(np.linspace(0, self.num_timesteps - 1, ddim_steps, dtype=int))
+        timestep_seq = list(reversed(indices))  # descending: T-1, ..., 0
+
+        x = th.randn(*shape, device=device)
+
+        adj = None
+        if adj_shape is not None:
+            init_p = float(adj_init_p) if adj_init_p is not None else 0.5
+            adj    = th.bernoulli(th.full(adj_shape, init_p, device=device))
+            adj    = (adj + adj.transpose(-1, -2)) / 2
+            node_mask = model_kwargs.get("node_mask")
+            if node_mask is not None:
+                adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
+
+        for step_idx, t_curr in enumerate(timestep_seq):
+            t_prev = timestep_seq[step_idx + 1] if step_idx + 1 < len(timestep_seq) else -1
+
+            t_vec = th.tensor([t_curr] * shape[0], device=device)
+
+            current_kwargs = {**model_kwargs}
+            if adj is not None:
+                current_kwargs["adj"] = adj
+
+            node_mask = current_kwargs.get("node_mask")
+
+            with th.no_grad():
+                model_out, adj_pred, _ = model(
+                    x * (node_mask.unsqueeze(-1) if node_mask is not None else 1),
+                    self._scale_timesteps(t_vec),
+                    **current_kwargs,
+                )
+
+                # Predict x0 for continuous features from eps prediction
+                pred_xstart_cont = self._predict_xstart_from_eps(
+                    x[..., 1:], t_vec, model_out[..., 1:]
+                )
+                if clip_bounds is not None:
+                    lo, hi = clip_bounds
+                    pred_xstart_cont = pred_xstart_cont.clamp(lo, hi)
+                pred_xstart_bin  = model_out[..., 0:1].clamp(0.0, 1.0)
+                pred_xstart      = th.cat([pred_xstart_bin, pred_xstart_cont], dim=-1)
+                if node_mask is not None:
+                    pred_xstart = pred_xstart * node_mask.unsqueeze(-1)
+
+                # Re-derive eps from pred_xstart (more stable than raw model eps)
+                eps = self._predict_eps_from_xstart(
+                    x[..., 1:], t_vec, pred_xstart[..., 1:]
+                )
+
+                # DDIM update coefficients
+                ab_t    = float(self.alphas_cumprod[t_curr])
+                ab_prev = float(self.alphas_cumprod[t_prev]) if t_prev >= 0 else 1.0
+
+                sigma = (
+                    eta
+                    * math.sqrt((1.0 - ab_prev) / max(1.0 - ab_t, 1e-8))
+                    * math.sqrt(max(1.0 - ab_t / max(ab_prev, 1e-8), 0.0))
+                )
+                dir_coef  = math.sqrt(max(1.0 - ab_prev - sigma ** 2, 0.0))
+
+                # Continuous features: DDIM mean + optional noise
+                mean_cont = (
+                    pred_xstart[..., 1:] * math.sqrt(ab_prev)
+                    + dir_coef * eps
+                )
+                noise = th.randn_like(x[..., 1:]) if t_prev >= 0 else th.zeros_like(x[..., 1:])
+                x_cont = mean_cont + sigma * noise
+
+                # Binary laundering feature: use direct prediction (no DDIM)
+                x_bin = pred_xstart[..., 0:1]
+
+                x = th.cat([x_bin, x_cont], dim=-1)
+                if node_mask is not None:
+                    x = x * node_mask.unsqueeze(-1)
+
+                # Adjacency: Bernoulli predict-x0-and-resample (same as p_sample)
+                if adj is not None:
+                    ap = adj_pred.clamp(0.0, 1.0) ** adj_gamma
+                    if t_prev >= 0:
+                        adj = th.bernoulli(ap)
+                    else:
+                        adj = (ap > 0.5).float()
+                    adj = (adj + adj.transpose(-1, -2)) / 2
+                    if node_mask is not None:
+                        adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
 
         if adj is not None:
             return x, adj
@@ -465,8 +660,11 @@ class GaussianDiffusion:
         noise=None,
         adj_start=None,
         adj_loss_weight=0.5,
-        deg_loss_weight=0.1,
+        density_loss_weight=1.0,
+        node_exist_loss_weight=1.0,
+        mask_dropout_rate=0.4,
         laund_loss_weight=1.0,
+        ghost_node_rate=0.3,
     ):
 
         if model_kwargs is None:
@@ -482,13 +680,69 @@ class GaussianDiffusion:
             x_t, adj_t = self.q_sample(
                 x_start, t, noise=noise, node_mask=node_mask, adj_start=adj_start
             )
-            # Pass noisy adj to the model for message passing
-            training_kwargs = {**model_kwargs, "adj": adj_t}
         else:
             x_t = self.q_sample(x_start, t, noise=noise, node_mask=node_mask)
-            training_kwargs = model_kwargs
+            adj_t = None
 
-        model_output_x, adj_pred = model(
+        # Node-mask corruption: randomly deactivate active nodes proportional to t.
+        # The model must learn to reconstruct the original mask — i.e., decide which
+        # nodes should exist based purely on local structural context.
+        if node_mask is not None:
+            t_frac = (t.float() / max(self.num_timesteps - 1, 1)).unsqueeze(-1)  # [B,1]
+            drop_prob     = t_frac * mask_dropout_rate                            # [B,1]
+            keep          = (th.rand_like(node_mask) >= drop_prob).float()
+            node_mask_t   = node_mask * keep                                      # [B,N]
+            # Zero out features / adj rows+cols for dropped nodes
+            x_t   = x_t   * node_mask_t.unsqueeze(-1)
+            if adj_t is not None:
+                adj_t = adj_t * node_mask_t[:, :, None] * node_mask_t[:, None, :]
+
+            # Ghost node injection: activate padding slots with random features and edges.
+            # This noise looks like "adding new nodes" to the graph, and the model must
+            # learn to mark them as non-existent (node_logits < 0) while also ignoring
+            # their spurious edges. It provides a strong, direct training signal that
+            # teaches sparsity: the target adjacency is 0 for all ghost-involved pairs.
+            if ghost_node_rate > 0.0:
+                inactive = 1.0 - node_mask                           # [B, N] padding slots
+                ghost_prob = (t_frac * ghost_node_rate).clamp(0.0, 0.8)
+                ghost_added = inactive * th.bernoulli(
+                    th.ones_like(node_mask) * ghost_prob
+                )                                                     # [B, N]
+
+                if ghost_added.any():
+                    # Random Gaussian features for ghost nodes; real-node positions
+                    # have ghost_added=0 so they are unaffected.
+                    ghost_feats = th.randn_like(x_t) * ghost_added.unsqueeze(-1)
+                    x_t = x_t + ghost_feats
+
+                    # Activate ghost nodes in the corrupted mask so the model sees them
+                    node_mask_t = (node_mask_t + ghost_added).clamp(0.0, 1.0)
+
+                    # Random edges between ghost nodes and all active (real+ghost) nodes
+                    if adj_t is not None:
+                        g  = ghost_added                            # [B, N]
+                        am = node_mask_t                            # [B, N]
+                        # edge mask: at least one endpoint is a ghost node
+                        ghost_edge_mask = (
+                            g[:, :, None] * am[:, None, :]
+                            + am[:, :, None] * g[:, None, :]
+                        ).clamp(0.0, 1.0)
+                        rand_ghost_adj = (
+                            th.bernoulli(th.full_like(adj_t, 0.5)) * ghost_edge_mask
+                        )
+                        rand_ghost_adj = (
+                            rand_ghost_adj + rand_ghost_adj.transpose(-1, -2)
+                        ) / 2
+                        adj_t = (adj_t + rand_ghost_adj).clamp(0.0, 1.0)
+        else:
+            node_mask_t = None
+
+        # Forward pass with the corrupted mask
+        training_kwargs = {**model_kwargs, "node_mask": node_mask_t}
+        if adj_t is not None:
+            training_kwargs["adj"] = adj_t
+
+        model_output_x, adj_pred, node_logits = model(
             x_t,
             self._scale_timesteps(t),
             **training_kwargs
@@ -563,8 +817,10 @@ class GaussianDiffusion:
                 ).expand(adj_start.shape[0])
                 n_pos = adj_start.sum(dim=[1, 2]).clamp(min=1)
 
-            # pos_weight: upweight positive (edge) class to counter sparsity
-            pos_w = ((n_valid - n_pos) / n_pos).clamp(1.0, 50.0)  # [B]
+            # pos_weight: mild upweight of edges to counter sparsity.
+            # Clamped at 2 — higher values bias the model toward
+            # over-predicting edges, leading to unrealistically dense generation.
+            pos_w = ((n_valid - n_pos) / n_pos).clamp(1.0, 2.0)  # [B]
 
             eps = 1e-6
             adj_pred_c = adj_pred.clamp(eps, 1.0 - eps)
@@ -580,26 +836,32 @@ class GaussianDiffusion:
 
             loss = loss + adj_loss_weight * adj_loss
 
-            # Degree distribution matching: soft degree of adj_pred vs adj_start
-            # Normalise by n_nodes so loss is in [0, 1] instead of [0, N²]
+            # Density regularisation: symmetric squared penalty on the gap
+            # between predicted and true density.  Two-sided so the model is
+            # pulled toward the exact true density rather than just being
+            # prevented from exceeding it — this is the primary signal that
+            # counteracts the inner-product decoder's bias toward dense outputs.
+            true_density = n_pos / n_valid                                   # [B]
             if node_mask is not None:
-                n_nodes_float = node_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # [B, 1]
+                pred_density = (adj_pred_c * mask2d).sum(dim=[1, 2]) / n_valid
             else:
-                n_nodes_float = float(adj_pred.shape[-1])
-            deg_pred = adj_pred.sum(dim=-1) / n_nodes_float   # fractional degree [B, N]
-            deg_true = adj_start.sum(dim=-1) / n_nodes_float  # fractional degree [B, N]
-            deg_mse  = (deg_pred - deg_true) ** 2
+                pred_density = adj_pred_c.mean(dim=[1, 2])
+            density_loss = (pred_density - true_density) ** 2
 
-            if node_mask is not None:
-                deg_loss = (
-                    (deg_mse * node_mask).sum(dim=-1)
-                    / node_mask.sum(dim=-1).clamp(min=1)
-                )
-            else:
-                deg_loss = deg_mse.mean(dim=-1)
+            loss = loss + density_loss_weight * density_loss
 
-            loss = loss + deg_loss_weight * deg_loss
 
+
+        # Node existence loss: predict original mask from the corrupted input.
+        # This teaches the model which nodes *should* be active given the graph
+        # structure — the foundation for meaningful node insertion/deletion.
+        if node_mask is not None:
+            node_exist_loss = th.nn.functional.binary_cross_entropy_with_logits(
+                node_logits,   # [B, N] raw logits
+                node_mask,     # [B, N] original mask (before corruption)
+                reduction="none",
+            ).mean(dim=-1)     # [B]
+            loss = loss + node_exist_loss_weight * node_exist_loss
 
         return {
             "loss": loss,

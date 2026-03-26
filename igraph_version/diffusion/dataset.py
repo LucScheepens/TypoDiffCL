@@ -26,12 +26,9 @@ class NetworkDataset(Dataset):
         # Node features
         # --------------------------------
 
-        x = torch.zeros(n, 3)
-
+        x = torch.zeros(n, 2)
 
         laundering = data["laundering_nodes"]
-        depths = data["node_depths"]
-
 
         # igraph vertex indices: 0..n-1
         for i in range(n):
@@ -42,15 +39,11 @@ class NetworkDataset(Dataset):
             else:
                 node_id = i
 
-
             # Feature 1: laundering
             x[i, 0] = int(node_id in laundering)
 
-            # Feature 2: degree (safe now)
+            # Feature 2: degree
             x[i, 1] = graph.degree(i)
-
-            # Feature 3: depth
-            x[i, 2] = depths.get(node_id, 0)
 
 
         # --------------------------------

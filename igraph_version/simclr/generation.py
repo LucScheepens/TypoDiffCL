@@ -1,0 +1,412 @@
+import math
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import networkx as nx
+import numpy as np
+from pathlib import Path
+from tqdm.auto import tqdm
+from torch_geometric.data import Data, Batch
+
+SIMCLR_DIR = Path(__file__).resolve().parent
+DIFF_DIR   = SIMCLR_DIR.parent / "diffusion"
+MAX_NODES  = 300
+
+# Make sibling packages importable
+if str(SIMCLR_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(SIMCLR_DIR.parent))
+if str(SIMCLR_DIR) not in sys.path:
+    sys.path.insert(0, str(SIMCLR_DIR))
+
+
+def _enforce_connectivity(adj_bin):
+    """
+    Given a [N, N] binary CPU tensor, add the minimum number of edges so that
+    all nodes are in a single connected component.  Components are chained in
+    order: comp[0]-comp[1], comp[1]-comp[2], …
+
+    Returns the connected adjacency and the number of edges added.
+    """
+    G = nx.from_numpy_array(adj_bin.numpy())
+    components = list(nx.connected_components(G))
+    if len(components) == 1:
+        return adj_bin, 0
+    adj_conn = adj_bin.clone()
+    for i in range(len(components) - 1):
+        u = min(components[i])
+        v = min(components[i + 1])
+        adj_conn[u, v] = 1.0
+        adj_conn[v, u] = 1.0
+    return adj_conn, len(components) - 1
+
+
+def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
+    """Convert dense predicted node features + adjacency to a PyG Data object."""
+    x_bin  = x0_nodes[:, 0:1].clamp(0.0, 1.0)
+    x_cont = x0_nodes[:, 1:] * x_std[1:] + x_mean[1:]
+    deg    = adj_soft.sum(dim=-1, keepdim=True)
+    deg_n  = deg / deg.detach().max().clamp(min=1.0)
+    x_feat = torch.cat([x_bin, deg_n, x_cont[:, 1:]], dim=-1)   # [n, 6]
+    ei = (adj_soft.detach() > 0.5).nonzero(as_tuple=False).T.contiguous()
+    if ei.shape[1] == 0:
+        ei = torch.zeros(2, 0, dtype=torch.long, device=device)
+    return Data(x=x_feat, edge_index=ei,
+                batch=torch.zeros(n, dtype=torch.long, device=device))
+
+
+def load_simclr_encoder(device):
+    """Find and load the best SimCLR checkpoint. Returns encoder in eval mode."""
+    from simclr import GraphEncoder
+    ckpt_dir = SIMCLR_DIR / "model_checkpoints"
+    candidates = list(ckpt_dir.glob("*.pt"))
+    best_ckpt_path, best_loss = None, float("inf")
+    for p in candidates:
+        try:
+            c = torch.load(p, map_location="cpu", weights_only=False)
+            if isinstance(c, dict) and "loss" in c and c["loss"] < best_loss:
+                best_loss, best_ckpt_path = c["loss"], p
+        except Exception:
+            pass
+    print(f"Best SimCLR checkpoint: {best_ckpt_path.name}  (loss={best_loss:.4f})")
+    ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
+    encoder = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    encoder.eval()
+    return encoder
+
+
+def load_diffusion_model(device):
+    """Load diffusion model and normalisation stats. Returns (model, diffusion, x_mean, x_std)."""
+    from diffusion.model import DiffusionGNN
+    from diffusion.diff_util import create_diffusion
+    ckpt       = torch.load(DIFF_DIR / "model.pt", map_location=device, weights_only=False)
+    diff_model = DiffusionGNN(node_dim=6, hidden_dim=128, num_layers=4).to(device)
+    diff_model.load_state_dict(ckpt["model"])
+    diff_model.eval()
+    diffusion  = create_diffusion(T=500)
+    x_mean     = ckpt["x_mean"].to(device)
+    x_std      = ckpt["x_std"].to(device)
+    print("Diffusion model loaded.")
+    return diff_model, diffusion, x_mean, x_std
+
+
+def encode_all_networks(networks, encoder, device):
+    """
+    Encode every network with the SimCLR encoder.
+    Returns (H_all_n, y_all) — normalised embeddings and binary labels.
+    """
+    from augmentation import augment_network_view_fast
+    from simclr import network_to_pyg_data_fast
+    all_graphs, all_labels = [], []
+    for net in networks:
+        v = augment_network_view_fast(net)
+        all_graphs.append(network_to_pyg_data_fast(v))
+        all_labels.append(int(len(net["laundering_nodes"]) > 0))
+    with torch.no_grad():
+        H_all = encoder(Batch.from_data_list(all_graphs).to(device)).cpu()
+    H_all_n = F.normalize(H_all, dim=1)           # [N, 128]
+    y_all   = torch.tensor(all_labels, dtype=torch.float32)
+    return H_all_n, y_all
+
+
+def train_mlp_probe(H_all_n, y_all, device, n_epochs=500):
+    """Train a binary MLP probe on frozen SimCLR embeddings. Returns the probe."""
+    probe = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1)).to(device)
+    opt   = torch.optim.Adam(probe.parameters(), lr=5e-3)
+    for _ in range(n_epochs):
+        logit = probe(H_all_n.to(device)).squeeze(-1)
+        loss  = F.binary_cross_entropy_with_logits(logit, y_all.to(device))
+        opt.zero_grad(); loss.backward(); opt.step()
+    with torch.no_grad():
+        preds = (torch.sigmoid(probe(H_all_n.to(device)).squeeze(-1)) > 0.5).cpu()
+    acc = (preds == y_all.bool()).float().mean()
+    print(f"MLP probe accuracy: {acc:.3f}")
+    for p in probe.parameters():
+        p.requires_grad_(False)
+    return probe
+
+
+def guided_generate(
+    seed_network,
+    encoder,
+    probe,
+    diff_model,
+    diffusion,
+    x_mean,
+    x_std,
+    H_train,
+    device,
+    target_label=1,
+    t_start=350,
+    guidance_scale=2.0,
+    novelty_weight=2.0,
+    novelty_k=10,
+    guide_every=5,
+    guide_from=0.25,
+    degree_penalty=0.5,
+    target_mean_degree=None,
+    adj_threshold=0.5,
+    adj_gamma=2.5,
+    target_density=None,
+    pbar=None,
+):
+    """
+    Generate one network via diffusion guided by:
+      1. Classification loss  — steer towards target_label
+      2. Novelty repulsion    — push away from K nearest training embeddings
+
+    Returns (x_out, adj_out, n_nodes) all on CPU.
+    """
+    from diffusion.diff_util import network_to_dense
+
+    if "x_dense" in seed_network and "adj_dense" in seed_network:
+        x   = seed_network["x_dense"].to(device)
+        adj = seed_network["adj_dense"].to(device)
+    else:
+        x, adj = network_to_dense(seed_network)
+        x, adj = x.to(device), adj.to(device)
+    n = x.shape[0]
+
+    x_pad   = torch.zeros(1, MAX_NODES, 6,         device=device)
+    adj_pad = torch.zeros(1, MAX_NODES, MAX_NODES,  device=device)
+    mask    = torch.zeros(1, MAX_NODES,             device=device)
+    x_pad[0, :n]       = x
+    adj_pad[0, :n, :n] = adj
+    mask[0, :n]        = 1.0
+
+    x_norm = x_pad.clone()
+    x_norm[:, :, 1:] = (x_pad[:, :, 1:] - x_mean[1:]) / x_std[1:]
+    x_norm  = x_norm  * mask.unsqueeze(-1)
+    adj_pad = adj_pad * mask[:, :, None] * mask[:, None, :]
+
+    t_tensor   = torch.tensor([t_start], device=device)
+    x_t, adj_t = diffusion.q_sample(x_norm, t_tensor, node_mask=mask, adj_start=adj_pad)
+
+    guide_threshold = int(guide_from * t_start)
+    cached_grad     = None
+    cached_grad_adj = None
+    H_dev = H_train.to(device) if H_train is not None else None
+
+    for step_i, t_curr in enumerate(range(t_start, -1, -1)):
+        t_vec    = torch.tensor([t_curr], device=device)
+        t_scaled = diffusion._scale_timesteps(t_vec)
+        eff_guide_every = 1 if t_curr < 100 else guide_every
+        do_guide = (t_curr < guide_threshold) and (step_i % eff_guide_every == 0)
+
+        if do_guide:
+            with torch.enable_grad():
+                x_t_g   = x_t.detach().requires_grad_(True)
+                adj_t_g = adj_t.detach().requires_grad_(True)
+                eps_pred, adj_pred, _ = diff_model(x_t_g, t_scaled,
+                                                   adj=adj_t_g, node_mask=mask)
+                x0_cont = diffusion._predict_xstart_from_eps(
+                              x_t_g[..., 1:], t_vec, eps_pred[..., 1:])
+                x0_bin  = eps_pred[..., 0:1].clamp(0, 1)
+                x0_pred = torch.cat([x0_bin, x0_cont], dim=-1)
+
+                pyg   = _to_pyg(x0_pred[0, :n], adj_pred[0, :n, :n], n, device, x_mean, x_std)
+                h     = encoder(pyg)
+                h_n   = F.normalize(h, dim=-1)           # [1, 128]
+
+                score  = torch.sigmoid(probe(h_n)).squeeze()
+                g_loss = (-torch.log(score + 1e-8) if target_label == 1
+                          else -torch.log(1 - score + 1e-8))
+
+                # Novelty weight ramps up as t decreases so classification
+                # dominates the structural phase and novelty dominates fine detail
+                t_frac      = t_curr / max(t_start, 1)
+                eff_novelty = novelty_weight * (1.0 - t_frac)
+                if H_dev is not None and eff_novelty > 0.0:
+                    cos_sims   = (H_dev @ h_n.T).squeeze()
+                    top_k_sims = torch.topk(cos_sims, min(novelty_k, len(H_dev))).values
+                    g_loss     = g_loss + eff_novelty * top_k_sims.mean()
+
+                # Degree penalty — penalises excess degree above training target.
+                # Uses squared one-sided loss so it pulls toward realistic density
+                # rather than toward zero edges.
+                if degree_penalty > 0.0:
+                    mean_deg = adj_pred[0, :n, :n].sum(dim=-1).mean()
+                    if target_mean_degree is not None:
+                        excess = torch.relu(mean_deg - target_mean_degree)
+                        g_loss = g_loss + degree_penalty * excess ** 2
+                    else:
+                        g_loss = g_loss + degree_penalty * mean_deg
+
+                grads = torch.autograd.grad(g_loss, [x_t_g, adj_t_g])
+                # Clip to prevent instability from large gradient magnitudes
+                cached_grad     = grads[0].detach().clamp(-1.0, 1.0)
+                cached_grad_adj = grads[1].detach().clamp(-1.0, 1.0)
+                # Cache eps and adj_pred for use in the denoising step below
+                cached_eps_pred  = eps_pred.detach()
+                cached_adj_pred  = adj_pred.detach()
+        else:
+            with torch.no_grad():
+                eps_pred, adj_pred, _ = diff_model(x_t, t_scaled,
+                                                   adj=adj_t, node_mask=mask)
+                x0_cont = diffusion._predict_xstart_from_eps(
+                              x_t[..., 1:], t_vec, eps_pred[..., 1:])
+                x0_bin  = eps_pred[..., 0:1].clamp(0, 1)
+                x0_pred = torch.cat([x0_bin, x0_cont], dim=-1)
+                cached_eps_pred = eps_pred
+                cached_adj_pred = adj_pred
+
+        with torch.no_grad():
+            coef1    = float(diffusion.posterior_mean_coef1[t_curr])
+            coef2    = float(diffusion.posterior_mean_coef2[t_curr])
+            post_lv  = float(diffusion.posterior_log_variance_clipped[t_curr])
+
+            if cached_grad is not None:
+                # condition_score guidance (Song et al. 2020):
+                # Modify the epsilon prediction in score-function space rather
+                # than shifting the posterior mean after the fact.  This is more
+                # principled: eps_guided = eps + sqrt(1-ᾱ_t) * ∇_x_t log p(y|x_t)
+                # Since cached_grad = d(g_loss)/d(x_t) = -∇ log p(y|x_t),
+                # the correction is +sqrt(1-ᾱ_t) * cached_grad.
+                sqrt_1m_ab  = math.sqrt(max(1.0 - float(diffusion.alphas_cumprod[t_curr]), 1e-8))
+                eps_guided  = (cached_eps_pred[..., 1:].detach()
+                               + guidance_scale * sqrt_1m_ab * cached_grad[..., 1:])
+                x0_cont_g   = diffusion._predict_xstart_from_eps(
+                                  x_t.detach()[..., 1:], t_vec, eps_guided)
+                x0_bin_g    = cached_eps_pred[..., 0:1].detach().clamp(0, 1)
+                x0_d        = torch.cat([x0_bin_g, x0_cont_g], dim=-1) * mask.unsqueeze(-1)
+            else:
+                x0_d = torch.cat([x0_pred[..., 0:1].clamp(0, 1),
+                                   x0_pred[..., 1:]], dim=-1).detach()
+                x0_d = x0_d * mask.unsqueeze(-1)
+
+            mean  = coef1 * x0_d + coef2 * x_t.detach()
+            noise = torch.randn_like(x_t) * mask.unsqueeze(-1)
+            x_t   = (mean + (t_curr > 0) * np.exp(0.5 * post_lv) * noise) * mask.unsqueeze(-1)
+
+            # Adjacency guidance: operate in logit space for numerical stability.
+            # Subtracting guidance_scale * grad moves adj_pred in the direction
+            # that decreases g_loss (i.e. toward the target class).
+            ap = cached_adj_pred.clamp(0, 1)
+            if cached_grad_adj is not None:
+                ap_logit = torch.logit(ap.clamp(1e-6, 1.0 - 1e-6))
+                ap_logit = ap_logit - guidance_scale * cached_grad_adj
+                ap = torch.sigmoid(ap_logit)
+
+            # Gamma compression: squash mid-range probabilities toward zero,
+            # preserving only high-confidence edges.  Counters the over-dense
+            # predictions from checkpoints trained with high pos_weight.
+            ap = ap ** adj_gamma
+
+            if t_curr > 0:
+                adj_t = torch.bernoulli(ap)
+            elif target_density is not None:
+                # Density-calibrated threshold: keep only enough edges to match
+                # the training mean density, selecting the highest-confidence ones.
+                n_active = int(mask[0].sum().item())
+                n_keep   = max(1, round(target_density * n_active * (n_active - 1) / 2))
+                ap_flat  = ap[0, :n, :n].reshape(-1)
+                if n_keep * 2 < len(ap_flat):
+                    kth   = ap_flat.kthvalue(len(ap_flat) - n_keep * 2).values.item()
+                    adj_t = (ap > max(kth, 0.05)).float()
+                else:
+                    adj_t = (ap > adj_threshold).float()
+            else:
+                adj_t = (ap > adj_threshold).float()
+
+            adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2 * mask[:, :, None] * mask[:, None, :]
+
+        if pbar is not None:
+            pbar.update(1)
+
+    # Guarantee a single connected component before returning
+    adj_out = adj_t[0, :n, :n].cpu()
+    adj_out, _ = _enforce_connectivity(adj_out)
+    return x_t[0, :n].cpu(), adj_out, n
+
+
+def run_guided_generation(
+    networks,
+    encoder,
+    probe,
+    diff_model,
+    diffusion,
+    x_mean,
+    x_std,
+    H_all_n,
+    device,
+    target_label=1,
+    n_gen=8,
+    t_start=350,
+    guidance_scale=2.0,
+    novelty_weight=2.0,
+    guide_every=5,
+    guide_from=0.25,
+    degree_penalty=0.5,
+    adj_threshold=0.5,
+):
+    """
+    Generate n_gen networks using guided diffusion.
+    Seeds are drawn equally from laundering and clean training networks.
+
+    Returns (gen_outputs, gen_embeddings, seeds):
+        gen_outputs    : list of (x_denorm, adj, n_nodes) tuples
+        gen_embeddings : np.ndarray [n_gen, 128]  normalised encoder embeddings
+        seeds          : list of seed network dicts
+    """
+    import random as _random
+    from diffusion.diff_util import network_to_dense as _ntd
+
+    # Compute training mean degree and edge density for calibrated generation
+    mean_degs, densities = [], []
+    for net in networks:
+        adj = net["adj_dense"] if "adj_dense" in net else _ntd(net)[1]
+        n = adj.shape[0]
+        n_edges = float(adj.sum()) / 2
+        mean_degs.append(float(adj.sum(dim=-1).mean()))
+        if n > 1:
+            densities.append(n_edges / (n * (n - 1) / 2))
+    target_mean_degree = float(np.mean(mean_degs)) if mean_degs else None
+    target_density     = float(np.mean(densities)) if densities else None
+
+    laund_nets = [n for n in networks if     len(n["laundering_nodes"]) > 0]
+    clean_nets = [n for n in networks if not len(n["laundering_nodes"]) > 0]
+    seeds = (
+        _random.sample(laund_nets, min(n_gen // 2, len(laund_nets)))
+      + _random.sample(clean_nets, min(n_gen // 2, len(clean_nets)))
+    )
+
+    gen_outputs, gen_embeddings = [], []
+
+    with tqdm(total=len(seeds) * (t_start + 1),
+              desc=f"Generating {len(seeds)} networks",
+              unit="step", dynamic_ncols=True) as pbar:
+        for i, seed in enumerate(seeds):
+            pbar.set_postfix(network=f"{i+1}/{len(seeds)}")
+            x_out, adj_out, n_out = guided_generate(
+                seed, encoder, probe, diff_model, diffusion,
+                x_mean, x_std, H_all_n, device,
+                target_label=target_label,
+                t_start=t_start, guidance_scale=guidance_scale,
+                novelty_weight=novelty_weight,
+                guide_every=guide_every, guide_from=guide_from,
+                degree_penalty=degree_penalty,
+                target_mean_degree=target_mean_degree,
+                adj_threshold=adj_threshold,
+                target_density=target_density,
+                pbar=pbar,
+            )
+
+            # Denormalise node features
+            x_cont_d = x_out[:, 1:] * x_std.cpu()[1:] + x_mean.cpu()[1:]
+            x_bin_d  = x_out[:, 0:1].clamp(0, 1)
+            deg_g    = adj_out.sum(dim=-1, keepdim=True)
+            deg_n    = deg_g / deg_g.max().clamp(min=1.0)
+            x_denorm = torch.cat([x_bin_d, deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 6]
+
+            gen_outputs.append((x_denorm, adj_out, n_out))
+
+            ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
+            bv_g = torch.zeros(n_out, dtype=torch.long)
+            with torch.no_grad():
+                h_g = encoder(Data(x=x_denorm, edge_index=ei_g,
+                                   batch=bv_g).to(device)).cpu()
+            gen_embeddings.append(F.normalize(h_g, dim=-1).squeeze(0).numpy())
+
+    gen_embeddings = np.stack(gen_embeddings, axis=0)
+    return gen_outputs, gen_embeddings, seeds
