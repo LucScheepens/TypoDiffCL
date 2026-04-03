@@ -68,14 +68,18 @@ ELLIPTIC_DIR = _THIS_DIR.parent.parent / "data" / "elliptic_bitcoin_dataset"
 # ─────────────────────────────────────────────────────────────────────────────
 # Subgraph extraction
 # ─────────────────────────────────────────────────────────────────────────────
-def _bfs_ego(G: nx.Graph, anchor: int, max_nodes: int) -> set:
+def _bfs_ego(G: nx.Graph, anchor: int, max_nodes: int, depth: int = 4) -> set:
     """
-    Collect the 2-hop neighbourhood of `anchor` via BFS, capped at max_nodes.
-    Returns a set of node IDs (always includes anchor).
+    Collect the `depth`-hop neighbourhood of `anchor` via BFS, capped at
+    max_nodes.  Returns a set of node IDs (always includes anchor).
+
+    Default depth=4 matches the IBM AML extraction convention (max_depth=4)
+    and produces substantially larger ego-subgraphs than the previous 2-hop
+    default, giving the diffusion model richer seeds to work from.
     """
     visited = {anchor}
     frontier = [anchor]
-    for _ in range(2):                              # 2 hops
+    for _ in range(depth):
         next_frontier = []
         for u in frontier:
             for v in G.neighbors(u):
@@ -152,7 +156,7 @@ def _to_pyg(G_sub: nx.Graph, feat: np.ndarray, label: int, timestep: int = -1) -
         x          = torch.tensor(feat, dtype=torch.float),
         edge_index = edge_index,
         y          = torch.tensor([label], dtype=torch.long),
-        timestep   = torch.tensor(timestep, dtype=torch.long),
+        timestep   = torch.tensor([timestep], dtype=torch.long),
     )
 
 
@@ -163,21 +167,26 @@ def load_elliptic_pyg_graphs(
     data_dir        = ELLIPTIC_DIR,
     min_nodes : int = 3,
     max_nodes : int = 100,
+    depth     : int = 4,
     deduplicate: bool = True,
     verbose   : bool = True,
 ) -> list:
     """
     Load the Elliptic Bitcoin Dataset and return a list of PyG Data objects.
 
-    For each labeled transaction a 2-hop ego subgraph (capped at max_nodes)
-    is extracted from the timestep graph.  The graph label equals the
-    anchor transaction's class (1 = illicit, 0 = licit).
+    For each labeled transaction a `depth`-hop ego subgraph (capped at
+    max_nodes) is extracted from the timestep graph.  The graph label equals
+    the anchor transaction's class (1 = illicit, 0 = licit).
+
+    depth=4 (default) matches the IBM AML extraction convention and produces
+    larger, richer subgraphs than the previous 2-hop default.
 
     Parameters
     ----------
     data_dir    : directory containing the three Elliptic CSV files
     min_nodes   : minimum ego size to include (default 3)
     max_nodes   : BFS cap on ego size (default 100)
+    depth       : BFS hop depth around each anchor transaction (default 4)
     deduplicate : skip egos whose node-set duplicates one already seen
     verbose     : print progress
 
@@ -255,7 +264,7 @@ def load_elliptic_pyg_graphs(
 
         for anchor in labeled_in_ts:
             label    = class_map[anchor]      # 0 or 1
-            ego_set  = _bfs_ego(G, anchor, max_nodes)
+            ego_set  = _bfs_ego(G, anchor, max_nodes, depth=depth)
             n        = len(ego_set)
 
             if n < min_nodes:

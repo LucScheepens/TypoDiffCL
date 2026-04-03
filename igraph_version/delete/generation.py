@@ -149,6 +149,7 @@ def guided_generate(
     adj_threshold=0.5,
     adj_gamma=2.5,
     target_density=None,
+    max_nodes=None,
     pbar=None,
 ):
     """
@@ -160,6 +161,8 @@ def guided_generate(
     """
     from diffusion.diff_util import network_to_dense
 
+    _max = max_nodes if max_nodes is not None else MAX_NODES
+
     if "x_dense" in seed_network and "adj_dense" in seed_network:
         x   = seed_network["x_dense"].to(device)
         adj = seed_network["adj_dense"].to(device)
@@ -168,9 +171,9 @@ def guided_generate(
         x, adj = x.to(device), adj.to(device)
     n = x.shape[0]
 
-    x_pad   = torch.zeros(1, MAX_NODES, 6,         device=device)
-    adj_pad = torch.zeros(1, MAX_NODES, MAX_NODES,  device=device)
-    mask    = torch.zeros(1, MAX_NODES,             device=device)
+    x_pad   = torch.zeros(1, _max, 6,       device=device)
+    adj_pad = torch.zeros(1, _max, _max,    device=device)
+    mask    = torch.zeros(1, _max,           device=device)
     x_pad[0, :n]       = x
     adj_pad[0, :n, :n] = adj
     mask[0, :n]        = 1.0
@@ -529,6 +532,7 @@ def run_guided_generation_elliptic(
     guide_from=0.25,
     degree_penalty=0.5,
     adj_threshold=0.5,
+    max_nodes=100,
 ):
     """
     Like run_guided_generation() but seeds are Elliptic PyG Data objects.
@@ -609,6 +613,7 @@ def run_guided_generation_elliptic(
                 target_mean_degree=target_mean_degree,
                 adj_threshold=adj_threshold,
                 target_density=target_density,
+                max_nodes=max_nodes,
                 pbar=pbar,
             )
 

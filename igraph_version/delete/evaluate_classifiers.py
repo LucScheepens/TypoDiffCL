@@ -588,7 +588,7 @@ def main():
             print(f"  [{skipped} IBM networks skipped]")
 
     if args.dataset in ("elliptic", "both"):
-        from elliptic_adapter import load_elliptic_pyg_graphs
+        from grad.igraph_version.archive.elliptic_adapter import load_elliptic_pyg_graphs
         elliptic_graphs = load_elliptic_pyg_graphs()
         all_data.extend(elliptic_graphs)
 
@@ -688,7 +688,7 @@ def main():
             # Requires elliptic_diffusion_train.py and elliptic_simclr_train.py
             # to have been run first.
             print(f"[Elliptic] Generating {args.n_gen} augmentation graphs …")
-            from generation import (
+            from grad.igraph_version.delete.generation import (
                 load_simclr_encoder_elliptic,
                 load_diffusion_model_elliptic,
                 encode_all_pyg_graphs,
@@ -724,7 +724,7 @@ def main():
         else:
             # ── IBM augmentation path (original) ──────────────────────────
             print(f"Generating {args.n_gen} augmentation networks …")
-            from generation import (
+            from grad.igraph_version.delete.generation import (
                 load_simclr_encoder, load_diffusion_model,
                 encode_all_networks, train_mlp_probe, run_guided_generation,
             )

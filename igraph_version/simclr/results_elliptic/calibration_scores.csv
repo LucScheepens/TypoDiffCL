@@ -1,0 +1,6 @@
+#,label,score,realism,novelty,mah_distance,max_cosine_sim,mean_top10_sim
+1,training,0.0,0.8591,0.0,1.199,1.0,1.0
+2,training,0.0011,0.5711,0.0018,4.422,1.0,0.9982
+3,training,0.0,0.7395,0.0,2.382,1.0,1.0
+4,training,-0.0,0.7869,-0.0,1.891,1.0,1.0
+5,training,-0.0,0.7869,-0.0,1.891,1.0,1.0

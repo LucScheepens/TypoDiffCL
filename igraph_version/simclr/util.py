@@ -44,7 +44,7 @@ def build_igraph_from_df(df):
 
 def extract_laundering_networks_igraph(
     df,
-    max_depth=5,
+    max_depth=2,
     max_networks=10,
     collapse_threshold=10,
     max_nodes = None
@@ -159,7 +159,7 @@ import random
 
 def extract_non_laundering_networks_igraph(
     df,
-    max_depth=5,
+    max_depth=2,
     max_networks=10,
     collapse_threshold=10,
     min_size=10,

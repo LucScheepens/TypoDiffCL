@@ -19,7 +19,7 @@ code is reusable without modification)
 Outputs
 ───────
   diffusion/model_elliptic.pt          trained diffusion checkpoint
-  simclr/elliptic_diffusion_cache.pt   dense (x, adj) pairs for fast reloads
+  simclr/elliptic_diffusion_cache_d4.pt  dense (x, adj) pairs for fast reloads
 
 Usage
 ─────
@@ -69,7 +69,7 @@ LAUND_LOSS_W      = 2.0     # upweight illicit BCE — mirrors IBM convention
 MAX_GRAD_NORM     = 1.0
 VIZ_INTERVAL      = 50
 
-CACHE_PATH = BASE_DIR / "elliptic_diffusion_cache.pt"
+CACHE_PATH = BASE_DIR / "elliptic_diffusion_cache_d4.pt"
 CKPT_PATH  = DIFF_DIR / "model_elliptic.pt"
 
 

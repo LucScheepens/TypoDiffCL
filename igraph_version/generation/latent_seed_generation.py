@@ -69,11 +69,16 @@ import umap
 from tqdm.auto import tqdm
 
 # ── path setup ─────────────────────────────────────────────────────────────────
-SIMCLR_DIR = Path(__file__).resolve().parent
-if str(SIMCLR_DIR.parent) not in sys.path:
-    sys.path.insert(0, str(SIMCLR_DIR.parent))
-if str(SIMCLR_DIR) not in sys.path:
-    sys.path.insert(0, str(SIMCLR_DIR))
+_GEN_DIR   = Path(__file__).resolve().parent   # igraph_version/generation/
+ROOT_DIR   = _GEN_DIR.parent                   # igraph_version/
+DIFF_DIR   = ROOT_DIR / "diffusion"
+SIMCLR_DIR = ROOT_DIR / "simclr"
+CKPT_DIR   = ROOT_DIR / "checkpoints"
+DATA_DIR   = ROOT_DIR / "data"
+
+for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from util import (
     preprocess_df,
@@ -81,7 +86,7 @@ from util import (
     extract_non_laundering_networks_igraph,
 )
 from augmentation import build_igraph_from_transactions
-from generation import (
+from generation.generation import (
     load_simclr_encoder,
     load_diffusion_model,
     encode_all_networks,
@@ -916,12 +921,12 @@ def main():
     import numpy as np
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    results_dir = SIMCLR_DIR / "results" / "latent_seed"
+    results_dir = ROOT_DIR / "results" / "ibm" / "latent_seed"
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"Results → {results_dir}\n")
 
     # ── 1. Load networks ──────────────────────────────────────────────────────
-    CACHE_PATH = SIMCLR_DIR / "networks_cache.pkl"
+    CACHE_PATH = DATA_DIR / "networks_cache.pkl"
     df_full    = preprocess_df(CSV_PATH)
 
     if CACHE_PATH.exists():

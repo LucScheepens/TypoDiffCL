@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 BASE_DIR = Path(__file__).resolve().parent
 DIFF_DIR = BASE_DIR.parent / "diffusion"
+DATA_DIR = BASE_DIR.parent / "data"
 
 # igraph_version/ — makes `diffusion.*` and `simclr.*` resolve as packages
 if str(DIFF_DIR.parent) not in sys.path:
@@ -27,7 +28,7 @@ from augmentation import build_igraph_from_transactions
 from util import preprocess_df, extract_laundering_networks_igraph, extract_non_laundering_networks_igraph
 
 # Separate cache from the diffusion (x,adj)-tuple cache — stores full network dicts with igraph graphs
-SIMCLR_CACHE = BASE_DIR / "simclr_networks_cache.pt"
+SIMCLR_CACHE = DATA_DIR / "simclr_networks_cache.pt"
 MAX_NODES = 300
 
 def load_or_build_networks(df_full):
@@ -78,7 +79,7 @@ def load_or_build_networks(df_full):
 
 def load_diffusion(device):
     """Load the trained diffusion model from the sibling diffusion directory."""
-    ckpt_path = DIFF_DIR / "model.pt"
+    ckpt_path = BASE_DIR.parent / "checkpoints" / "diffusion_ibm" / "model.pt"
     if not ckpt_path.exists():
         print(f"[diffusion] No checkpoint at {ckpt_path} — diffusion augmentation disabled.")
         return None, None, None, None
@@ -125,7 +126,7 @@ if __name__ == "__main__":
         device=device,
         batch_size=128,
         epochs=100,
-        checkpoint_dir=str(BASE_DIR / "model_checkpoints"),
+        checkpoint_dir=str(BASE_DIR.parent / "checkpoints" / "simclr_ibm"),
         # Diffusion augmentation (ignored if diff_model is None)
         diffusion_model=diff_model,
         diffusion=diffusion,

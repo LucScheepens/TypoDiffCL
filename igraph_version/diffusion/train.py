@@ -9,6 +9,7 @@ from torch.optim import Adam
 from torch.utils.data import DataLoader
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR.parent / "data"
 sys.path.insert(0, str(BASE_DIR.parent))   # igraph_version/ — makes simclr importable
 
 from collate import collate_fn
@@ -47,7 +48,7 @@ MAX_GRAD_NORM = 1.0
 
 VIZ_INTERVAL  = 50
 GRAPHS_DIR    = str(BASE_DIR / "graphs")
-CACHE_PATH    = str(BASE_DIR / "cached_dataset.pt")
+CACHE_PATH    = str(DATA_DIR / "cached_dataset.pt")
 
 
 def _needs_rebuild():
@@ -211,7 +212,7 @@ if __name__ == "__main__":
             "model": model.state_dict(),
             "x_mean": x_mean.cpu(),
             "x_std":  x_std.cpu(),
-        }, BASE_DIR / "model.pt")
+        }, BASE_DIR.parent / "checkpoints" / "diffusion_ibm" / "model.pt")
 
         if (epoch + 1) % VIZ_INTERVAL == 0 or (epoch + 1) == EPOCHS:
             model.eval()
