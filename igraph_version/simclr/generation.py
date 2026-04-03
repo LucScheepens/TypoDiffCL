@@ -410,3 +410,223 @@ def run_guided_generation(
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
     return gen_outputs, gen_embeddings, seeds
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Elliptic equivalents  (PyG Data objects instead of IBM network dicts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_simclr_encoder_elliptic(device):
+    """
+    Like load_simclr_encoder() but reads from model_checkpoints_elliptic/.
+    Run elliptic_simclr_train.py first to produce the checkpoint.
+    """
+    from simclr import GraphEncoder
+    ckpt_dir   = SIMCLR_DIR / "model_checkpoints_elliptic"
+    candidates = list(ckpt_dir.glob("*.pt"))
+    best_path, best_loss = None, float("inf")
+    for p in candidates:
+        try:
+            c = torch.load(p, map_location="cpu", weights_only=False)
+            if isinstance(c, dict) and "loss" in c and c["loss"] < best_loss:
+                best_loss, best_path = c["loss"], p
+        except Exception:
+            pass
+    if best_path is None:
+        raise FileNotFoundError(
+            f"No valid checkpoint found in {ckpt_dir}. "
+            "Run elliptic_simclr_train.py first."
+        )
+    print(f"Best Elliptic SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
+    ckpt    = torch.load(best_path, map_location=device, weights_only=False)
+    encoder = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    encoder.eval()
+    return encoder
+
+
+def load_diffusion_model_elliptic(device):
+    """
+    Like load_diffusion_model() but loads diffusion/model_elliptic.pt.
+    Run elliptic_diffusion_train.py first to produce the checkpoint.
+    """
+    from diffusion.model    import DiffusionGNN
+    from diffusion.diff_util import create_diffusion
+    model_path = DIFF_DIR / "model_elliptic.pt"
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"Elliptic diffusion checkpoint not found at {model_path}. "
+            "Run elliptic_diffusion_train.py first."
+        )
+    ckpt       = torch.load(model_path, map_location=device, weights_only=False)
+    diff_model = DiffusionGNN(node_dim=6, hidden_dim=128, num_layers=4).to(device)
+    diff_model.load_state_dict(ckpt["model"])
+    diff_model.eval()
+    diffusion  = create_diffusion(T=500)
+    x_mean     = ckpt["x_mean"].to(device)
+    x_std      = ckpt["x_std"].to(device)
+    print(f"Elliptic diffusion model loaded from {model_path}.")
+    return diff_model, diffusion, x_mean, x_std
+
+
+def encode_all_pyg_graphs(graphs, encoder, device, batch_size=128):
+    """
+    Encode a list of Elliptic PyG Data objects with the Elliptic SimCLR encoder.
+
+    Each graph's .x [n, 5] is extended to [n, 6] by prepending .y as col 0,
+    matching the convention used during elliptic_simclr_train.py training.
+
+    Parameters
+    ----------
+    graphs     : list[PyG Data]  with .x [n,5] and .y [1]
+    encoder    : GraphEncoder (in_dim=6, trained on Elliptic)
+    device     : torch.device
+    batch_size : graphs per forward pass
+
+    Returns
+    -------
+    H_all_n : Tensor [N, 128]  L2-normalised embeddings
+    y_all   : Tensor [N]       float labels (0 = licit, 1 = illicit)
+    """
+    from torch_geometric.data import Data as _Data, Batch as _Batch
+
+    ext_graphs, all_labels = [], []
+    for g in graphs:
+        n         = g.x.shape[0]
+        label_col = torch.full((n, 1), float(g.y.item()))
+        x6        = torch.cat([label_col, g.x], dim=1)        # [n, 6]
+        ext_graphs.append(_Data(x=x6, edge_index=g.edge_index.clone()))
+        all_labels.append(float(g.y.item()))
+
+    H_list = []
+    with torch.no_grad():
+        for i in range(0, len(ext_graphs), batch_size):
+            chunk = _Batch.from_data_list(ext_graphs[i : i + batch_size]).to(device)
+            H_list.append(encoder(chunk).cpu())
+
+    H_all   = torch.cat(H_list, dim=0)                        # [N, 128]
+    H_all_n = F.normalize(H_all, dim=1)
+    y_all   = torch.tensor(all_labels, dtype=torch.float32)
+    return H_all_n, y_all
+
+
+def run_guided_generation_elliptic(
+    graphs,
+    encoder,
+    probe,
+    diff_model,
+    diffusion,
+    x_mean,
+    x_std,
+    H_all_n,
+    device,
+    target_label=1,
+    n_gen=8,
+    t_start=350,
+    guidance_scale=2.0,
+    novelty_weight=2.0,
+    guide_every=5,
+    guide_from=0.25,
+    degree_penalty=0.5,
+    adj_threshold=0.5,
+):
+    """
+    Like run_guided_generation() but seeds are Elliptic PyG Data objects.
+
+    Each seed's .x [n, 5] is extended to [n, 6] (prepend .y as col 0) and
+    converted to a minimal IBM-style dict {"x_dense": …, "adj_dense": …} so
+    that the existing guided_generate() function can be called without changes.
+
+    Seed selection mirrors the IBM convention:
+      n_gen // 2 seeds drawn from illicit  (y=1) graphs
+      n_gen // 2 seeds drawn from licit    (y=0) graphs
+
+    Returns (gen_outputs, gen_embeddings, seeds) with the same layout as
+    run_guided_generation(), so gen_output_to_pyg() in evaluate_classifiers.py
+    works unchanged.
+    """
+    import random as _random
+
+    def _pyg_to_seed_dict(g):
+        """Convert an Elliptic PyG Data (5-D) to a fake IBM dict for guided_generate."""
+        n         = g.x.shape[0]
+        label_col = torch.full((n, 1), float(g.y.item()))
+        x6        = torch.cat([label_col, g.x], dim=1)    # [n, 6]
+
+        adj = torch.zeros(n, n)
+        ei  = g.edge_index
+        if ei.shape[1] > 0:
+            valid = ei[0] != ei[1]
+            src, dst = ei[0][valid], ei[1][valid]
+            inbounds = (src < n) & (dst < n)
+            adj[src[inbounds], dst[inbounds]] = 1.0
+            adj = (adj + adj.T).clamp(max=1.0)
+
+        return {"x_dense": x6, "adj_dense": adj}
+
+    # Compute training mean degree and density for calibrated generation
+    mean_degs, densities = [], []
+    for g in graphs:
+        n       = g.x.shape[0]
+        ei      = g.edge_index
+        n_edges = ei.shape[1] // 2          # bidirectional → halve
+        deg     = torch.zeros(n)
+        if ei.shape[1] > 0:
+            deg.scatter_add_(0, ei[0], torch.ones(ei.shape[1]))
+        mean_degs.append(float(deg.mean()))
+        if n > 1:
+            densities.append(n_edges / (n * (n - 1) / 2))
+    target_mean_degree = float(np.mean(mean_degs)) if mean_degs else None
+    target_density     = float(np.mean(densities)) if densities else None
+
+    illicit = [g for g in graphs if g.y.item() == 1]
+    licit   = [g for g in graphs if g.y.item() == 0]
+    seeds   = (
+        _random.sample(illicit, min(n_gen // 2, len(illicit)))
+      + _random.sample(licit,   min(n_gen // 2, len(licit)))
+    )
+
+    gen_outputs, gen_embeddings = [], []
+
+    with tqdm(total=len(seeds) * (t_start + 1),
+              desc=f"Generating {len(seeds)} Elliptic graphs",
+              unit="step", dynamic_ncols=True) as pbar:
+        for i, seed_g in enumerate(seeds):
+            pbar.set_postfix(graph=f"{i+1}/{len(seeds)}")
+
+            # Convert to the dict format that guided_generate() expects.
+            # It checks for "x_dense"/"adj_dense" first (fast path, lines 163-168).
+            seed_dict = _pyg_to_seed_dict(seed_g)
+
+            x_out, adj_out, n_out = guided_generate(
+                seed_dict, encoder, probe, diff_model, diffusion,
+                x_mean, x_std, H_all_n, device,
+                target_label=target_label,
+                t_start=t_start, guidance_scale=guidance_scale,
+                novelty_weight=novelty_weight,
+                guide_every=guide_every, guide_from=guide_from,
+                degree_penalty=degree_penalty,
+                target_mean_degree=target_mean_degree,
+                adj_threshold=adj_threshold,
+                target_density=target_density,
+                pbar=pbar,
+            )
+
+            # Denormalise node features — identical to run_guided_generation
+            x_cont_d = x_out[:, 1:] * x_std.cpu()[1:] + x_mean.cpu()[1:]
+            x_bin_d  = x_out[:, 0:1].clamp(0, 1)
+            deg_g    = adj_out.sum(dim=-1, keepdim=True)
+            deg_n    = deg_g / deg_g.max().clamp(min=1.0)
+            x_denorm = torch.cat([x_bin_d, deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 6]
+
+            gen_outputs.append((x_denorm, adj_out, n_out))
+
+            ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
+            bv_g = torch.zeros(n_out, dtype=torch.long)
+            with torch.no_grad():
+                h_g = encoder(Data(x=x_denorm, edge_index=ei_g,
+                                   batch=bv_g).to(device)).cpu()
+            gen_embeddings.append(F.normalize(h_g, dim=-1).squeeze(0).numpy())
+
+    gen_embeddings = np.stack(gen_embeddings, axis=0)
+    return gen_outputs, gen_embeddings, seeds
