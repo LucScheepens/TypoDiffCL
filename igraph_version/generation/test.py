@@ -43,8 +43,7 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
 
 from util import (
     preprocess_df,
-    extract_laundering_networks_igraph,
-    extract_non_laundering_networks_igraph,
+    extract_networks_igraph,
 )
 from augmentation import build_igraph_from_transactions
 from plotting_helpers import plot_simclr_latent_space_laundering_vs_clean
@@ -398,15 +397,10 @@ def run_ibm(device, results_dir, ibm_csv):
               f"({n_laund} laundering, {len(networks) - n_laund} clean) from cache\n")
     else:
         print("Extracting networks from CSV (this may take a while) …")
-        with_laund = extract_laundering_networks_igraph(
-            df_full, max_depth=4, max_networks=2000,
+        networks = extract_networks_igraph(
+            df_full, max_depth=4, max_networks=4000,
             collapse_threshold=10, max_nodes=300,
         )
-        non_laund = extract_non_laundering_networks_igraph(
-            df_full, max_depth=4, max_networks=len(with_laund),
-            collapse_threshold=10, max_nodes=300,
-        )
-        networks = with_laund + non_laund
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
         networks_to_cache = [{k: v for k, v in net.items() if k != "graph"}
@@ -414,8 +408,9 @@ def run_ibm(device, results_dir, ibm_csv):
         with open(cache_path, "wb") as f:
             pickle.dump(networks_to_cache, f)
         print(f"Saved network cache → {cache_path}")
+        n_laund = sum(1 for n in networks if len(n["laundering_nodes"]) > 0)
         print(f"Loaded {len(networks)} networks "
-              f"({len(with_laund)} laundering, {len(non_laund)} clean)\n")
+              f"({n_laund} laundering, {len(networks) - n_laund} clean)\n")
 
     # -- 2. SimCLR latent space plot -----------------------------------------
     print("Plotting SimCLR latent space …")
@@ -471,7 +466,7 @@ def run_ibm(device, results_dir, ibm_csv):
 
     # -- 9. Score generated networks -----------------------------------------
     gen_scores = []
-    for i, (x_d, adj_d, _) in enumerate(gen_outputs):
+    for i, (x_d, adj_d, *_) in enumerate(gen_outputs):
         s = score_network(x_d, adj_d, encoder, H_all_n, device,
                           mu, cov_inv, realism_scale,
                           gen_embedding=torch.tensor(gen_embeddings[i]))
@@ -557,7 +552,7 @@ def run_elliptic(device, results_dir):
 
     # -- 8. Score generated networks -----------------------------------------
     gen_scores = []
-    for i, (x_d, adj_d, _) in enumerate(gen_outputs):
+    for i, (x_d, adj_d, *_) in enumerate(gen_outputs):
         s = score_network(x_d, adj_d, encoder, H_all_n, device,
                           mu, cov_inv, realism_scale,
                           gen_embedding=torch.tensor(gen_embeddings[i]))

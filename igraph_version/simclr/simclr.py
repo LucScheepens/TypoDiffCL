@@ -56,8 +56,11 @@ def network_to_pyg_data_fast(network):
     else:
         edge_index = torch.zeros(2, 0, dtype=torch.long)
 
-    # Use precomputed 7-D features if available and size matches this graph
-    if "x_dense" in network and network["x_dense"] is not None and network["x_dense"].shape[0] == n:
+    # Use precomputed features if available, size matches, and dim matches current schema
+    _TARGET_DIM = 11
+    if ("x_dense" in network and network["x_dense"] is not None
+            and network["x_dense"].shape[0] == n
+            and network["x_dense"].shape[1] == _TARGET_DIM):
         x = network["x_dense"].clone()
         # Refresh degree and laundering in case augmentation changed them
         degrees = g.degree()
@@ -66,23 +69,17 @@ def network_to_pyg_data_fast(network):
             x[i, 0] = float(names[i] in laundering)
             x[i, 1] = degrees[i] / max_deg
     else:
-        import math as _math
+        # Recompute from network_to_dense (handles all feature dimensions correctly)
+        from diffusion.diff_util import network_to_dense as _ntd
+        x, _ = _ntd(network)
+        # Refresh laundering flag in case augmentation changed the graph
         degrees = g.degree()
         max_deg = max(max(degrees), 1)
-        clustering = g.transitivity_local_undirected(mode="zero")
-        pagerank = g.pagerank()
-        _assort = g.assortativity_degree(directed=False)
-        assort = 0.0 if (_assort is None or _math.isnan(_assort)) else float(_assort)
-
-        x = torch.zeros(n, 6)
         for i in range(n):
-            node_id = names[i]
-            x[i, 0] = float(node_id in laundering)
+            x[i, 0] = float(names[i] in laundering)
             x[i, 1] = degrees[i] / max_deg
-            x[i, 2] = 0.0  # betweenness skipped for speed
-            x[i, 3] = clustering[i]
-            x[i, 4] = pagerank[i]
-            x[i, 5] = assort
+        # Cache for future calls within this session
+        network["x_dense"] = x
 
     return Data(x=x, edge_index=edge_index)
 
@@ -223,7 +220,8 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
         return None
 
     # Pad to max_nodes and build node mask
-    x_pad    = torch.zeros(1, max_nodes, 6)
+    node_dim = x.shape[1]
+    x_pad    = torch.zeros(1, max_nodes, node_dim)
     adj_pad  = torch.zeros(1, max_nodes, max_nodes)
     mask     = torch.zeros(1, max_nodes)
     x_pad[0, :n]       = x

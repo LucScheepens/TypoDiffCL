@@ -82,8 +82,7 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
 
 from util import (
     preprocess_df,
-    extract_laundering_networks_igraph,
-    extract_non_laundering_networks_igraph,
+    extract_networks_igraph,
 )
 from augmentation import build_igraph_from_transactions
 from generation.generation import (
@@ -779,8 +778,9 @@ def plot_generated_vs_closest_training(
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    for i, ((x_denorm, adj_out, n_out), gen_emb) in enumerate(
+    for i, (gen_out, gen_emb) in enumerate(
             zip(gen_outputs, gen_embeddings)):
+        x_denorm, adj_out, n_out = gen_out[0], gen_out[1], gen_out[2]
 
         # ── Generated network ─────────────────────────────────────────────
         adj_np     = adj_out.cpu().numpy()
@@ -937,15 +937,10 @@ def main():
             net["graph"] = build_igraph_from_transactions(net["transactions"])
     else:
         print("Extracting networks (no cache found) …")
-        with_laund = extract_laundering_networks_igraph(
-            df_full, max_depth=4, max_networks=2000,
+        networks = extract_networks_igraph(
+            df_full, max_depth=4, max_networks=4000,
             collapse_threshold=10, max_nodes=300,
         )
-        non_laund = extract_non_laundering_networks_igraph(
-            df_full, max_depth=4, max_networks=len(with_laund),
-            collapse_threshold=10, max_nodes=300,
-        )
-        networks = with_laund + non_laund
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
         to_cache = [{k: v for k, v in n.items() if k != "graph"} for n in networks]

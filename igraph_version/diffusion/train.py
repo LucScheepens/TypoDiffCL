@@ -21,8 +21,7 @@ from visualizations import run_all_visualizations
 
 from simclr.augmentation import build_igraph_from_transactions
 from simclr.util import (
-    extract_laundering_networks_igraph,
-    extract_non_laundering_networks_igraph,
+    extract_networks_igraph,
     preprocess_df,
 )
 
@@ -82,19 +81,12 @@ if __name__ == "__main__":
         df_full  = preprocess_df(CSV_PATH)
         print(f"Loaded {len(df_full)} rows  [{time.time()-start_time:.1f}s]")
 
-        with_laund = extract_laundering_networks_igraph(
-            df_full, max_depth=4, max_networks=2000,
+        networks = extract_networks_igraph(
+            df_full, max_depth=4, max_networks=4000,
             collapse_threshold=10, max_nodes=MAX_NODES,
         )
-        print(f"Laundering networks: {len(with_laund)}  [{time.time()-start_time:.1f}s]")
+        print(f"Networks extracted: {len(networks)}  [{time.time()-start_time:.1f}s]")
 
-        non_laund = extract_non_laundering_networks_igraph(
-            df_full, max_depth=4, max_networks=len(with_laund),
-            collapse_threshold=10, max_nodes=MAX_NODES,
-        )
-        print(f"Non-laundering networks: {len(non_laund)}  [{time.time()-start_time:.1f}s]")
-
-        networks = with_laund + non_laund
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
         preprocess(networks, save_path=CACHE_PATH)

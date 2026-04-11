@@ -94,12 +94,14 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from util import preprocess_df, extract_laundering_networks_igraph, extract_non_laundering_networks_igraph
+from util import preprocess_df, extract_networks_igraph, extract_transaction_ego_networks
 from augmentation import build_igraph_from_transactions
 
 # ── hyper-parameters ──────────────────────────────────────────────────────────
 CSV_PATH    = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"  # default
-IN_CHANNELS = 5        # structural features only: degree, betweenness, clustering, pagerank, assortativity
+IN_CHANNELS = 10       # topology (5) + transaction features (5): degree, betweenness, clustering,
+                       # pagerank, assortativity, log_mean_amount, log_max_amount,
+                       # tx_count, payment_format_entropy, temporal_span
 HIDDEN      = 64
 NUM_LAYERS  = 3
 HEADS       = 4        # attention heads for GraphTransformer
@@ -341,9 +343,11 @@ def network_to_pyg(x_dense, adj_dense, label):
         ei = _fallback_edges(x_np.shape[0])
 
     return Data(
-        x          = torch.tensor(x_np, dtype=torch.float),
-        edge_index = ei,
-        y          = torch.tensor([label], dtype=torch.long),
+        x             = torch.tensor(x_np, dtype=torch.float),
+        edge_index    = ei,
+        y             = torch.tensor([label], dtype=torch.long),
+        timestep      = torch.tensor([-1], dtype=torch.long),
+        timestamp_val = -1.0,
     )
 
 
@@ -351,9 +355,12 @@ def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
     """
     Convert a diffusion-generated triple to a PyG Data object.
     x_denorm[:, 0] = predicted laundering probability — excluded.
-    Label is determined by the probe classifier (passed in as `label`).
+    x_denorm[:, 1:] = all node features (topology + transaction) generated
+    by the retrained diffusion model on 11-dim data.
     """
-    x_np   = x_denorm[:n_out, 1:].float().numpy()
+    x_topo = x_denorm[:n_out, 1:].float()
+    x_np   = x_topo.numpy()
+
     adj_np = adj_out[:n_out, :n_out]
     adj_np = adj_np.numpy() if isinstance(adj_np, torch.Tensor) else adj_np
 
@@ -362,24 +369,42 @@ def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
         ei = _fallback_edges(n_out)
 
     return Data(
-        x          = torch.tensor(x_np, dtype=torch.float),
-        edge_index = ei,
-        y          = torch.tensor([label], dtype=torch.long),
-        timestep   = torch.tensor([-1], dtype=torch.long),
+        x             = torch.tensor(x_np, dtype=torch.float),
+        edge_index    = ei,
+        y             = torch.tensor([label], dtype=torch.long),
+        timestep      = torch.tensor([-1], dtype=torch.long),
+        timestamp_val = -1.0,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training / evaluation
 # ─────────────────────────────────────────────────────────────────────────────
-def _train_epoch(model, loader, optimizer, device):
+
+def _focal_loss(logits, targets, weight=None, gamma=2.0):
+    """
+    Focal loss: FL(p) = -α(1-p)^γ log(p).
+    Downweights easy negatives more aggressively than weighted CE,
+    which helps when positives are rare (8-11% here).
+    `weight` is the per-class weight tensor (same as F.cross_entropy weight).
+    """
+    ce   = F.cross_entropy(logits, targets, weight=weight, reduction="none")
+    probs = F.softmax(logits, dim=-1)
+    pt   = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+    return ((1 - pt) ** gamma * ce).mean()
+
+
+def _train_epoch(model, loader, optimizer, device, pos_weight=None, focal=False):
     model.train()
     total_loss = 0.0
     for batch in loader:
         batch = batch.to(device)
         optimizer.zero_grad()
         logits = model(batch.x, batch.edge_index, batch.batch)
-        loss   = F.cross_entropy(logits, batch.y)
+        if focal:
+            loss = _focal_loss(logits, batch.y, weight=pos_weight)
+        else:
+            loss = F.cross_entropy(logits, batch.y, weight=pos_weight)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -388,7 +413,8 @@ def _train_epoch(model, loader, optimizer, device):
 
 
 @torch.no_grad()
-def _evaluate(model, loader, device):
+def _collect_probs(model, loader, device):
+    """Return (labels, probs) arrays without computing any metrics."""
     model.eval()
     all_labels, all_probs = [], []
     for batch in loader:
@@ -397,20 +423,160 @@ def _evaluate(model, loader, device):
         probs  = F.softmax(logits, dim=-1)[:, 1].cpu().numpy()
         all_labels.extend(batch.y.cpu().numpy())
         all_probs.extend(probs)
+    return np.array(all_labels), np.array(all_probs)
 
-    labels = np.array(all_labels)
-    probs  = np.array(all_probs)
-    preds  = (probs >= 0.5).astype(int)
 
+def _best_f1_threshold(labels, probs, thresholds=None):
+    """
+    Sweep decision thresholds and return the one maximising F1 on the
+    given labels/probs arrays.  Thresholds default to 50 values in [0.05, 0.95].
+    """
+    if thresholds is None:
+        thresholds = np.linspace(0.05, 0.95, 50)
+    best_t, best_f1 = 0.5, 0.0
+    for t in thresholds:
+        preds = (probs >= t).astype(int)
+        f = f1_score(labels, preds, average="binary", zero_division=0)
+        if f > best_f1:
+            best_f1, best_t = f, t
+    return best_t, best_f1
+
+
+def _evaluate(model, loader, device, threshold=0.5):
+    """Compute metrics at a fixed threshold (use after threshold is tuned on val)."""
+    labels, probs = _collect_probs(model, loader, device)
+    preds = (probs >= threshold).astype(int)
     auc  = roc_auc_score(labels, probs) if len(np.unique(labels)) > 1 else 0.5
-    f1   = f1_score(labels, preds, average="macro", zero_division=0)
-    prec = precision_score(labels, preds, average="macro", zero_division=0)
-    rec  = recall_score(labels, preds, average="macro", zero_division=0)
+    f1   = f1_score(labels, preds, average="binary", zero_division=0)
+    prec = precision_score(labels, preds, average="binary", zero_division=0)
+    rec  = recall_score(labels, preds, average="binary", zero_division=0)
     return {"auc": auc, "f1": f1, "precision": prec, "recall": rec}
 
 
-def run_experiment(train_data, val_data, test_data, model_cls, device, seed):
-    """Train one model; pick the checkpoint with best val AUC; report test metrics."""
+_PROXY_MAX_TRAIN = 2000   # cap proxy training set size to keep greedy selection fast
+
+def _proxy_val_f1(train_data, val_data, device, epochs=20, seed=0,
+                  focal=False, n_seeds=1):
+    """
+    Train `n_seeds` small GIN proxies for `epochs` epochs each and return
+    the mean val F1 (at the per-run tuned threshold).
+
+    train_data is subsampled to _PROXY_MAX_TRAIN graphs (stratified) so that
+    each proxy run stays fast even on large datasets — the signal for whether
+    one extra graph helps is the same regardless of training set size.
+    """
+    # Stratified subsample to keep proxy fast
+    rng = np.random.default_rng(seed)
+    if len(train_data) > _PROXY_MAX_TRAIN:
+        pos_idx = [i for i, d in enumerate(train_data) if d.y.item() == 1]
+        neg_idx = [i for i, d in enumerate(train_data) if d.y.item() == 0]
+        n_pos_keep = max(1, int(_PROXY_MAX_TRAIN * len(pos_idx) / len(train_data)))
+        n_neg_keep = _PROXY_MAX_TRAIN - n_pos_keep
+        keep = (list(rng.choice(pos_idx, min(n_pos_keep, len(pos_idx)), replace=False)) +
+                list(rng.choice(neg_idx, min(n_neg_keep, len(neg_idx)), replace=False)))
+        proxy_train = [train_data[i] for i in keep]
+    else:
+        proxy_train = train_data
+
+    f1_scores = []
+    for s in range(n_seeds):
+        torch.manual_seed(seed * 100 + s)
+        np.random.seed(seed * 100 + s)
+
+        proxy = GINClassifier(hidden=32, num_layers=2, dropout=0.0).to(device)
+        opt   = torch.optim.Adam(proxy.parameters(), lr=1e-3)
+
+        n_pos = sum(d.y.item() == 1 for d in proxy_train)
+        n_neg = len(proxy_train) - n_pos
+        pw    = (torch.tensor([1.0, n_neg / n_pos], dtype=torch.float, device=device)
+                 if n_pos > 0 and n_neg > 0 else None)
+
+        tr_loader  = DataLoader(proxy_train, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_data,    batch_size=BATCH_SIZE)
+
+        for _ in range(epochs):
+            _train_epoch(proxy, tr_loader, opt, device, pos_weight=pw, focal=focal)
+
+        labels, probs = _collect_probs(proxy, val_loader, device)
+        _, f1         = _best_f1_threshold(labels, probs)
+        f1_scores.append(f1)
+
+    return float(np.mean(f1_scores))
+
+
+def greedy_select_generated(gen_data, train_data, val_data, device,
+                            proxy_epochs=20, min_delta=0.0, focal=False,
+                            proxy_seeds=3):
+    """
+    Greedily select the subset of generated graphs that maximally improves
+    validation F1 (at tuned threshold) of a fast proxy GIN.
+
+    Each proxy score is the mean over `proxy_seeds` independent runs to reduce
+    variance — without this, the ranking is dominated by noise from a single run.
+
+    Algorithm
+    ---------
+    1. Train proxy_seeds proxies on `train_data` alone → mean baseline val F1.
+    2. For each generated graph, train proxy_seeds proxies on train_data + {graph}
+       and record the mean val F1 gain over baseline.
+    3. Sort candidates by gain (descending).  Keep all graphs whose
+       gain > min_delta (default 0 = keep anything that doesn't hurt).
+    4. Return the selected subset and a list of (graph_idx, f1_gain) pairs.
+
+    Parameters
+    ----------
+    gen_data     : list[PyG Data]  candidate generated graphs
+    train_data   : list[PyG Data]  real training graphs
+    val_data     : list[PyG Data]  validation graphs (not touched during main training)
+    device       : torch.device
+    proxy_epochs : int   epochs for each proxy training (default 20)
+    min_delta    : float minimum F1 gain to keep a graph (default 0.0)
+    focal        : bool  use focal loss in proxy (mirrors main training)
+    proxy_seeds  : int   number of independent proxy runs to average (default 3)
+
+    Returns
+    -------
+    selected   : list[PyG Data]  filtered subset of gen_data
+    gains      : list[tuple]  [(original_idx, f1_gain), ...] sorted best-first
+    """
+    print(f"\nGreedy selection: evaluating {len(gen_data)} generated graphs "
+          f"with a {proxy_epochs}-epoch proxy GIN "
+          f"(averaged over {proxy_seeds} seeds) …")
+
+    baseline = _proxy_val_f1(train_data, val_data, device,
+                             epochs=proxy_epochs, focal=focal, n_seeds=proxy_seeds)
+    print(f"  Baseline val F1 (no augmentation): {baseline:.4f}")
+
+    gains = []
+    for i, g in enumerate(gen_data):
+        f1 = _proxy_val_f1(train_data + [g], val_data, device,
+                           epochs=proxy_epochs, seed=i, focal=focal,
+                           n_seeds=proxy_seeds)
+        gains.append((i, f1 - baseline))
+        if (i + 1) % 10 == 0 or (i + 1) == len(gen_data):
+            print(f"  [{i+1:>3}/{len(gen_data)}]  "
+                  f"graph {i:>4}: Δ F1 = {f1 - baseline:+.4f}")
+
+    gains_sorted = sorted(gains, key=lambda x: x[1], reverse=True)
+    selected_idx = {idx for idx, delta in gains_sorted if delta > min_delta}
+    selected     = [g for i, g in enumerate(gen_data) if i in selected_idx]
+
+    n_kept    = len(selected)
+    mean_gain = float(np.mean([d for _, d in gains_sorted if d > min_delta])) if selected else 0.0
+    print(f"  Selected {n_kept}/{len(gen_data)} graphs  "
+          f"(mean Δ F1 among kept: {mean_gain:+.4f})\n")
+
+    return selected, gains_sorted
+
+
+def run_experiment(train_data, val_data, test_data, model_cls, device, seed,
+                   focal=False):
+    """
+    Train one model with checkpoint selection by val F1 (tuned threshold).
+    The threshold that maximises val F1 on the best checkpoint is then applied
+    to the test set, so precision/recall/F1 are all computed at that threshold.
+    AUC is threshold-independent and reported alongside.
+    """
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -419,23 +585,36 @@ def run_experiment(train_data, val_data, test_data, model_cls, device, seed):
     val_loader   = DataLoader(val_data,   batch_size=BATCH_SIZE)
     test_loader  = DataLoader(test_data,  batch_size=BATCH_SIZE)
 
+    # Class-weighted loss: upweight the minority (laundering) class so the
+    # model doesn't collapse to always predicting "clean" under real imbalance.
+    n_pos = sum(d.y.item() == 1 for d in train_data)
+    n_neg = len(train_data) - n_pos
+    if n_pos > 0 and n_neg > 0:
+        pos_weight = torch.tensor([1.0, n_neg / n_pos], dtype=torch.float, device=device)
+    else:
+        pos_weight = None
+
     model     = model_cls().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-    best_val_auc = -1.0
+    best_val_f1  = -1.0
     best_state   = None
+    best_thresh  = 0.5
 
     for epoch in range(1, EPOCHS + 1):
-        _train_epoch(model, train_loader, optimizer, device)
+        _train_epoch(model, train_loader, optimizer, device,
+                     pos_weight=pos_weight, focal=focal)
         scheduler.step()
-        val_m = _evaluate(model, val_loader, device)
-        if val_m["auc"] > best_val_auc:
-            best_val_auc = val_m["auc"]
+        val_labels, val_probs = _collect_probs(model, val_loader, device)
+        thresh, val_f1 = _best_f1_threshold(val_labels, val_probs)
+        if val_f1 > best_val_f1:
+            best_val_f1  = val_f1
+            best_thresh  = thresh
             best_state   = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-    return _evaluate(model, test_loader, device)
+    return _evaluate(model, test_loader, device, threshold=best_thresh)
 
 
 def _mean_std(values):
@@ -449,7 +628,7 @@ def _mean_std(values):
 def _print_table(results):
     col_w = 28
     metrics = ["auc", "f1", "precision", "recall"]
-    headers = ["Model / Condition"] + ["AUC-ROC", "Macro-F1", "Precision", "Recall"]
+    headers = ["Model / Condition"] + ["AUC-ROC", "F1", "Precision", "Recall"]
     sep = "─" * (col_w + len(metrics) * 16)
 
     print("\n" + sep)
@@ -515,6 +694,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--augment", action="store_true",
                         help="Augment training set with diffusion-generated networks")
+    parser.add_argument("--focal-loss", action="store_true",
+                        help="Use focal loss (γ=2) instead of weighted cross-entropy. "
+                             "Downweights easy negatives more aggressively — helps with "
+                             "the 8%% positive rate in this dataset.")
+    parser.add_argument("--augment-select", action="store_true",
+                        help="Like --augment but greedily selects only generated graphs "
+                             "that improve val AUC of a fast proxy GIN. "
+                             "Implies --augment.")
+    parser.add_argument("--proxy-epochs", type=int, default=20, metavar="E",
+                        help="Epochs for the fast proxy GIN used in greedy selection "
+                             "(default 20). Lower = faster but noisier.")
+    parser.add_argument("--proxy-seeds", type=int, default=1, metavar="S",
+                        help="Number of independent proxy runs to average per candidate "
+                             "graph during greedy selection (default 1). Higher = more "
+                             "reliable ranking but linearly more compute.")
+    parser.add_argument("--min-delta", type=float, default=0.0, metavar="D",
+                        help="Minimum val AUC gain to keep a generated graph during "
+                             "greedy selection (default 0.0 = keep anything that "
+                             "doesn't hurt).")
     parser.add_argument("--n-gen", type=int, default=40,
                         help="Number of networks to generate for augmentation (default 40)")
     parser.add_argument("--low-data", type=float, default=1.0, metavar="FRAC",
@@ -528,10 +726,40 @@ def main():
                         help="Override the IBM CSV path. Use this to switch between "
                              "HI-Small_Trans.csv (default) and LI-Large_Trans.csv, e.g. "
                              r"--ibm-csv C:\path\to\LI-Large_Trans.csv")
+    # ── Ablation / encoder override ──────────────────────────────────────────
+    parser.add_argument("--encoder-dir", type=str, default=None, metavar="DIR",
+                        help="Override the SimCLR encoder checkpoint directory. "
+                             "Must contain a .pt file with 'encoder_state_dict' and 'loss'. "
+                             "Default: checkpoints/simclr_elliptic (Elliptic) or "
+                             "checkpoints/simclr_ibm (IBM).")
+    parser.add_argument("--ablation-label", type=str, default=None, metavar="LABEL",
+                        help="Short label appended to the results CSV name, e.g. "
+                             "'no_supcon' → classifier_comparison_elliptic_no_supcon.csv")
+    # ── Generation hyperparameter overrides ──────────────────────────────────
+    parser.add_argument("--guidance-scale", type=float, default=None,
+                        help="Override guidance_scale in guided generation (default 2.0). "
+                             "Set 0 for unguided pure diffusion.")
+    parser.add_argument("--novelty-weight", type=float, default=None,
+                        help="Override novelty_weight in guided generation (default 2.0). "
+                             "Set 0 to disable novelty repulsion.")
+    parser.add_argument("--degree-penalty", type=float, default=None,
+                        help="Override degree_penalty in guided generation (default 0.5). "
+                             "Set 0 to disable density constraint.")
+    parser.add_argument("--t-start", type=int, default=None,
+                        help="Override t_start (starting diffusion timestep) in guided "
+                             "generation (default 150 for Elliptic).")
     args = parser.parse_args()
+
+    if args.augment_select:
+        args.augment = True   # augment-select implies augment
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
+
+    from generation.graph_quality_metrics import (
+        score_generated_graphs, print_quality_report, save_quality_csv,
+        plot_quality_extremes,
+    )
 
     # ── 1. Load PyG graphs ───────────────────────────────────────────────────
     all_data: list = []
@@ -546,7 +774,7 @@ def main():
         # Cache filename is tied to the CSV so switching datasets doesn't silently
         # reuse a stale cache built from a different file.
         csv_stem   = Path(ibm_csv).stem
-        CACHE_PATH = DATA_DIR / f"networks_cache_{csv_stem}.pkl"
+        CACHE_PATH = DATA_DIR / f"networks_cache_{csv_stem}_v2.pkl"
         df_full    = preprocess_df(ibm_csv)
 
         if CACHE_PATH.exists():
@@ -556,16 +784,14 @@ def main():
             for net in networks:
                 net["graph"] = build_igraph_from_transactions(net["transactions"])
         else:
-            print(f"Extracting IBM networks from {ibm_csv} (slow — run test.py first to cache) …")
-            with_laund = extract_laundering_networks_igraph(
-                df_full, max_depth=4, max_networks=2000,
-                collapse_threshold=10, max_nodes=300,
+            print(f"Extracting IBM networks from {ibm_csv} …")
+            networks = extract_transaction_ego_networks(
+                df_full,
+                max_depth=2,
+                max_nodes=50,
+                n_pos=2000,
+                neg_pos_ratio=10,
             )
-            non_laund = extract_non_laundering_networks_igraph(
-                df_full, max_depth=4, max_networks=len(with_laund),
-                collapse_threshold=10, max_nodes=300,
-            )
-            networks = with_laund + non_laund
             for net in networks:
                 net["graph"] = build_igraph_from_transactions(net["transactions"])
 
@@ -582,8 +808,14 @@ def main():
             if x_d.shape[0] < 3:
                 skipped += 1
                 continue
-            label = 1 if len(net.get("laundering_nodes", set())) > 0 else 0
-            all_data.append(network_to_pyg(x_d, adj_d, label))
+            # Use tx_label (the focal transaction's laundering flag) when
+            # available; fall back to subgraph-level label for cached nets.
+            label = net.get("tx_label",
+                            1 if len(net.get("laundering_nodes", set())) > 0 else 0)
+            pyg = network_to_pyg(x_d, adj_d, label)
+            pyg.timestamp_val = float(net["timestamp"].timestamp()) \
+                if "timestamp" in net else -1.0
+            all_data.append(pyg)
             ibm_data_networks.append(net)
 
         if skipped:
@@ -652,24 +884,46 @@ def main():
               f"{len(data_train)} train | {len(data_val)} val | {len(data_test)} test")
 
     else:
-        # Stratified random split for IBM / combined
-        indices = np.arange(len(all_data))
+        # Temporal split for IBM — mirrors the benchmark protocol.
+        # Graphs are sorted by transaction timestamp; we use the first 70%
+        # of time for train+val and the last 20% for test (10% gap = val).
+        # This tests generalisation to FUTURE transactions, which is the
+        # operationally relevant setting and what the paper measures.
+        ts_vals = np.array([d.timestamp_val if hasattr(d, "timestamp_val") else -1.0
+                            for d in all_data])
 
-        sss_test = StratifiedShuffleSplit(n_splits=1, test_size=TEST_FRAC, random_state=42)
-        idx_trainval, idx_test_arr = next(sss_test.split(indices, all_labels_np))
+        if ts_vals.min() >= 0:
+            # All graphs have timestamps — do a proper temporal split
+            sorted_idx  = np.argsort(ts_vals)
+            n           = len(sorted_idx)
+            n_trainval  = int(n * (1.0 - TEST_FRAC))
+            n_train     = int(n_trainval * (1.0 - VAL_FRAC / (1.0 - TEST_FRAC)))
 
-        data_trainval   = [all_data[i]    for i in idx_trainval]
-        labels_trainval = all_labels_np[idx_trainval]
-        data_test       = [all_data[i]    for i in idx_test_arr]
+            idx_tr       = sorted_idx[:n_train]
+            idx_val      = sorted_idx[n_train:n_trainval]
+            idx_test_arr = sorted_idx[n_trainval:]
+            idx_trainval = sorted_idx[:n_trainval]
+        else:
+            # Fallback to stratified random split (e.g. loaded from old cache)
+            indices = np.arange(len(all_data))
+            sss_test = StratifiedShuffleSplit(n_splits=1, test_size=TEST_FRAC, random_state=42)
+            idx_trainval, idx_test_arr = next(sss_test.split(indices, all_labels_np))
+            labels_trainval = all_labels_np[idx_trainval]
+            val_size = VAL_FRAC / (1.0 - TEST_FRAC)
+            sss_val  = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=42)
+            idx_tr, idx_val = next(sss_val.split(np.arange(len(idx_trainval)), labels_trainval))
+            idx_tr  = idx_trainval[idx_tr]
+            idx_val = idx_trainval[idx_val]
 
-        val_size = VAL_FRAC / (1.0 - TEST_FRAC)
-        sss_val  = StratifiedShuffleSplit(n_splits=1, test_size=val_size, random_state=42)
-        idx_tr, idx_val = next(sss_val.split(np.arange(len(data_trainval)), labels_trainval))
+        data_train = [all_data[i] for i in idx_tr]
+        data_val   = [all_data[i] for i in idx_val]
+        data_test  = [all_data[i] for i in idx_test_arr]
 
-        data_train = [data_trainval[i] for i in idx_tr]
-        data_val   = [data_trainval[i] for i in idx_val]
-
-        print(f"Split: {len(data_train)} train | {len(data_val)} val | {len(data_test)} test")
+        test_pos  = sum(d.y.item() == 1 for d in data_test)
+        train_pos = sum(d.y.item() == 1 for d in data_train)
+        print(f"Temporal split: {len(data_train)} train | {len(data_val)} val | {len(data_test)} test")
+        print(f"  train positive rate: {train_pos/len(data_train)*100:.1f}%  "
+              f"test positive rate: {test_pos/len(data_test)*100:.1f}%")
 
     # ── 3b. Optional low-data subsampling ────────────────────────────────────
     if args.low_data < 1.0:
@@ -701,19 +955,51 @@ def main():
                 train_mlp_probe,
                 run_guided_generation_elliptic,
             )
-            encoder_e = load_simclr_encoder_elliptic(device)
+            if args.encoder_dir is not None:
+                # Load encoder from an alternative directory (for SimCLR ablations)
+                from simclr import GraphEncoder as _GE
+                _ckpt_dir = Path(args.encoder_dir)
+                _candidates = list(_ckpt_dir.glob("*.pt"))
+                _best_path, _best_loss = None, float("inf")
+                for _p in _candidates:
+                    try:
+                        _c = torch.load(_p, map_location="cpu", weights_only=False)
+                        if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _best_loss:
+                            _best_loss, _best_path = _c["loss"], _p
+                    except Exception:
+                        pass
+                if _best_path is None:
+                    raise FileNotFoundError(f"No valid checkpoint in {args.encoder_dir}")
+                print(f"Ablation encoder: {_best_path.name}  (loss={_best_loss:.4f})")
+                _ckpt = torch.load(_best_path, map_location=device, weights_only=False)
+                encoder_e = _GE(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+                encoder_e.load_state_dict(_ckpt["encoder_state_dict"])
+                encoder_e.eval()
+            else:
+                encoder_e = load_simclr_encoder_elliptic(device)
+
             diff_model_e, diffusion_e, x_mean_e, x_std_e = load_diffusion_model_elliptic(device)
             # Only encode training-fold graphs to avoid test leakage in the probe.
             # data_train has already been split off from the temporal train pool.
             H_all_e, y_all_e = encode_all_pyg_graphs(data_train, encoder_e, device)
             probe_e = train_mlp_probe(H_all_e, y_all_e, device)
 
+            _gen_kwargs = dict(
+                target_label=1,
+                n_gen=args.n_gen,
+                t_start=args.t_start if args.t_start is not None else 150,
+            )
+            if args.guidance_scale is not None:
+                _gen_kwargs["guidance_scale"] = args.guidance_scale
+            if args.novelty_weight is not None:
+                _gen_kwargs["novelty_weight"] = args.novelty_weight
+            if args.degree_penalty is not None:
+                _gen_kwargs["degree_penalty"] = args.degree_penalty
+
             gen_outputs, _, _ = run_guided_generation_elliptic(
                 data_train, encoder_e, probe_e, diff_model_e, diffusion_e,
                 x_mean_e, x_std_e, H_all_e, device,
-                target_label=1,
-                n_gen=args.n_gen,
-                t_start=150,
+                **_gen_kwargs,
             )
             for (x_denorm, adj_out, n_out, label) in gen_outputs:
                 gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
@@ -722,6 +1008,18 @@ def main():
             n_lit_gen = len(gen_data) - n_ill_gen
             print(f"Generated {len(gen_data)} augmentation graphs "
                   f"(illicit={n_ill_gen}, licit={n_lit_gen})\n")
+
+            # ── Tier-1 quality scoring (Elliptic) ────────────────────────
+            _train_laund_e   = [g for g in data_train if g.y.item() == 1]
+            _H_train_laund_e = H_all_e[y_all_e == 1]
+            _quality_e = score_generated_graphs(
+                gen_data, _train_laund_e, _H_train_laund_e, encoder_e, device)
+            print_quality_report(_quality_e)
+            _q_suffix_e = f"elliptic{'_ld' + str(int(args.low_data * 100)) if args.low_data < 1.0 else ''}"
+            save_quality_csv(_quality_e,
+                             ROOT_DIR / "results" / f"graph_quality_{_q_suffix_e}.csv")
+            plot_quality_extremes(_quality_e, gen_data,
+                                  ROOT_DIR / "results" / f"quality_extremes_{_q_suffix_e}.png")
 
         elif not networks:
             # ── IBM networks missing ──────────────────────────────────────
@@ -732,61 +1030,113 @@ def main():
 
         else:
             # ── IBM augmentation path (original) ──────────────────────────
-            print(f"Generating {args.n_gen} augmentation networks …")
-            from generation.generation import (
-                load_simclr_encoder, load_diffusion_model,
-                encode_all_networks, train_mlp_probe, run_guided_generation,
-            )
-            encoder = load_simclr_encoder(device)
-            diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
+            _ld_tag  = f"_ld{int(args.low_data * 100)}" if args.low_data < 1.0 else ""
+            _t_start = args.t_start if args.t_start is not None else 150
+            GEN_CACHE_PATH = DATA_DIR / f"gen_cache_{csv_stem}_n{args.n_gen}_t{_t_start}{_ld_tag}.pkl"
 
-            # Only encode networks that ended up in the TRAINING fold.
-            # Using all networks (including test) would leak test-set embeddings
-            # into the probe, biasing guided generation toward the test distribution.
-            n_ibm = len(ibm_data_networks)
-            if args.dataset == "ibm":
-                # idx_tr indexes into data_trainval; idx_trainval indexes into all_data
-                train_ibm_nets = [
-                    ibm_data_networks[idx_trainval[i]]
-                    for i in idx_tr
-                    if idx_trainval[i] < n_ibm
-                ]
+            if GEN_CACHE_PATH.exists():
+                print(f"Loading generated graphs from cache ({GEN_CACHE_PATH.name}) …")
+                with open(GEN_CACHE_PATH, "rb") as _f:
+                    gen_data = pickle.load(_f)
+                n_laund_gen = sum(d.y.item() == 1 for d in gen_data)
+                n_clean_gen = len(gen_data) - n_laund_gen
+                print(f"Loaded {len(gen_data)} cached augmentation graphs "
+                      f"(laundering={n_laund_gen}, clean={n_clean_gen})\n")
             else:
-                # "both" dataset: IBM graphs are all_data[:n_ibm]
+                print(f"Generating {args.n_gen} augmentation networks …")
+                from generation.generation import (
+                    load_simclr_encoder, load_diffusion_model,
+                    encode_all_networks, train_mlp_probe, run_guided_generation,
+                )
+                encoder = load_simclr_encoder(device)
+                diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
+
+                # Only encode networks that ended up in the TRAINING fold.
+                # Using all networks (including test) would leak test-set embeddings
+                # into the probe, biasing guided generation toward the test distribution.
+                n_ibm = len(ibm_data_networks)
                 train_ibm_nets = [
-                    ibm_data_networks[idx_trainval[i]]
+                    ibm_data_networks[i]
                     for i in idx_tr
-                    if idx_trainval[i] < n_ibm
+                    if i < n_ibm
                 ]
-            if not train_ibm_nets:
-                train_ibm_nets = networks   # fallback if mapping fails
+                if not train_ibm_nets:
+                    train_ibm_nets = networks   # fallback if mapping fails
 
-            H_all_n, y_all = encode_all_networks(train_ibm_nets, encoder, device)
-            probe = train_mlp_probe(H_all_n, y_all, device)
+                H_all_n, y_all = encode_all_networks(train_ibm_nets, encoder, device)
+                probe = train_mlp_probe(H_all_n, y_all, device)
 
-            gen_outputs, _, _ = run_guided_generation(
-                networks, encoder, probe, diff_model, diffusion,
-                x_mean, x_std, H_all_n, device,
-                target_label=1,
-                n_gen=args.n_gen,
-                t_start=150,
-            )
-            for (x_denorm, adj_out, n_out, label) in gen_outputs:
-                gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
+                gen_outputs, _, _ = run_guided_generation(
+                    networks, encoder, probe, diff_model, diffusion,
+                    x_mean, x_std, H_all_n, device,
+                    target_label=1,
+                    n_gen=args.n_gen,
+                    t_start=_t_start,
+                )
+                for (x_denorm, adj_out, n_out, label) in gen_outputs:
+                    gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
 
-            n_laund_gen = sum(d.y.item() == 1 for d in gen_data)
-            n_clean_gen = len(gen_data) - n_laund_gen
-            print(f"Generated {len(gen_data)} augmentation graphs "
-                  f"(laundering={n_laund_gen}, clean={n_clean_gen})\n")
+                n_laund_gen = sum(d.y.item() == 1 for d in gen_data)
+                n_clean_gen = len(gen_data) - n_laund_gen
+                print(f"Generated {len(gen_data)} augmentation graphs "
+                      f"(laundering={n_laund_gen}, clean={n_clean_gen})\n")
 
-    # ── 5. Run experiments ───────────────────────────────────────────────────
+                GEN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(GEN_CACHE_PATH, "wb") as _f:
+                    pickle.dump(gen_data, _f)
+                print(f"Generated graphs cached to {GEN_CACHE_PATH.name}")
+
+            # ── Tier-1 quality scoring (IBM) — skipped when loading from cache ──
+            if not GEN_CACHE_PATH.exists() or 'encoder' in dir():
+                try:
+                    _train_laund_ibm   = [g for g in data_train if g.y.item() == 1]
+                    _H_train_laund_ibm = H_all_n[y_all == 1]
+                    _quality_ibm = score_generated_graphs(
+                        gen_data, _train_laund_ibm, _H_train_laund_ibm, encoder, device)
+                    print_quality_report(_quality_ibm)
+                    _q_suffix_ibm = f"ibm{'_ld' + str(int(args.low_data * 100)) if args.low_data < 1.0 else ''}"
+                    save_quality_csv(_quality_ibm,
+                                     ROOT_DIR / "results" / f"graph_quality_{_q_suffix_ibm}.csv")
+                    plot_quality_extremes(_quality_ibm, gen_data,
+                                         ROOT_DIR / "results" / f"quality_extremes_{_q_suffix_ibm}.png")
+                except Exception as _qe:
+                    print(f"[quality scoring skipped: {_qe}]")
+
+    # ── 5. Greedy selection (if requested) ──────────────────────────────────
+    gen_data_selected = []
+    selection_gains   = []
+    if args.augment and args.augment_select and gen_data:
+        gen_data_selected, selection_gains = greedy_select_generated(
+            gen_data, list(data_train), data_val, device,
+            proxy_epochs=args.proxy_epochs,
+            min_delta=args.min_delta,
+            focal=args.focal_loss,
+            proxy_seeds=args.proxy_seeds,
+        )
+        # Save gain report
+        gains_path = ROOT_DIR / "results" / "greedy_selection_gains.csv"
+        gains_path.parent.mkdir(exist_ok=True)
+        with open(gains_path, "w", newline="") as _f:
+            _w = csv.writer(_f)
+            _w.writerow(["graph_idx", "f1_gain", "kept"])
+            kept_set = {i for i, _ in selection_gains
+                        if _ > args.min_delta}
+            for idx, gain in selection_gains:
+                _w.writerow([idx, f"{gain:.6f}", int(idx in kept_set)])
+        print(f"Selection gains saved → {gains_path}")
+
+    # ── 6. Run experiments ───────────────────────────────────────────────────
     models     = [
         ("GIN",              GINClassifier),
         ("GraphTransformer", GraphTransformerClassifier),
         ("GraphSAGE",        GraphSAGEClassifier),
         ("DeepSets",         DeepSetsClassifier),
     ]
-    conditions = ["baseline"] + (["augmented"] if args.augment else [])
+    conditions = ["baseline"]
+    if args.augment:
+        conditions.append("augmented")
+    if args.augment_select and gen_data_selected:
+        conditions.append("selected")
     results    = {}
 
     for model_name, model_cls in models:
@@ -794,6 +1144,9 @@ def main():
             train_set = list(data_train)
             if condition == "augmented":
                 train_set = train_set + gen_data
+                random.shuffle(train_set)
+            elif condition == "selected":
+                train_set = train_set + gen_data_selected
                 random.shuffle(train_set)
 
             label_counts = {0: 0, 1: 0}
@@ -806,7 +1159,8 @@ def main():
 
             run_metrics = {k: [] for k in ["auc", "f1", "precision", "recall"]}
             for seed in range(N_RUNS):
-                m = run_experiment(train_set, data_val, data_test, model_cls, device, seed)
+                m = run_experiment(train_set, data_val, data_test, model_cls, device, seed,
+                                   focal=args.focal_loss)
                 for k in run_metrics:
                     run_metrics[k].append(m[k])
                 print(f"  seed {seed}: AUC={m['auc']:.3f}  F1={m['f1']:.3f}")
@@ -820,6 +1174,8 @@ def main():
     suffix = args.dataset
     if args.low_data < 1.0:
         suffix += f"_ld{int(args.low_data * 100)}"
+    if args.ablation_label:
+        suffix += f"_{args.ablation_label}"
     _save_csv(results, ROOT_DIR / "results" / f"classifier_comparison_{suffix}.csv")
 
 

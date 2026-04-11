@@ -25,7 +25,7 @@ from diffusion.diff_util import create_diffusion, network_to_dense
 
 from simclr import GraphEncoder, ProjectionHead, train_simclr_fast
 from augmentation import build_igraph_from_transactions
-from util import preprocess_df, extract_laundering_networks_igraph, extract_non_laundering_networks_igraph
+from util import preprocess_df, extract_networks_igraph
 
 # Separate cache from the diffusion (x,adj)-tuple cache — stores full network dicts with igraph graphs
 SIMCLR_CACHE = DATA_DIR / "simclr_networks_cache.pt"
@@ -44,18 +44,22 @@ def load_or_build_networks(df_full):
     if SIMCLR_CACHE.exists():
         print(f"[cache] Loading networks from {SIMCLR_CACHE} ...")
         networks = torch.load(SIMCLR_CACHE, weights_only=False)
-        print(f"[cache] Loaded {len(networks)} networks.")
-        return networks
+        # Invalidate cache if node features don't match current network_to_dense output
+        if networks and networks[0].get("x_dense") is not None:
+            cached_dim = networks[0]["x_dense"].shape[1]
+            if cached_dim != 11:
+                print(f"[cache] Stale cache (node_dim={cached_dim}, expected 11) — rebuilding …")
+                SIMCLR_CACHE.unlink()
+                networks = None
+        if networks is not None:
+            print(f"[cache] Loaded {len(networks)} networks.")
+            return networks
 
     print("[cache] No cache found — extracting networks from scratch ...")
 
-    with_laund = extract_laundering_networks_igraph(
-        df_full, max_depth=4, max_networks=2000, collapse_threshold=10, max_nodes=MAX_NODES
+    networks = extract_networks_igraph(
+        df_full, max_depth=4, max_networks=4000, collapse_threshold=10, max_nodes=MAX_NODES
     )
-    non_laund = extract_non_laundering_networks_igraph(
-        df_full, max_depth=5, max_networks=len(with_laund), collapse_threshold=10, max_nodes=MAX_NODES
-    )
-    networks = with_laund + non_laund
 
     print(f"[cache] Extracted {len(networks)} networks. Building igraph graphs and precomputing features ...")
 

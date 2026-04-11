@@ -124,8 +124,7 @@ def train_diffusion_ibm(device):
     from diffusion.resample  import LossSecondMomentResampler
     from diffusion.visualizations import run_all_visualizations
     from augmentation        import build_igraph_from_transactions
-    from util import (preprocess_df, extract_laundering_networks_igraph,
-                      extract_non_laundering_networks_igraph)
+    from util import (preprocess_df, extract_networks_igraph)
 
     cache_path = DATA_DIR / "cached_dataset_ibm.pt"
     graphs_dir = str(DIFF_DIR / "graphs")
@@ -138,7 +137,7 @@ def train_diffusion_ibm(device):
     print(f"  Save : {out_path}")
     print('='*60)
 
-    NODE_DIM = 6
+    NODE_DIM = 11  # laundering flag (1) + topology (5) + transaction features (5)
 
     def _needs_rebuild():
         if not cache_path.exists():
@@ -151,20 +150,13 @@ def train_diffusion_ibm(device):
 
     if _needs_rebuild():
         print("Extracting IBM networks …")
-        df_full    = preprocess_df(IBM_CSV_PATH)
-        with_laund = extract_laundering_networks_igraph(
+        df_full  = preprocess_df(IBM_CSV_PATH)
+        networks = extract_networks_igraph(
             df_full, max_depth=IBM_MAX_DEPTH,
-            max_networks=IBM_MAX_NETWORKS,
+            max_networks=IBM_MAX_NETWORKS * 2,
             collapse_threshold=IBM_COLLAPSE_THRESH,
             max_nodes=IBM_MAX_NODES,
         )
-        non_laund  = extract_non_laundering_networks_igraph(
-            df_full, max_depth=IBM_MAX_DEPTH,
-            max_networks=len(with_laund),
-            collapse_threshold=IBM_COLLAPSE_THRESH,
-            max_nodes=IBM_MAX_NODES,
-        )
-        networks = with_laund + non_laund
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
         print(f"  {len(networks)} networks extracted. Preprocessing …")
@@ -174,7 +166,7 @@ def train_diffusion_ibm(device):
     dataset  = CachedDataset(str(cache_path))
     loader   = DataLoader(dataset, batch_size=DIFF_IBM_BATCH,
                           shuffle=True, collate_fn=collate_fn, drop_last=True)
-    all_x    = torch.cat([x for x, _ in dataset], dim=0)
+    all_x    = torch.cat([x for x, _adj in dataset], dim=0)
     x_mean   = torch.zeros(NODE_DIM); x_std = torch.ones(NODE_DIM)
     x_mean[1:] = all_x[:, 1:].mean(0); x_std[1:] = all_x[:, 1:].std(0).clamp(min=1e-6)
     x_mean, x_std = x_mean.to(device), x_std.to(device)
@@ -200,11 +192,11 @@ def train_diffusion_ibm(device):
         model.train()
         total = 0.0; nb = 0
 
-        for x_batch, adj_batch in loader:
+        for x_batch, adj_batch, mask in loader:
             x_batch   = x_batch.to(device)
             adj_batch = adj_batch.to(device)
+            mask      = mask.to(device)
             n_nodes   = x_batch.shape[1]
-            mask      = (x_batch.abs().sum(-1) > 0).float()
 
             x_norm = x_batch.clone()
             x_norm[:, :, 1:] = (x_batch[:, :, 1:] - x_mean[1:]) / x_std[1:]
@@ -217,25 +209,28 @@ def train_diffusion_ibm(device):
                                                       adj=adj_t, node_mask=mask)
                 # noise-pred loss on continuous features
                 noise_true = x_t[:, :, 1:] - x_norm[:, :, 1:]
-                mse  = ((eps_pred[:, :, 1:] - noise_true) ** 2 * mask.unsqueeze(-1)).sum() / mask.sum().clamp(1)
-                # label BCE
-                bce  = F.binary_cross_entropy(
-                    eps_pred[:, :, 0].clamp(1e-6, 1-1e-6) * mask,
-                    x_batch[:, :, 0] * mask, reduction="sum"
-                ) / mask.sum().clamp(1)
-                # adjacency loss
-                adj_l = F.binary_cross_entropy(
-                    adj_pred.clamp(1e-6, 1-1e-6) * mask[:, :, None] * mask[:, None, :],
-                    adj_batch * mask[:, :, None] * mask[:, None, :], reduction="sum"
-                ) / (mask.sum() ** 2).clamp(1)
-                # density loss
-                pred_dens  = adj_pred.sum(dim=(-1, -2)) / (n_nodes ** 2 + 1e-8)
-                true_dens  = adj_batch.sum(dim=(-1, -2)) / (n_nodes ** 2 + 1e-8)
-                dens_loss  = ((pred_dens - true_dens) ** 2).mean()
+                mse = ((eps_pred[:, :, 1:] - noise_true) ** 2 * mask.unsqueeze(-1)).sum() / mask.sum().clamp(1)
 
-                loss = (mse + DIFF_IBM_LAUND_W * bce
-                        + DIFF_IBM_ADJ_W * adj_l
-                        + DIFF_IBM_DENSITY_W * dens_loss)
+            # BCE losses computed in float32 — bce is unsafe inside autocast
+            eps_pred_f = eps_pred.float()
+            adj_pred_f = adj_pred.float()
+            mask_f     = mask.float()
+            bce  = F.binary_cross_entropy(
+                eps_pred_f[:, :, 0].clamp(1e-6, 1-1e-6) * mask_f,
+                x_batch[:, :, 0].float() * mask_f, reduction="sum"
+            ) / mask_f.sum().clamp(1)
+            _m2 = mask_f[:, :, None] * mask_f[:, None, :]
+            adj_l = F.binary_cross_entropy(
+                adj_pred_f.clamp(1e-6, 1-1e-6) * _m2,
+                adj_batch.float() * _m2, reduction="sum"
+            ) / (_m2.sum()).clamp(1)
+            pred_dens = adj_pred_f.sum(dim=(-1, -2)) / (n_nodes ** 2 + 1e-8)
+            true_dens = adj_batch.float().sum(dim=(-1, -2)) / (n_nodes ** 2 + 1e-8)
+            dens_loss = ((pred_dens - true_dens) ** 2).mean()
+
+            loss = (mse + DIFF_IBM_LAUND_W * bce
+                    + DIFF_IBM_ADJ_W * adj_l
+                    + DIFF_IBM_DENSITY_W * dens_loss)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -263,8 +258,7 @@ def train_diffusion_ibm(device):
 def train_simclr_ibm(device):
     from simclr import GraphEncoder, ProjectionHead, train_simclr_fast
     from augmentation import build_igraph_from_transactions
-    from util import (preprocess_df, extract_laundering_networks_igraph,
-                      extract_non_laundering_networks_igraph)
+    from util import (preprocess_df, extract_networks_igraph)
     from diffusion.model     import DiffusionGNN
     from diffusion.diff_util import create_diffusion
 
@@ -279,25 +273,32 @@ def train_simclr_ibm(device):
     print(f"  Save : {ckpt_dir}")
     print('='*60)
 
+    def _cache_stale(nets):
+        """Return True if the cached networks have the wrong node feature dim."""
+        for n in nets:
+            xd = n.get("x_dense")
+            if xd is not None:
+                return xd.shape[1] != 11
+        return False  # no x_dense yet — will be built on first use
+
+    networks = None
     if cache_pt.exists():
         print(f"Loading networks from cache: {cache_pt}")
         networks = torch.load(str(cache_pt), weights_only=False)
-    else:
+        if _cache_stale(networks):
+            print("  Stale cache (wrong node_dim) — rebuilding …")
+            cache_pt.unlink()
+            networks = None
+
+    if networks is None:
         print("Extracting IBM networks …")
-        df_full    = preprocess_df(IBM_CSV_PATH)
-        with_laund = extract_laundering_networks_igraph(
+        df_full  = preprocess_df(IBM_CSV_PATH)
+        networks = extract_networks_igraph(
             df_full, max_depth=IBM_MAX_DEPTH,
-            max_networks=IBM_MAX_NETWORKS,
+            max_networks=IBM_MAX_NETWORKS * 2,
             collapse_threshold=IBM_COLLAPSE_THRESH,
             max_nodes=IBM_MAX_NODES,
         )
-        non_laund  = extract_non_laundering_networks_igraph(
-            df_full, max_depth=IBM_MAX_DEPTH,
-            max_networks=len(with_laund),
-            collapse_threshold=IBM_COLLAPSE_THRESH,
-            max_nodes=IBM_MAX_NODES,
-        )
-        networks = with_laund + non_laund
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
         torch.save(networks, str(cache_pt))
@@ -308,25 +309,26 @@ def train_simclr_ibm(device):
     diff_model = diffusion = x_mean = x_std = None
     if diff_ckpt.exists():
         ckpt       = torch.load(str(diff_ckpt), map_location=device, weights_only=False)
-        diff_model = DiffusionGNN(node_dim=6, hidden_dim=DIFF_IBM_HIDDEN, num_layers=4).to(device)
+        node_dim_ckpt = ckpt["model"]["input_proj.weight"].shape[1]
+        diff_model = DiffusionGNN(node_dim=node_dim_ckpt, hidden_dim=DIFF_IBM_HIDDEN, num_layers=4).to(device)
         diff_model.load_state_dict(ckpt["model"])
         diff_model.eval()
         diffusion = create_diffusion(T=DIFF_IBM_TIMESTEPS)
         x_mean    = ckpt["x_mean"].to(device)
         x_std     = ckpt["x_std"].to(device)
-        print("  Diffusion augmentation enabled.")
+        print(f"  Diffusion augmentation enabled (node_dim={node_dim_ckpt}).")
     else:
+        node_dim_ckpt = 11  # default to current feature count
         print(f"  Diffusion checkpoint not found at {diff_ckpt} — training without augmentation.")
 
-    df_full   = preprocess_df(IBM_CSV_PATH)
-    encoder   = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    encoder   = GraphEncoder(in_dim=node_dim_ckpt, hidden_dim=64, out_dim=128).to(device)
     projector = ProjectionHead(in_dim=128, proj_dim=64).to(device)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(projector.parameters()), lr=SIMCLR_IBM_LR
     )
 
     train_simclr_fast(
-        networks=networks, full_df=df_full,
+        networks=networks, full_df=None,
         encoder=encoder, projector=projector, optimizer=optimizer,
         device=device,
         batch_size=SIMCLR_IBM_BATCH,
@@ -426,11 +428,11 @@ def train_diffusion_elliptic(device):
         model.train()
         total = 0.0; nb = 0
 
-        for x_batch, adj_batch in loader:
+        for x_batch, adj_batch, mask in loader:
             x_batch   = x_batch.to(device)
             adj_batch = adj_batch.to(device)
+            mask      = mask.to(device)
             n_nodes   = x_batch.shape[1]
-            mask      = (x_batch.abs().sum(-1) > 0).float()
 
             x_norm = x_batch.clone()
             x_norm[:, :, 1:] = (x_batch[:, :, 1:] - x_mean[1:]) / x_std[1:]
@@ -442,21 +444,27 @@ def train_diffusion_elliptic(device):
                 eps_pred, adj_pred, _ = model(x_t, diffusion._scale_timesteps(t),
                                               adj=adj_t, node_mask=mask)
                 noise_true = x_t[:, :, 1:] - x_norm[:, :, 1:]
-                mse  = ((eps_pred[:, :, 1:] - noise_true) ** 2 * mask.unsqueeze(-1)).sum() / mask.sum().clamp(1)
-                bce  = F.binary_cross_entropy(
-                    eps_pred[:, :, 0].clamp(1e-6, 1-1e-6) * mask,
-                    x_batch[:, :, 0] * mask, reduction="sum"
-                ) / mask.sum().clamp(1)
-                adj_l = F.binary_cross_entropy(
-                    adj_pred.clamp(1e-6, 1-1e-6) * mask[:, :, None] * mask[:, None, :],
-                    adj_batch * mask[:, :, None] * mask[:, None, :], reduction="sum"
-                ) / (mask.sum() ** 2).clamp(1)
-                pred_dens = adj_pred.sum(dim=(-1,-2)) / (n_nodes ** 2 + 1e-8)
-                true_dens = adj_batch.sum(dim=(-1,-2)) / (n_nodes ** 2 + 1e-8)
-                dens_loss = ((pred_dens - true_dens) ** 2).mean()
-                loss = (mse + DIFF_ELL_LAUND_W * bce
-                        + DIFF_ELL_ADJ_W * adj_l
-                        + DIFF_ELL_DENSITY_W * dens_loss)
+                mse = ((eps_pred[:, :, 1:] - noise_true) ** 2 * mask.unsqueeze(-1)).sum() / mask.sum().clamp(1)
+
+            # BCE losses computed in float32 — bce is unsafe inside autocast
+            eps_pred_f = eps_pred.float()
+            adj_pred_f = adj_pred.float()
+            mask_f     = mask.float()
+            bce  = F.binary_cross_entropy(
+                eps_pred_f[:, :, 0].clamp(1e-6, 1-1e-6) * mask_f,
+                x_batch[:, :, 0].float() * mask_f, reduction="sum"
+            ) / mask_f.sum().clamp(1)
+            _m2 = mask_f[:, :, None] * mask_f[:, None, :]
+            adj_l = F.binary_cross_entropy(
+                adj_pred_f.clamp(1e-6, 1-1e-6) * _m2,
+                adj_batch.float() * _m2, reduction="sum"
+            ) / (_m2.sum()).clamp(1)
+            pred_dens = adj_pred_f.sum(dim=(-1, -2)) / (n_nodes ** 2 + 1e-8)
+            true_dens = adj_batch.float().sum(dim=(-1, -2)) / (n_nodes ** 2 + 1e-8)
+            dens_loss = ((pred_dens - true_dens) ** 2).mean()
+            loss = (mse + DIFF_ELL_LAUND_W * bce
+                    + DIFF_ELL_ADJ_W * adj_l
+                    + DIFF_ELL_DENSITY_W * dens_loss)
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()

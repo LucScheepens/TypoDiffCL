@@ -70,7 +70,8 @@ def load_simclr_encoder(device):
             pass
     print(f"Best SimCLR checkpoint: {best_ckpt_path.name}  (loss={best_loss:.4f})")
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
-    encoder = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    in_dim = ckpt["encoder_state_dict"]["conv1.lin.weight"].shape[1]
+    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=64, out_dim=128).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     encoder.eval()
     return encoder
@@ -81,7 +82,8 @@ def load_diffusion_model(device):
     from diffusion.model import DiffusionGNN
     from diffusion.diff_util import create_diffusion
     ckpt       = torch.load(CKPT_DIR / "diffusion_ibm" / "model.pt", map_location=device, weights_only=False)
-    diff_model = DiffusionGNN(node_dim=6, hidden_dim=128, num_layers=4).to(device)
+    node_dim   = ckpt["model"]["input_proj.weight"].shape[1]
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
     diffusion  = create_diffusion(T=500)
@@ -171,7 +173,7 @@ def guided_generate(
         x, adj = x.to(device), adj.to(device)
     n = x.shape[0]
 
-    x_pad   = torch.zeros(1, _max, 6,       device=device)
+    x_pad   = torch.zeros(1, _max, x.shape[1], device=device)
     adj_pad = torch.zeros(1, _max, _max,    device=device)
     mask    = torch.zeros(1, _max,           device=device)
     x_pad[0, :n]       = x
@@ -369,10 +371,19 @@ def run_guided_generation(
 
     laund_nets = [n for n in networks if     len(n["laundering_nodes"]) > 0]
     clean_nets = [n for n in networks if not len(n["laundering_nodes"]) > 0]
-    seeds = (
-        _random.sample(laund_nets, min(n_gen // 2, len(laund_nets)))
-      + _random.sample(clean_nets, min(n_gen // 2, len(clean_nets)))
-    )
+
+    # Seed from the same class as target_label so guidance starts from a
+    # realistic example of the desired class rather than fighting from the
+    # opposite distribution.  Fall back to mixed if one pool is too small.
+    if target_label == 1 and len(laund_nets) >= n_gen:
+        seeds = _random.sample(laund_nets, n_gen)
+    elif target_label == 0 and len(clean_nets) >= n_gen:
+        seeds = _random.sample(clean_nets, n_gen)
+    else:
+        seeds = (
+            _random.sample(laund_nets, min(n_gen // 2, len(laund_nets)))
+          + _random.sample(clean_nets, min(n_gen // 2, len(clean_nets)))
+        )
 
     gen_outputs, gen_embeddings = [], []
 
@@ -405,14 +416,13 @@ def run_guided_generation(
             ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
             bv_g = torch.zeros(n_out, dtype=torch.long)
             with torch.no_grad():
-                h_g       = encoder(Data(x=x_denorm, edge_index=ei_g,
-                                         batch=bv_g).to(device)).cpu()
-                h_g_n     = F.normalize(h_g, dim=-1)
-                pred_label = int(
-                    torch.sigmoid(probe(h_g_n.to(device))).squeeze().item() > 0.5
-                )
+                h_g   = encoder(Data(x=x_denorm, edge_index=ei_g,
+                                     batch=bv_g).to(device)).cpu()
+                h_g_n = F.normalize(h_g, dim=-1)
 
-            gen_outputs.append((x_denorm, adj_out, n_out, pred_label))
+            # Label is the guided target — we explicitly steered generation
+            # toward target_label, so that is the correct label.
+            gen_outputs.append((x_denorm, adj_out, n_out, target_label))
             gen_embeddings.append(h_g_n.squeeze(0).numpy())
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
@@ -446,7 +456,8 @@ def load_simclr_encoder_elliptic(device):
         )
     print(f"Best Elliptic SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
     ckpt    = torch.load(best_path, map_location=device, weights_only=False)
-    encoder = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    in_dim  = ckpt["encoder_state_dict"]["conv1.lin.weight"].shape[1]
+    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=64, out_dim=128).to(device)
     encoder.load_state_dict(ckpt["encoder_state_dict"])
     encoder.eval()
     return encoder
@@ -466,7 +477,8 @@ def load_diffusion_model_elliptic(device):
             "Run elliptic_diffusion_train.py first."
         )
     ckpt       = torch.load(model_path, map_location=device, weights_only=False)
-    diff_model = DiffusionGNN(node_dim=6, hidden_dim=128, num_layers=4).to(device)
+    node_dim   = ckpt["model"]["input_proj.weight"].shape[1]
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
     diffusion  = create_diffusion(T=500)
@@ -631,14 +643,13 @@ def run_guided_generation_elliptic(
             ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
             bv_g = torch.zeros(n_out, dtype=torch.long)
             with torch.no_grad():
-                h_g       = encoder(Data(x=x_denorm, edge_index=ei_g,
-                                         batch=bv_g).to(device)).cpu()
-                h_g_n     = F.normalize(h_g, dim=-1)
-                pred_label = int(
-                    torch.sigmoid(probe(h_g_n.to(device))).squeeze().item() > 0.5
-                )
+                h_g   = encoder(Data(x=x_denorm, edge_index=ei_g,
+                                     batch=bv_g).to(device)).cpu()
+                h_g_n = F.normalize(h_g, dim=-1)
 
-            gen_outputs.append((x_denorm, adj_out, n_out, pred_label))
+            # Label is the guided target — we explicitly steered generation
+            # toward target_label, so that is the correct label.
+            gen_outputs.append((x_denorm, adj_out, n_out, target_label))
             gen_embeddings.append(h_g_n.squeeze(0).numpy())
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
