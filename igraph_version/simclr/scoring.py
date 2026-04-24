@@ -100,8 +100,10 @@ def score_network(x, adj, encoder, H_all_n, device, mu, cov_inv, realism_scale,
         if ei.shape[1] == 0:
             ei = torch.zeros(2, 0, dtype=torch.long)
         bv = torch.zeros(n, dtype=torch.long)
+        # Strip col 0 (laundering flag) — encoder expects features without label
+        x_enc = x_pyg[:, 1:] if x_pyg.shape[1] > 1 else x_pyg
         with torch.no_grad():
-            h = encoder(Data(x=x_pyg, edge_index=ei, batch=bv).to(device)).cpu()
+            h = encoder(Data(x=x_enc, edge_index=ei, batch=bv).to(device)).cpu()
             gen_embedding = F.normalize(h, dim=-1).squeeze(0)
 
     if isinstance(gen_embedding, torch.Tensor):

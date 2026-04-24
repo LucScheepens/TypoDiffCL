@@ -89,11 +89,7 @@ def crop_network(network, crop_ratio=0.8, random_seed=None):
 
 
 def delete_random_edges(network, delete_frac=0.15, random_seed=None):
-    """
-    Delete random edges without disconnecting the network.
-    Bridge detection runs on the undirected view so it works correctly
-    for directed graphs produced by util.py.
-    """
+    """Delete a random fraction of edges — no bridge detection overhead."""
     if random_seed is not None:
         random.seed(random_seed)
 
@@ -101,24 +97,10 @@ def delete_random_edges(network, delete_frac=0.15, random_seed=None):
     if g.ecount() < 2:
         return {**network, "graph": g}
 
-    # Bridges on the undirected view — O(V+E), fast
-    g_undir = g.as_undirected(combine_edges="first")
-    bridge_pairs = set()
-    for eid in g_undir.bridges():
-        e = g_undir.es[eid]
-        bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
-
-    # Any directed edge whose undirected pair is a bridge is excluded
-    non_bridges = [
-        e.index for e in g.es
-        if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
-    ]
-    if not non_bridges:
-        return {**network, "graph": g}
-
-    target = max(1, int(len(non_bridges) * delete_frac))
-    random.shuffle(non_bridges)
-    g.delete_edges(non_bridges[:target])
+    all_eids = list(range(g.ecount()))
+    target = max(1, int(len(all_eids) * delete_frac))
+    random.shuffle(all_eids)
+    g.delete_edges(all_eids[:target])
 
     return {**network, "graph": g}
 
@@ -241,18 +223,14 @@ def augment_network_view_fast(
     network,
     p_crop=0.6,
     p_edge_drop=0.2,
-    p_node_delete=0.2,
-    p_node_add=0.2,
     crop_ratio_range=(0.6, 0.9),
     edge_drop_range=(0.05, 0.2),
-    node_delete_frac=0.15,
-    num_new_nodes=5,
     random_seed=None,
 ):
     if random_seed is not None:
         random.seed(random_seed)
 
-    aug_net = {**network}  # shallow copy — augmentation fns always return new dicts/graphs
+    aug_net = {**network}
 
     if random.random() < p_crop:
         ratio = random.uniform(*crop_ratio_range)
@@ -261,11 +239,5 @@ def augment_network_view_fast(
     if random.random() < p_edge_drop:
         frac = random.uniform(*edge_drop_range)
         aug_net = delete_random_edges(aug_net, delete_frac=frac)
-
-    if random.random() < p_node_delete:
-        aug_net = delete_nodes(aug_net, delete_frac=node_delete_frac)
-
-    if random.random() < p_node_add:
-        aug_net = add_nodes(aug_net, num_new_nodes=num_new_nodes)
 
     return aug_net

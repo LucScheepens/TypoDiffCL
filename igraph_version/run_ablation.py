@@ -42,16 +42,17 @@ from pathlib import Path
 
 BASE_DIR   = Path(__file__).resolve().parent
 RESULT_DIR = BASE_DIR / "results"
-CKPT_ROOT  = BASE_DIR / "checkpoints" / "simclr_elliptic_ablation"
 
-EVAL_SCRIPT  = BASE_DIR / "generation" / "evaluate_classifiers.py"
-TRAIN_SCRIPT = BASE_DIR / "elliptic_simclr_train_ablation.py"
+EVAL_SCRIPT             = BASE_DIR / "generation" / "evaluate_classifiers.py"
+ELLIPTIC_TRAIN_SCRIPT   = BASE_DIR / "elliptic_simclr_train_ablation.py"
+IBM_TRAIN_SCRIPT        = BASE_DIR / "ibm_simclr_train_ablation.py"
 
 
 # ── Ablation condition definitions ────────────────────────────────────────────
 
+# Elliptic conditions — may use --p-edge-drop and --p-feat-mask
 # Each entry: (condition_name, description, extra_train_args)
-ENCODER_CONDITIONS = [
+ELLIPTIC_ENCODER_CONDITIONS = [
     (
         "full",
         "Full pipeline: edge-drop + feat-mask + diffusion aug + SupCon",
@@ -92,7 +93,72 @@ ENCODER_CONDITIONS = [
         "NT-Xent only, no SupCon, no diffusion aug",
         ["--supcon-weight", "0.0", "--p-diffusion", "0.0"],
     ),
+    # ── Option A / C ─────────────────────────────────────────────────────────
+    (
+        "diff_multistep",
+        "Option A: multi-step DDIM views (15 steps, t_start=0.5T)",
+        ["--view-type", "multistep"],
+    ),
+    (
+        "diff_guided",
+        "Option C: class-guided DDIM views (15 steps, guidance_scale=1.5)",
+        ["--view-type", "guided"],
+    ),
+    (
+        "diff_multistep_to_guided",
+        "Option A+C: warmup on multistep then switch to guided",
+        ["--view-type", "multistep_to_guided"],
+    ),
 ]
+
+# IBM conditions — IBM augmentation uses augment_network_view_fast internally,
+# so only p_diffusion and supcon_weight are exposed as knobs.
+IBM_ENCODER_CONDITIONS = [
+    (
+        "full",
+        "Full pipeline: struct aug (crop/edge-del/node-del/node-add) + diffusion aug + SupCon",
+        [],
+    ),
+    (
+        "no_supcon",
+        "No supervised contrastive loss (NT-Xent only)",
+        ["--supcon-weight", "0.0"],
+    ),
+    (
+        "no_diffusion_aug",
+        "No diffusion augmentation in SimCLR (structural aug only, p_diffusion=0)",
+        ["--p-diffusion", "0.0"],
+    ),
+    (
+        "diffusion_aug_only",
+        "Diffusion augmentation for both views (p_diffusion=1.0)",
+        ["--p-diffusion", "1.0"],
+    ),
+    (
+        "ntxent_only",
+        "NT-Xent only, no SupCon, no diffusion aug",
+        ["--supcon-weight", "0.0", "--p-diffusion", "0.0"],
+    ),
+    # ── Option A / C ─────────────────────────────────────────────────────────
+    (
+        "diff_multistep",
+        "Option A: multi-step DDIM views (15 steps, t_start=0.5T)",
+        ["--view-type", "multistep"],
+    ),
+    (
+        "diff_guided",
+        "Option C: class-guided DDIM views (15 steps, guidance_scale=1.5)",
+        ["--view-type", "guided"],
+    ),
+    (
+        "diff_multistep_to_guided",
+        "Option A+C: warmup on multistep then switch to guided",
+        ["--view-type", "multistep_to_guided"],
+    ),
+]
+
+# Kept for backwards compatibility — used when dataset is not "ibm"
+ENCODER_CONDITIONS = ELLIPTIC_ENCODER_CONDITIONS
 
 # Each entry: (condition_name, description, extra_eval_args)
 # These all use the DEFAULT trained encoder (checkpoints/simclr_elliptic)
@@ -208,12 +274,14 @@ def main():
     )
     parser.add_argument("--dataset", choices=["elliptic", "ibm", "both"],
                         default="elliptic",
-                        help="Dataset (default: elliptic)")
+                        help="Dataset (default: elliptic). "
+                             "IBM uses ibm_simclr_train_ablation.py for encoder training; "
+                             "Elliptic uses elliptic_simclr_train_ablation.py.")
     parser.add_argument("--n-gen",    type=int,   default=40,
                         help="Generated graphs per condition (default 40)")
     parser.add_argument("--low-data", type=float, default=1.0,
                         help="Training data fraction, e.g. 0.2 for low-data regime")
-    parser.add_argument("--epochs",   type=int,   default=100,
+    parser.add_argument("--epochs",   type=int,   default=10,
                         help="SimCLR training epochs per condition (default 100)")
     parser.add_argument("--skip-training", action="store_true",
                         help="Skip SimCLR retraining if checkpoints already exist")
@@ -226,7 +294,19 @@ def main():
     args = parser.parse_args()
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
-    CKPT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # ── Select dataset-specific config ───────────────────────────────────────
+    if args.dataset == "ibm":
+        train_script      = IBM_TRAIN_SCRIPT
+        encoder_conditions = IBM_ENCODER_CONDITIONS
+        ckpt_root         = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
+    else:
+        # "elliptic" or "both" — run encoder training on Elliptic
+        train_script      = ELLIPTIC_TRAIN_SCRIPT
+        encoder_conditions = ELLIPTIC_ENCODER_CONDITIONS
+        ckpt_root         = BASE_DIR / "checkpoints" / "simclr_elliptic_ablation"
+
+    ckpt_root.mkdir(parents=True, exist_ok=True)
 
     all_results = {}
     failures    = []
@@ -234,24 +314,24 @@ def main():
     # ── A. Encoder ablations ─────────────────────────────────────────────────
     if not args.gen_only:
         print("\n" + "="*60)
-        print("PART A: SimCLR Encoder Ablations")
+        print(f"PART A: SimCLR Encoder Ablations  [{args.dataset}]")
         print("="*60)
 
-        for condition, description, extra_train_args in ENCODER_CONDITIONS:
+        for condition, description, extra_train_args in encoder_conditions:
             if args.conditions and condition not in args.conditions:
                 continue
 
-            ckpt_dir  = CKPT_ROOT / condition
+            ckpt_dir  = ckpt_root / condition
             best_ckpt = ckpt_dir / "best_model.pt"
 
             # ── A1. Train encoder ────────────────────────────────────────────
             if not (args.skip_training and best_ckpt.exists()):
                 ok = _run(
-                    [TRAIN_SCRIPT,
+                    [train_script,
                      "--condition", condition,
                      "--epochs",    str(args.epochs),
                      ] + extra_train_args,
-                    f"Train encoder: {condition} — {description}",
+                    f"Train encoder [{args.dataset}]: {condition} — {description}",
                 )
                 if not ok:
                     failures.append(f"train:{condition}")

@@ -186,10 +186,6 @@ class DiffusionGNN(nn.Module):
         nn.init.normal_(self.adj_lin.weight,   std=0.01)
         nn.init.normal_(self.adj_proj.weight,  std=0.02)
 
-        # Node existence prediction: learned from the same node embeddings.
-        # Predicts a logit per node — whether that node should be active.
-        self.node_existence_head = nn.Linear(hidden_dim, 1)
-
 
     def forward(self, x, t, adj=None, node_mask=None):
 
@@ -243,7 +239,4 @@ class DiffusionGNN(nn.Module):
         if node_mask is not None:
             adj_pred = adj_pred * node_mask[:, :, None] * node_mask[:, None, :]
 
-        # Node existence logits — raw (not sigmoid'd), one per padded position
-        node_logits = self.node_existence_head(h).squeeze(-1)   # [B, N]
-
-        return out, adj_pred, node_logits
+        return out, adj_pred, None

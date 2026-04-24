@@ -56,7 +56,8 @@ for _p in (str(BASE_DIR), str(DIFF_DIR), str(BASE_DIR / "simclr"),
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from simclr import GraphEncoder, ProjectionHead, nt_xent_loss, sup_con_loss
+from simclr import (GraphEncoder, ProjectionHead, nt_xent_loss, sup_con_loss,
+                    _diffusion_view_multistep, _diffusion_view_guided, _fit_probe)
 from elliptic_adapter import load_elliptic_pyg_graphs
 
 CKPT_ROOT = BASE_DIR / "checkpoints" / "simclr_elliptic_ablation"
@@ -90,7 +91,9 @@ def _augment_pyg(data, p_edge_drop=0.20, p_feat_mask=0.15):
             keep_full = torch.cat([keep_full, torch.ones(1, dtype=torch.bool)])
         ei = ei[:, keep_full]
 
-    return Data(x=x, edge_index=ei, y=data.y.clone())
+    # Strip col 0 (laundering flag) — encoder must not receive the label
+    # as a node feature, only through the SupCon label signal.
+    return Data(x=x[:, 1:], edge_index=ei, y=data.y.clone())
 
 
 def _load_diffusion(device):
@@ -158,7 +161,8 @@ def _diffusion_view(data6, diff_model, diffusion, x_mean, x_std, device, t_frac=
     x0[:, 1] = deg / deg.max().clamp(min=1.0)
 
     ei_out = (adj_pred[0, :n, :n].cpu() > 0.5).nonzero(as_tuple=False).T.contiguous()
-    return Data(x=x0, edge_index=ei_out, y=data6.y.clone())
+    # Strip col 0 so the local diffusion view has the same dim as _augment_pyg output
+    return Data(x=x0[:, 1:], edge_index=ei_out, y=data6.y.clone())
 
 
 # ── training ──────────────────────────────────────────────────────────────────
@@ -168,6 +172,8 @@ def train(args, device):
     print(f"SimCLR ablation: {args.condition}")
     print(f"  supcon_weight={args.supcon_weight}  p_diffusion={args.p_diffusion}")
     print(f"  p_edge_drop={args.p_edge_drop}  p_feat_mask={args.p_feat_mask}")
+    print(f"  view_type={args.view_type}  diff_n_steps={args.diff_n_steps}"
+          f"  diff_t_start={args.diff_t_start}  diff_guidance={args.diff_guidance_scale}")
     print(f"{'='*60}\n")
 
     print("Loading Elliptic graphs …")
@@ -184,7 +190,8 @@ def train(args, device):
     ckpt_dir = CKPT_ROOT / args.condition
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    encoder   = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    # in_dim=5: col 0 (laundering flag) is stripped before the encoder sees any view
+    encoder   = GraphEncoder(in_dim=5, hidden_dim=64, out_dim=128).to(device)
     projector = ProjectionHead(in_dim=128, proj_dim=64).to(device)
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(projector.parameters()), lr=args.lr
@@ -194,11 +201,27 @@ def train(args, device):
     best_encoder_sd   = None
     best_projector_sd = None
 
+    # view-type flags (mirrors train_simclr_fast logic)
+    _use_multistep   = args.view_type in ("multistep", "guided", "multistep_to_guided")
+    _use_guided      = args.view_type == "guided"
+    _use_progressive = args.view_type == "multistep_to_guided"
+    probe            = None
+
     for epoch in range(args.epochs):
         t0 = time.time()
         encoder.train();  projector.train()
         if diff_model is not None:
             diff_model.eval()
+
+        # ── decide view strategy for this epoch ──────────────────────────────
+        guided_this_epoch = _use_guided or (_use_progressive and epoch >= args.probe_warmup_epochs)
+
+        if guided_this_epoch and use_diffusion:
+            # Fit once at the start of the guided phase — periodic re-fitting
+            # overfits to noise in the embeddings and destabilises guidance.
+            if probe is None:
+                print(f"  [probe] fitting once on {len(graphs)} Elliptic graphs …")
+                probe = _fit_probe(encoder, graphs, device, n_epochs=300, is_pyg=True)
 
         random.shuffle(graphs)
         total_loss = total_ntxent = total_sc = 0.0
@@ -214,18 +237,30 @@ def train(args, device):
                     p_feat_mask=args.p_feat_mask,
                 ))
 
+                diff_v2 = None
                 if use_diffusion and random.random() < args.p_diffusion:
-                    v2 = _diffusion_view(g, diff_model, diffusion, x_mean, x_std, device)
-                    views2.append(v2 if v2 is not None else _augment_pyg(g,
-                        p_edge_drop=args.p_edge_drop,
-                        p_feat_mask=args.p_feat_mask,
-                    ))
-                else:
-                    views2.append(_augment_pyg(g,
-                        p_edge_drop=args.p_edge_drop,
-                        p_feat_mask=args.p_feat_mask,
-                    ))
+                    if guided_this_epoch and probe is not None:
+                        diff_v2 = _diffusion_view_guided(
+                            g, diff_model, diffusion, x_mean, x_std,
+                            encoder, probe, device,
+                            t_start_frac=args.diff_t_start,
+                            n_steps=args.diff_n_steps,
+                            guidance_scale=args.diff_guidance_scale,
+                            max_nodes=MAX_NODES, is_pyg=True,
+                        )
+                    elif _use_multistep:
+                        diff_v2 = _diffusion_view_multistep(
+                            g, diff_model, diffusion, x_mean, x_std, device,
+                            t_start_frac=args.diff_t_start,
+                            n_steps=args.diff_n_steps,
+                            max_nodes=MAX_NODES, is_pyg=True,
+                        )
+                    else:
+                        diff_v2 = _diffusion_view(g, diff_model, diffusion, x_mean, x_std, device)
 
+                views2.append(diff_v2 if diff_v2 is not None else _augment_pyg(
+                    g, p_edge_drop=args.p_edge_drop, p_feat_mask=args.p_feat_mask,
+                ))
                 labels_list.append(int(g.y.item()))
 
             labels = torch.tensor(labels_list, dtype=torch.long, device=device)
@@ -310,6 +345,22 @@ if __name__ == "__main__":
     parser.add_argument("--lr",            type=float, default=1e-3)
     parser.add_argument("--ckpt-interval", type=int,   default=10,
                         help="Save a periodic checkpoint every N epochs")
+    # ── new: view-type control ────────────────────────────────────────────────
+    parser.add_argument("--view-type", type=str, default="single_step",
+                        choices=["single_step", "multistep", "guided", "multistep_to_guided"],
+                        help="Diffusion view strategy: single_step (current), "
+                             "multistep (Option A: DDIM), guided (Option C: class-guided DDIM), "
+                             "multistep_to_guided (warmup on A then switch to C)")
+    parser.add_argument("--diff-n-steps",       type=int,   default=15,
+                        help="DDIM denoising steps for multistep/guided views (default 15)")
+    parser.add_argument("--diff-t-start",       type=float, default=0.5,
+                        help="Noise start level as fraction of T (default 0.5)")
+    parser.add_argument("--diff-guidance-scale",type=float, default=1.5,
+                        help="Guidance strength for guided views (default 1.5)")
+    parser.add_argument("--probe-warmup-epochs",type=int,   default=20,
+                        help="Epochs of multistep before switching to guided (multistep_to_guided)")
+    parser.add_argument("--probe-update-every", type=int,   default=20,
+                        help="Re-fit probe every N epochs once guided phase starts")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

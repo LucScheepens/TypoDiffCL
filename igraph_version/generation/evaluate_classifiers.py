@@ -354,11 +354,10 @@ def network_to_pyg(x_dense, adj_dense, label):
 def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
     """
     Convert a diffusion-generated triple to a PyG Data object.
-    x_denorm[:, 0] = predicted laundering probability — excluded.
-    x_denorm[:, 1:] = all node features (topology + transaction) generated
-    by the retrained diffusion model on 11-dim data.
+    x_denorm col 0 is normalized degree (deg_n) — col 0 is NOT the laundering
+    flag after the label-leakage fix; all 10 columns are topology features.
     """
-    x_topo = x_denorm[:n_out, 1:].float()
+    x_topo = x_denorm[:n_out].float()
     x_np   = x_topo.numpy()
 
     adj_np = adj_out[:n_out, :n_out]
@@ -745,6 +744,12 @@ def main():
     parser.add_argument("--degree-penalty", type=float, default=None,
                         help="Override degree_penalty in guided generation (default 0.5). "
                              "Set 0 to disable density constraint.")
+    parser.add_argument("--q-threshold", type=float, default=0.4, metavar="Q",
+                        help="Minimum composite quality score Q ∈ [0,1] required to keep "
+                             "a generated graph. Graphs below this threshold are discarded "
+                             "before being added to the training set. "
+                             "Q is the mean of (1-norm_emb_dist, 1-norm_wass_dist, "
+                             "1-norm_density). Default: 0.4. Set 0.0 to keep all.")
     parser.add_argument("--t-start", type=int, default=None,
                         help="Override t_start (starting diffusion timestep) in guided "
                              "generation (default 150 for Elliptic).")
@@ -927,17 +932,14 @@ def main():
 
     # ── 3b. Optional low-data subsampling ────────────────────────────────────
     if args.low_data < 1.0:
-        n_keep = max(10, int(len(data_train) * args.low_data))
+        n_train_before_ld = len(data_train)
+        n_keep = max(10, int(n_train_before_ld * args.low_data))
         train_labels_np = np.array([d.y.item() for d in data_train])
         sss_ld = StratifiedShuffleSplit(n_splits=1, train_size=n_keep, random_state=42)
         idx_ld, _ = next(sss_ld.split(np.arange(len(data_train)), train_labels_np))
         data_train = [data_train[i] for i in idx_ld]
-        if args.dataset == "elliptic":
-            print(f"Low-data mode: keeping {len(data_train)} / {len(idx_trainval)} "
-                f"training graphs ({args.low_data:.0%})")
-        else:
-            print(f"Low-data mode: keeping {len(data_train)} / {len(data_trainval)} "
-                f"training graphs ({args.low_data:.0%})")
+        print(f"Low-data mode: keeping {len(data_train)} / {n_train_before_ld} "
+              f"training graphs ({args.low_data:.0%})")
         print()
 
     # ── 4. Optionally generate augmentation data ─────────────────────────────
@@ -972,7 +974,8 @@ def main():
                     raise FileNotFoundError(f"No valid checkpoint in {args.encoder_dir}")
                 print(f"Ablation encoder: {_best_path.name}  (loss={_best_loss:.4f})")
                 _ckpt = torch.load(_best_path, map_location=device, weights_only=False)
-                encoder_e = _GE(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+                # in_dim=5 after label-leakage fix (col 0 stripped before encoder)
+                encoder_e = _GE(in_dim=5, hidden_dim=64, out_dim=128).to(device)
                 encoder_e.load_state_dict(_ckpt["encoder_state_dict"])
                 encoder_e.eval()
             else:
@@ -984,24 +987,30 @@ def main():
             H_all_e, y_all_e = encode_all_pyg_graphs(data_train, encoder_e, device)
             probe_e = train_mlp_probe(H_all_e, y_all_e, device)
 
-            _gen_kwargs = dict(
-                target_label=1,
-                n_gen=args.n_gen,
+            _gen_kwargs_shared = dict(
+                n_gen=args.n_gen // 2,   # half per class for balanced augmentation
                 t_start=args.t_start if args.t_start is not None else 150,
             )
             if args.guidance_scale is not None:
-                _gen_kwargs["guidance_scale"] = args.guidance_scale
+                _gen_kwargs_shared["guidance_scale"] = args.guidance_scale
             if args.novelty_weight is not None:
-                _gen_kwargs["novelty_weight"] = args.novelty_weight
+                _gen_kwargs_shared["novelty_weight"] = args.novelty_weight
             if args.degree_penalty is not None:
-                _gen_kwargs["degree_penalty"] = args.degree_penalty
+                _gen_kwargs_shared["degree_penalty"] = args.degree_penalty
 
-            gen_outputs, _, _ = run_guided_generation_elliptic(
-                data_train, encoder_e, probe_e, diff_model_e, diffusion_e,
-                x_mean_e, x_std_e, H_all_e, device,
-                **_gen_kwargs,
-            )
-            for (x_denorm, adj_out, n_out, label) in gen_outputs:
+            # Generate for both classes to match the real class balance and
+            # avoid biasing the augmented training set toward class 1.
+            _gen_raw_e = []
+            for _lbl in (1, 0):
+                _outs, _, _ = run_guided_generation_elliptic(
+                    data_train, encoder_e, probe_e, diff_model_e, diffusion_e,
+                    x_mean_e, x_std_e, H_all_e, device,
+                    target_label=_lbl,
+                    **_gen_kwargs_shared,
+                )
+                _gen_raw_e.extend(_outs)
+
+            for (x_denorm, adj_out, n_out, label) in _gen_raw_e:
                 gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
 
             n_ill_gen = sum(d.y.item() == 1 for d in gen_data)
@@ -1021,6 +1030,14 @@ def main():
             plot_quality_extremes(_quality_e, gen_data,
                                   ROOT_DIR / "results" / f"quality_extremes_{_q_suffix_e}.png")
 
+            # ── Q-score filtering ─────────────────────────────────────────
+            if args.q_threshold > 0.0:
+                Q_scores = _quality_e["Q"]
+                before   = len(gen_data)
+                gen_data = [g for g, q in zip(gen_data, Q_scores) if q >= args.q_threshold]
+                print(f"Q-filter (threshold={args.q_threshold:.2f}): "
+                      f"kept {len(gen_data)}/{before} generated graphs\n")
+
         elif not networks:
             # ── IBM networks missing ──────────────────────────────────────
             print("WARNING: --augment requires IBM networks for the diffusion+SimCLR "
@@ -1034,15 +1051,24 @@ def main():
             _t_start = args.t_start if args.t_start is not None else 150
             GEN_CACHE_PATH = DATA_DIR / f"gen_cache_{csv_stem}_n{args.n_gen}_t{_t_start}{_ld_tag}.pkl"
 
+            _cache_valid = False
             if GEN_CACHE_PATH.exists():
-                print(f"Loading generated graphs from cache ({GEN_CACHE_PATH.name}) …")
                 with open(GEN_CACHE_PATH, "rb") as _f:
                     gen_data = pickle.load(_f)
-                n_laund_gen = sum(d.y.item() == 1 for d in gen_data)
-                n_clean_gen = len(gen_data) - n_laund_gen
-                print(f"Loaded {len(gen_data)} cached augmentation graphs "
-                      f"(laundering={n_laund_gen}, clean={n_clean_gen})\n")
-            else:
+                # Invalidate cache if feature dim changed (expected IN_CHANNELS)
+                _sample_dim = gen_data[0].x.shape[1] if gen_data else 0
+                if _sample_dim == IN_CHANNELS:
+                    _cache_valid = True
+                    n_laund_gen = sum(d.y.item() == 1 for d in gen_data)
+                    n_clean_gen = len(gen_data) - n_laund_gen
+                    print(f"Loading generated graphs from cache ({GEN_CACHE_PATH.name}) …")
+                    print(f"Loaded {len(gen_data)} cached augmentation graphs "
+                          f"(laundering={n_laund_gen}, clean={n_clean_gen})\n")
+                else:
+                    print(f"Stale cache (dim={_sample_dim}, expected {IN_CHANNELS}) — regenerating …")
+                    GEN_CACHE_PATH.unlink()
+            if not _cache_valid:
+                gen_data = []
                 print(f"Generating {args.n_gen} augmentation networks …")
                 from generation.generation import (
                     load_simclr_encoder, load_diffusion_model,
@@ -1066,15 +1092,18 @@ def main():
                 H_all_n, y_all = encode_all_networks(train_ibm_nets, encoder, device)
                 probe = train_mlp_probe(H_all_n, y_all, device)
 
-                gen_outputs, _, _ = run_guided_generation(
-                    networks, encoder, probe, diff_model, diffusion,
-                    x_mean, x_std, H_all_n, device,
-                    target_label=1,
-                    n_gen=args.n_gen,
-                    t_start=_t_start,
-                )
-                for (x_denorm, adj_out, n_out, label) in gen_outputs:
-                    gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
+                # Generate for both classes (balanced) — avoids biasing the
+                # augmented training set toward class 1 only.
+                for _lbl in (1, 0):
+                    _outs, _, _ = run_guided_generation(
+                        networks, encoder, probe, diff_model, diffusion,
+                        x_mean, x_std, H_all_n, device,
+                        target_label=_lbl,
+                        n_gen=args.n_gen // 2,
+                        t_start=_t_start,
+                    )
+                    for (x_denorm, adj_out, n_out, label) in _outs:
+                        gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
 
                 n_laund_gen = sum(d.y.item() == 1 for d in gen_data)
                 n_clean_gen = len(gen_data) - n_laund_gen
@@ -1101,6 +1130,32 @@ def main():
                                          ROOT_DIR / "results" / f"quality_extremes_{_q_suffix_ibm}.png")
                 except Exception as _qe:
                     print(f"[quality scoring skipped: {_qe}]")
+            else:
+                # When loading from cache, quality scoring was already done in the
+                # previous run.  Apply Q filtering based on a saved CSV if it exists,
+                # otherwise skip (the user can re-generate without cache to re-filter).
+                _q_csv = ROOT_DIR / "results" / f"graph_quality_ibm.csv"
+                if args.q_threshold > 0.0 and _q_csv.exists():
+                    import csv as _csv_mod
+                    with open(_q_csv) as _qf:
+                        _q_rows = list(_csv_mod.DictReader(_qf))
+                    if len(_q_rows) == len(gen_data):
+                        _Q_cached = [float(r["Q"]) for r in _q_rows]
+                        before    = len(gen_data)
+                        gen_data  = [g for g, q in zip(gen_data, _Q_cached)
+                                     if q >= args.q_threshold]
+                        print(f"Q-filter (threshold={args.q_threshold:.2f}, from cache): "
+                              f"kept {len(gen_data)}/{before} generated graphs\n")
+
+            # Apply Q filtering when quality scores were freshly computed
+            if 'encoder' in dir() and '_quality_ibm' in dir():
+                if args.q_threshold > 0.0:
+                    Q_scores = _quality_ibm["Q"]
+                    before   = len(gen_data)
+                    gen_data = [g for g, q in zip(gen_data, Q_scores)
+                                if q >= args.q_threshold]
+                    print(f"Q-filter (threshold={args.q_threshold:.2f}): "
+                          f"kept {len(gen_data)}/{before} generated graphs\n")
 
     # ── 5. Greedy selection (if requested) ──────────────────────────────────
     gen_data_selected = []

@@ -118,16 +118,14 @@ def _plot_umap(H_all_n, all_labels, gen_embeddings, seeds, target_label,
 def _plot_latent_space_pyg(graphs, encoder, device, save_path):
     """
     UMAP of the Elliptic SimCLR encoder space (illicit vs licit).
-    Works directly with PyG Data objects extended to 6-D.
+    Works directly with PyG Data objects (5-D features, col 0 = label stripped).
     """
     from torch_geometric.data import Data as _Data, Batch as _Batch
 
     ext, labels = [], []
     for g in graphs:
-        n         = g.x.shape[0]
-        label_col = torch.full((n, 1), float(g.y.item()))
-        x6        = torch.cat([label_col, g.x], dim=1)
-        ext.append(_Data(x=x6, edge_index=g.edge_index))
+        # No label prepending — encoder expects 5-dim after label-leakage fix.
+        ext.append(_Data(x=g.x.clone(), edge_index=g.edge_index))
         labels.append(int(g.y.item()))
 
     H_list = []

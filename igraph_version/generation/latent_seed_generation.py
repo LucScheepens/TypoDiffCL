@@ -605,11 +605,12 @@ def run_latent_seed_generation(
                 pbar=pbar,
             )
 
+            # Denormalise — col 0 (laundering flag) excluded to match
+            # the encoder's input dimension after the label-leakage fix.
             x_cont_d = x_out[:, 1:] * x_std.cpu()[1:] + x_mean.cpu()[1:]
-            x_bin_d  = x_out[:, 0:1].clamp(0, 1)
             deg_g    = adj_out.sum(dim=-1, keepdim=True)
             deg_n    = deg_g / deg_g.max().clamp(min=1.0)
-            x_denorm = torch.cat([x_bin_d, deg_n, x_cont_d[:, 1:]], dim=-1)
+            x_denorm = torch.cat([deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 5]
 
             gen_outputs.append((x_denorm, adj_out, n_out))
 

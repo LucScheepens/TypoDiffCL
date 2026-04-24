@@ -59,10 +59,9 @@ def _embed_gen_data(gen_data, encoder, device, batch_size=64):
     """
     ext_graphs = []
     for g in gen_data:
-        n         = g.x.shape[0]
-        label_col = torch.ones(n, 1)                      # all generated = laundering
-        x6        = torch.cat([label_col, g.x], dim=1)   # [n, 6]
-        ext_graphs.append(Data(x=x6, edge_index=g.edge_index.clone()))
+        # Generated graphs already have col 0 (laundering flag) excluded after
+        # the label-leakage fix — pass features directly without prepending.
+        ext_graphs.append(Data(x=g.x.clone(), edge_index=g.edge_index.clone()))
 
     H_list = []
     with torch.no_grad():
@@ -96,7 +95,7 @@ def compute_embedding_distances(gen_data, H_train_laund, encoder, device, k=5):
     gen_data      : list[PyG Data]  generated graphs (5-dim node features)
     H_train_laund : Tensor [M, 128] L2-normalised embeddings of real
                     laundering training graphs only
-    encoder       : SimCLR GraphEncoder (in_dim=6)
+    encoder       : SimCLR GraphEncoder (in_dim=5 after label-leakage fix)
     device        : torch.device
     k             : number of nearest neighbours to average over
 
@@ -226,7 +225,7 @@ def score_generated_graphs(gen_data, train_laund_data, H_train_laund,
     train_laund_data : list[PyG Data]  real laundering training graphs (5-dim)
     H_train_laund    : Tensor [M, 128] L2-normalised SimCLR embeddings of
                        real laundering training graphs (label == 1 subset only)
-    encoder          : SimCLR GraphEncoder (in_dim=6)
+    encoder          : SimCLR GraphEncoder (in_dim=5 after label-leakage fix)
     device           : torch.device
     k                : k-NN for embedding distance
 

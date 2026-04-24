@@ -42,12 +42,15 @@ def _enforce_connectivity(adj_bin):
 
 
 def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
-    """Convert dense predicted node features + adjacency to a PyG Data object."""
-    x_bin  = x0_nodes[:, 0:1].clamp(0.0, 1.0)
+    """Convert dense predicted node features + adjacency to a PyG Data object.
+
+    Col 0 (laundering flag) is excluded so the encoder receives the same
+    feature dimension as during training (after the label-leakage fix).
+    """
     x_cont = x0_nodes[:, 1:] * x_std[1:] + x_mean[1:]
     deg    = adj_soft.sum(dim=-1, keepdim=True)
     deg_n  = deg / deg.detach().max().clamp(min=1.0)
-    x_feat = torch.cat([x_bin, deg_n, x_cont[:, 1:]], dim=-1)   # [n, 6]
+    x_feat = torch.cat([deg_n, x_cont[:, 1:]], dim=-1)   # [n, 5] — col 0 stripped
     ei = (adj_soft.detach() > 0.5).nonzero(as_tuple=False).T.contiguous()
     if ei.shape[1] == 0:
         ei = torch.zeros(2, 0, dtype=torch.long, device=device)
@@ -115,7 +118,9 @@ def encode_all_networks(networks, encoder, device):
 def train_mlp_probe(H_all_n, y_all, device, n_epochs=500):
     """Train a binary MLP probe on frozen SimCLR embeddings. Returns the probe."""
     probe = nn.Sequential(nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1)).to(device)
-    opt   = torch.optim.Adam(probe.parameters(), lr=5e-3)
+    # weight_decay = L2 regularisation — prevents the probe from overfitting to
+    # small embedding sets, which would produce misleading classifier guidance.
+    opt   = torch.optim.Adam(probe.parameters(), lr=5e-3, weight_decay=1e-4)
     for _ in range(n_epochs):
         logit = probe(H_all_n.to(device)).squeeze(-1)
         loss  = F.binary_cross_entropy_with_logits(logit, y_all.to(device))
@@ -321,8 +326,9 @@ def guided_generate(
 
     # Guarantee a single connected component before returning
     adj_out = adj_t[0, :n, :n].cpu()
-    adj_out, _ = _enforce_connectivity(adj_out)
-    return x_t[0, :n].cpu(), adj_out, n
+    adj_out, n_patches = _enforce_connectivity(adj_out)
+    # Return patch count so callers can log/filter graphs that needed heavy repair
+    return x_t[0, :n].cpu(), adj_out, n, n_patches
 
 
 def run_guided_generation(
@@ -385,14 +391,23 @@ def run_guided_generation(
           + _random.sample(clean_nets, min(n_gen // 2, len(clean_nets)))
         )
 
+    # ── Structural validity thresholds ────────────────────────────────────────
+    train_sizes = [
+        (net["adj_dense"] if "adj_dense" in net else _ntd(net)[1]).shape[0]
+        for net in networks
+    ]
+    size_5th = float(np.percentile(train_sizes, 5)) if train_sizes else 3.0
+    density_ceil = 2.0 * target_density if target_density is not None else None
+
     gen_outputs, gen_embeddings = [], []
+    n_discarded = 0
 
     with tqdm(total=len(seeds) * (t_start + 1),
               desc=f"Generating {len(seeds)} networks",
               unit="step", dynamic_ncols=True) as pbar:
         for i, seed in enumerate(seeds):
             pbar.set_postfix(network=f"{i+1}/{len(seeds)}")
-            x_out, adj_out, n_out = guided_generate(
+            x_out, adj_out, n_out, n_patches = guided_generate(
                 seed, encoder, probe, diff_model, diffusion,
                 x_mean, x_std, H_all_n, device,
                 target_label=target_label,
@@ -406,12 +421,28 @@ def run_guided_generation(
                 pbar=pbar,
             )
 
-            # Denormalise node features
+            if n_patches > 0:
+                print(f"  [validity] graph {i+1}: connectivity repair added {n_patches} edge(s)")
+
+            # ── Structural validity checks ─────────────────────────────────
+            gen_density = float(adj_out.sum()) / max(n_out * (n_out - 1), 1)
+            if density_ceil is not None and gen_density > density_ceil:
+                print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
+                      f"> 2× target ({target_density:.3f})")
+                n_discarded += 1
+                continue
+            if n_out < size_5th:
+                print(f"  [validity] graph {i+1} discarded: "
+                      f"n_nodes {n_out} < 5th-pct ({size_5th:.0f})")
+                n_discarded += 1
+                continue
+
+            # Denormalise node features — col 0 (laundering flag) is excluded
+            # to match the encoder's input dimension after the leakage fix.
             x_cont_d = x_out[:, 1:] * x_std.cpu()[1:] + x_mean.cpu()[1:]
-            x_bin_d  = x_out[:, 0:1].clamp(0, 1)
             deg_g    = adj_out.sum(dim=-1, keepdim=True)
             deg_n    = deg_g / deg_g.max().clamp(min=1.0)
-            x_denorm = torch.cat([x_bin_d, deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 6]
+            x_denorm = torch.cat([deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 5]
 
             ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
             bv_g = torch.zeros(n_out, dtype=torch.long)
@@ -424,6 +455,9 @@ def run_guided_generation(
             # toward target_label, so that is the correct label.
             gen_outputs.append((x_denorm, adj_out, n_out, target_label))
             gen_embeddings.append(h_g_n.squeeze(0).numpy())
+
+    if n_discarded:
+        print(f"  [validity] {n_discarded}/{len(seeds)} graphs discarded by structural checks")
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
     return gen_outputs, gen_embeddings, seeds
@@ -498,7 +532,7 @@ def encode_all_pyg_graphs(graphs, encoder, device, batch_size=128):
     Parameters
     ----------
     graphs     : list[PyG Data]  with .x [n,5] and .y [1]
-    encoder    : GraphEncoder (in_dim=6, trained on Elliptic)
+    encoder    : GraphEncoder (in_dim=5 after label-leakage fix, trained on Elliptic)
     device     : torch.device
     batch_size : graphs per forward pass
 
@@ -511,10 +545,8 @@ def encode_all_pyg_graphs(graphs, encoder, device, batch_size=128):
 
     ext_graphs, all_labels = [], []
     for g in graphs:
-        n         = g.x.shape[0]
-        label_col = torch.full((n, 1), float(g.y.item()))
-        x6        = torch.cat([label_col, g.x], dim=1)        # [n, 6]
-        ext_graphs.append(_Data(x=x6, edge_index=g.edge_index.clone()))
+        # No label prepending — the encoder now expects features without col 0.
+        ext_graphs.append(_Data(x=g.x.clone(), edge_index=g.edge_index.clone()))
         all_labels.append(float(g.y.item()))
 
     H_list = []
@@ -606,7 +638,13 @@ def run_guided_generation_elliptic(
       + _random.sample(licit,   min(n_gen // 2, len(licit)))
     )
 
+    # ── Structural validity thresholds ────────────────────────────────────────
+    train_sizes = [g.x.shape[0] for g in graphs]
+    size_5th    = float(np.percentile(train_sizes, 5)) if train_sizes else 3.0
+    density_ceil = 2.0 * target_density if target_density is not None else None
+
     gen_outputs, gen_embeddings = [], []
+    n_discarded = 0
 
     with tqdm(total=len(seeds) * (t_start + 1),
               desc=f"Generating {len(seeds)} Elliptic graphs",
@@ -615,10 +653,10 @@ def run_guided_generation_elliptic(
             pbar.set_postfix(graph=f"{i+1}/{len(seeds)}")
 
             # Convert to the dict format that guided_generate() expects.
-            # It checks for "x_dense"/"adj_dense" first (fast path, lines 163-168).
+            # It checks for "x_dense"/"adj_dense" first (fast path).
             seed_dict = _pyg_to_seed_dict(seed_g)
 
-            x_out, adj_out, n_out = guided_generate(
+            x_out, adj_out, n_out, n_patches = guided_generate(
                 seed_dict, encoder, probe, diff_model, diffusion,
                 x_mean, x_std, H_all_n, device,
                 target_label=target_label,
@@ -633,12 +671,28 @@ def run_guided_generation_elliptic(
                 pbar=pbar,
             )
 
-            # Denormalise node features — identical to run_guided_generation
+            if n_patches > 0:
+                print(f"  [validity] graph {i+1}: connectivity repair added {n_patches} edge(s)")
+
+            # ── Structural validity checks ─────────────────────────────────
+            gen_density = float(adj_out.sum()) / max(n_out * (n_out - 1), 1)
+            if density_ceil is not None and gen_density > density_ceil:
+                print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
+                      f"> 2× target ({target_density:.3f})")
+                n_discarded += 1
+                continue
+            if n_out < size_5th:
+                print(f"  [validity] graph {i+1} discarded: "
+                      f"n_nodes {n_out} < 5th-pct ({size_5th:.0f})")
+                n_discarded += 1
+                continue
+
+            # Denormalise node features — col 0 (laundering flag) excluded
+            # to match the encoder's input dimension after the leakage fix.
             x_cont_d = x_out[:, 1:] * x_std.cpu()[1:] + x_mean.cpu()[1:]
-            x_bin_d  = x_out[:, 0:1].clamp(0, 1)
             deg_g    = adj_out.sum(dim=-1, keepdim=True)
             deg_n    = deg_g / deg_g.max().clamp(min=1.0)
-            x_denorm = torch.cat([x_bin_d, deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 6]
+            x_denorm = torch.cat([deg_n, x_cont_d[:, 1:]], dim=-1)   # [n, 5]
 
             ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
             bv_g = torch.zeros(n_out, dtype=torch.long)
@@ -651,6 +705,9 @@ def run_guided_generation_elliptic(
             # toward target_label, so that is the correct label.
             gen_outputs.append((x_denorm, adj_out, n_out, target_label))
             gen_embeddings.append(h_g_n.squeeze(0).numpy())
+
+    if n_discarded:
+        print(f"  [validity] {n_discarded}/{len(seeds)} graphs discarded by structural checks")
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
     return gen_outputs, gen_embeddings, seeds

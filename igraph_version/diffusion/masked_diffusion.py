@@ -661,10 +661,7 @@ class GaussianDiffusion:
         adj_start=None,
         adj_loss_weight=0.5,
         density_loss_weight=1.0,
-        node_exist_loss_weight=1.0,
-        mask_dropout_rate=0.4,
         laund_loss_weight=1.0,
-        ghost_node_rate=0.3,
     ):
 
         if model_kwargs is None:
@@ -684,131 +681,51 @@ class GaussianDiffusion:
             x_t = self.q_sample(x_start, t, noise=noise, node_mask=node_mask)
             adj_t = None
 
-        # Node-mask corruption: randomly deactivate active nodes proportional to t.
-        # The model must learn to reconstruct the original mask — i.e., decide which
-        # nodes should exist based purely on local structural context.
-        if node_mask is not None:
-            t_frac = (t.float() / max(self.num_timesteps - 1, 1)).unsqueeze(-1)  # [B,1]
-            drop_prob     = t_frac * mask_dropout_rate                            # [B,1]
-            keep          = (th.rand_like(node_mask) >= drop_prob).float()
-            node_mask_t   = node_mask * keep                                      # [B,N]
-            # Zero out features / adj rows+cols for dropped nodes
-            x_t   = x_t   * node_mask_t.unsqueeze(-1)
-            if adj_t is not None:
-                adj_t = adj_t * node_mask_t[:, :, None] * node_mask_t[:, None, :]
-
-            # Ghost node injection: activate padding slots with random features and edges.
-            # This noise looks like "adding new nodes" to the graph, and the model must
-            # learn to mark them as non-existent (node_logits < 0) while also ignoring
-            # their spurious edges. It provides a strong, direct training signal that
-            # teaches sparsity: the target adjacency is 0 for all ghost-involved pairs.
-            if ghost_node_rate > 0.0:
-                inactive = 1.0 - node_mask                           # [B, N] padding slots
-                ghost_prob = (t_frac * ghost_node_rate).clamp(0.0, 0.8)
-                ghost_added = inactive * th.bernoulli(
-                    th.ones_like(node_mask) * ghost_prob
-                )                                                     # [B, N]
-
-                if ghost_added.any():
-                    # Random Gaussian features for ghost nodes; real-node positions
-                    # have ghost_added=0 so they are unaffected.
-                    ghost_feats = th.randn_like(x_t) * ghost_added.unsqueeze(-1)
-                    x_t = x_t + ghost_feats
-
-                    # Activate ghost nodes in the corrupted mask so the model sees them
-                    node_mask_t = (node_mask_t + ghost_added).clamp(0.0, 1.0)
-
-                    # Random edges between ghost nodes and all active (real+ghost) nodes
-                    if adj_t is not None:
-                        g  = ghost_added                            # [B, N]
-                        am = node_mask_t                            # [B, N]
-                        # edge mask: at least one endpoint is a ghost node
-                        ghost_edge_mask = (
-                            g[:, :, None] * am[:, None, :]
-                            + am[:, :, None] * g[:, None, :]
-                        ).clamp(0.0, 1.0)
-                        rand_ghost_adj = (
-                            th.bernoulli(th.full_like(adj_t, 0.5)) * ghost_edge_mask
-                        )
-                        rand_ghost_adj = (
-                            rand_ghost_adj + rand_ghost_adj.transpose(-1, -2)
-                        ) / 2
-                        adj_t = (adj_t + rand_ghost_adj).clamp(0.0, 1.0)
-        else:
-            node_mask_t = None
-
-        # Forward pass with the corrupted mask
-        training_kwargs = {**model_kwargs, "node_mask": node_mask_t}
+        training_kwargs = {**model_kwargs}
         if adj_t is not None:
             training_kwargs["adj"] = adj_t
 
-        model_output_x, adj_pred, node_logits = model(
+        model_output_x, adj_pred, _ = model(
             x_t,
             self._scale_timesteps(t),
             **training_kwargs
         )
 
         if self.model_mean_type == ModelMeanType.EPSILON:
-
-            # Feature 0 (laundering): model predicts x_start directly (binary recovery)
-            # Features 1+ (continuous): model predicts epsilon (Gaussian denoising)
             target = th.cat([x_start[..., 0:1], noise[..., 1:]], dim=-1)
-
         elif self.model_mean_type == ModelMeanType.START_X:
-
             target = x_start
-
         else:
             raise NotImplementedError()
 
-
-        # --- Feature 0 (laundering label): weighted BCE with logits ---
-        # MSE on a binary feature with class imbalance causes the model to
-        # predict ~0 for all nodes. Weighted BCE forces it to learn the rare class.
-        laund_logits = model_output_x[..., 0]   # [B, N] — treated as logit
-        laund_true   = x_start[..., 0]          # [B, N] — binary {0, 1}
-
+        # Feature 0 (laundering): BCE with fixed pos_weight to handle class imbalance
+        laund_logits = model_output_x[..., 0]
+        laund_true   = x_start[..., 0]
+        laund_bce = th.nn.functional.binary_cross_entropy_with_logits(
+            laund_logits, laund_true,
+            pos_weight=th.tensor(10.0, device=laund_logits.device),
+            reduction="none",
+        )
         if node_mask is not None:
-            n_nodes = node_mask.sum(dim=-1).clamp(min=1)              # [B]
-            n_pos   = (laund_true * node_mask).sum(dim=-1).clamp(min=1)
-        else:
-            n_nodes = th.tensor(float(laund_true.shape[-1]), device=laund_true.device).expand(laund_true.shape[0])
-            n_pos   = laund_true.sum(dim=-1).clamp(min=1)
-
-        n_neg       = (n_nodes - n_pos).clamp(min=1)
-        pos_w_laund = (n_neg / n_pos).clamp(1.0, 50.0)               # [B]
-
-        eps = 1e-6
-        laund_prob = th.sigmoid(laund_logits).clamp(eps, 1.0 - eps)
-        laund_bce  = -(
-            pos_w_laund[:, None] * laund_true   * th.log(laund_prob)
-            + (1.0 - laund_true) * th.log(1.0 - laund_prob)
-        )                                                              # [B, N]
-
-        if node_mask is not None:
+            n_nodes    = node_mask.sum(dim=-1).clamp(min=1)
             laund_loss = (laund_bce * node_mask).sum(dim=-1) / n_nodes
         else:
             laund_loss = laund_bce.mean(dim=-1)
 
-        # --- Features 1+ (continuous): MSE on epsilon / x_start ---
-        mse_cont = (target[..., 1:] - model_output_x[..., 1:]) ** 2  # [B, N, F-1]
-
+        # Features 1+ (continuous): MSE on epsilon / x_start
+        mse_cont = (target[..., 1:] - model_output_x[..., 1:]) ** 2
         if node_mask is not None:
-            mask = node_mask.unsqueeze(-1)
-            cont_loss = (
-                (mse_cont * mask).sum(dim=[1, 2])
-                / mask.sum(dim=[1, 2]).clamp(min=1)
-            )
+            mask      = node_mask.unsqueeze(-1)
+            cont_loss = (mse_cont * mask).sum(dim=[1, 2]) / mask.sum(dim=[1, 2]).clamp(min=1)
         else:
             cont_loss = mse_cont.mean(dim=[1, 2])
 
         loss = cont_loss + laund_loss_weight * laund_loss
 
-
-        # Adjacency reconstruction: weighted BCE (handles sparsity imbalance)
+        # Adjacency reconstruction: weighted BCE + density regularisation
         if adj_start is not None:
             if node_mask is not None:
-                mask2d = node_mask[:, :, None] * node_mask[:, None, :]
+                mask2d  = node_mask[:, :, None] * node_mask[:, None, :]
                 n_valid = mask2d.sum(dim=[1, 2]).clamp(min=1)
                 n_pos   = (adj_start * mask2d).sum(dim=[1, 2]).clamp(min=1)
             else:
@@ -817,53 +734,27 @@ class GaussianDiffusion:
                 ).expand(adj_start.shape[0])
                 n_pos = adj_start.sum(dim=[1, 2]).clamp(min=1)
 
-            # pos_weight: mild upweight of edges to counter sparsity.
-            # Clamped at 2 — higher values bias the model toward
-            # over-predicting edges, leading to unrealistically dense generation.
-            pos_w = ((n_valid - n_pos) / n_pos).clamp(1.0, 2.0)  # [B]
-
-            eps = 1e-6
-            adj_pred_c = adj_pred.clamp(eps, 1.0 - eps)
+            pos_w      = ((n_valid - n_pos) / n_pos).clamp(1.0, 2.0)
+            adj_pred_c = adj_pred.clamp(1e-6, 1.0 - 1e-6)
             bce = -(
                 pos_w[:, None, None] * adj_start * th.log(adj_pred_c)
                 + (1.0 - adj_start) * th.log(1.0 - adj_pred_c)
             )
-
             if node_mask is not None:
                 adj_loss = (bce * mask2d).sum(dim=[1, 2]) / n_valid
             else:
                 adj_loss = bce.mean(dim=[1, 2])
 
-            loss = loss + adj_loss_weight * adj_loss
-
-            # Density regularisation: symmetric squared penalty on the gap
-            # between predicted and true density.  Two-sided so the model is
-            # pulled toward the exact true density rather than just being
-            # prevented from exceeding it — this is the primary signal that
-            # counteracts the inner-product decoder's bias toward dense outputs.
-            true_density = n_pos / n_valid                                   # [B]
+            true_density = n_pos / n_valid
             if node_mask is not None:
                 pred_density = (adj_pred_c * mask2d).sum(dim=[1, 2]) / n_valid
             else:
                 pred_density = adj_pred_c.mean(dim=[1, 2])
             density_loss = (pred_density - true_density) ** 2
 
-            loss = loss + density_loss_weight * density_loss
-
-
-
-        # Node existence loss: predict original mask from the corrupted input.
-        # This teaches the model which nodes *should* be active given the graph
-        # structure — the foundation for meaningful node insertion/deletion.
-        if node_mask is not None:
-            node_exist_loss = th.nn.functional.binary_cross_entropy_with_logits(
-                node_logits,   # [B, N] raw logits
-                node_mask,     # [B, N] original mask (before corruption)
-                reduction="none",
-            ).mean(dim=-1)     # [B]
-            loss = loss + node_exist_loss_weight * node_exist_loss
+            loss = loss + adj_loss_weight * adj_loss + density_loss_weight * density_loss
 
         return {
             "loss": loss,
-            "mse": loss,
+            "mse":  loss,
         }

@@ -113,7 +113,8 @@ if __name__ == "__main__":
     # Load the trained diffusion model (optional — falls back gracefully if absent)
     diff_model, diffusion, x_mean, x_std = load_diffusion(device)
 
-    encoder   = GraphEncoder(in_dim=6, hidden_dim=64, out_dim=128).to(device)
+    # in_dim=5: col 0 (laundering flag) stripped before encoder (label-leakage fix)
+    encoder   = GraphEncoder(in_dim=5, hidden_dim=64, out_dim=128).to(device)
     projector = ProjectionHead(in_dim=128, proj_dim=64).to(device)
 
     optimizer = torch.optim.Adam(
