@@ -2,18 +2,30 @@
 test.py — evaluate guided generation and save plots + scores to results/
 
 Run:
-    # IBM (default)
+    # IBM — baseline generation
     python test.py
 
-    # Elliptic Bitcoin Dataset
+    # IBM — with embedding separation check
+    python test.py --sep-check
+
+    # IBM — tune guidance params before generating
+    python test.py --tune-guidance --tune-trials 15
+
+    # Elliptic
     python test.py --dataset elliptic
 
-Outputs (in results_ibm/ or results_elliptic/):
-    simclr_latent_space.png                     SimCLR encoder space (illicit vs licit)
-    simclr_guided_generation.png                UMAP with generated networks highlighted
-    comparison/comparison_gen_NN.png            4-panel comparison per generated network
-    generated_scores.csv                        Realism / novelty scores for generated nets
-    calibration_scores.csv                      Same scores for N_CALIB sampled training nets
+    # Override guidance hyperparams directly
+    python test.py --guidance-scale 3.0 --novelty-weight 1.5 --degree-penalty 0.3
+
+Outputs (in results/<dataset>/):
+    simclr_latent_space.png                 SimCLR encoder space (illicit vs licit)
+    simclr_guided_generation.png            UMAP with generated networks highlighted
+    comparison/comparison_gen_NN.png        4-panel comparison per generated network
+    generated_scores.csv                    Realism / novelty scores for generated nets
+    calibration_scores.csv                  Same scores for N_CALIB sampled training nets
+    graph_quality_<dataset>.csv             Tier-1 Q-score report (emb dist, Wass, density, KL)
+    quality_extremes_<dataset>.png          Top / bottom generated graphs by Q score
+    tuning_trials.csv                       Hyperparameter search history (if --tune-guidance)
 """
 
 import sys
@@ -27,7 +39,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-import umap
 
 # ── path setup ────────────────────────────────────────────────────────────────
 _GEN_DIR   = Path(__file__).resolve().parent   # igraph_version/generation/
@@ -41,10 +52,7 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from util import (
-    preprocess_df,
-    extract_networks_igraph,
-)
+from util import preprocess_df, extract_networks_igraph
 from augmentation import build_igraph_from_transactions
 from plotting_helpers import plot_simclr_latent_space_laundering_vs_clean
 from generation.generation import (
@@ -53,11 +61,19 @@ from generation.generation import (
     encode_all_networks,
     train_mlp_probe,
     run_guided_generation,
+    tune_guidance_params,
     # Elliptic variants
     load_simclr_encoder_elliptic,
     load_diffusion_model_elliptic,
     encode_all_pyg_graphs,
     run_guided_generation_elliptic,
+)
+from generation.graph_quality_metrics import (
+    score_generated_graphs,
+    print_quality_report,
+    save_quality_csv,
+    plot_quality_extremes,
+    compute_embedding_separation,
 )
 from scoring import (
     fit_training_distribution,
@@ -68,26 +84,53 @@ from scoring import (
 )
 from generation.latent_seed_generation import plot_generated_vs_closest_training
 
-# ── config ────────────────────────────────────────────────────────────────────
+# ── defaults (overridden by CLI args) ─────────────────────────────────────────
 IBM_CSV_PATH   = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"
 TARGET         = 1       # 1 = generate illicit/laundering-like, 0 = clean-like
 N_GEN          = 8
 T_START        = 150
 GUIDE_SCALE    = 2.0
 NOVELTY_WEIGHT = 2.0
+DEGREE_PENALTY = 0.5
 GUIDE_EVERY    = 5
 GUIDE_FROM     = 0.25
 N_CALIB        = 5
 
 
-# ── shared helpers ────────────────────────────────────────────────────────────
+# ── PyG conversion helper (shared by IBM and Elliptic quality scoring) ────────
+
+def _gen_to_pyg(x_denorm, adj_out, n_out, label, adj_threshold=0.5):
+    """Convert a diffusion output triple to a minimal PyG Data object."""
+    from torch_geometric.data import Data
+    adj_np = adj_out[:n_out, :n_out]
+    if isinstance(adj_np, torch.Tensor):
+        adj_np = adj_np.numpy()
+    np.fill_diagonal(adj_np, 0.0)   # no self-loops
+    ei = (torch.tensor(adj_np) > adj_threshold).nonzero(as_tuple=False).T.contiguous()
+    if ei.shape[1] == 0:
+        ei = torch.zeros(2, 0, dtype=torch.long)
+    return Data(
+        x=x_denorm,
+        edge_index=ei,
+        y=torch.tensor([label], dtype=torch.long),
+    )
+
+
+# ── UMAP plot (shared) ────────────────────────────────────────────────────────
 
 def _plot_umap(H_all_n, all_labels, gen_embeddings, seeds, target_label,
                t_start, novelty_weight, save_path, pos_label="illicit/laundering"):
+    try:
+        import umap
+    except ImportError:
+        print("  [skip] umap-learn not installed — skipping UMAP plot")
+        return
+
     n_train    = len(all_labels)
+    n_gen      = len(gen_embeddings)
     H_combined = np.concatenate([H_all_n.numpy(), gen_embeddings], axis=0)
-    is_gen     = np.array([False] * n_train + [True] * len(seeds))
-    labels_all = np.array(list(all_labels) + [target_label] * len(seeds))
+    is_gen     = np.array([False] * n_train + [True] * n_gen)
+    labels_all = np.array(list(all_labels) + [target_label] * n_gen)
 
     reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="cosine", random_state=42)
     H_2d    = reducer.fit_transform(H_combined)
@@ -115,16 +158,19 @@ def _plot_umap(H_all_n, all_labels, gen_embeddings, seeds, target_label,
     print(f"Saved → {save_path}")
 
 
+# ── Elliptic-specific helpers ─────────────────────────────────────────────────
+
 def _plot_latent_space_pyg(graphs, encoder, device, save_path):
-    """
-    UMAP of the Elliptic SimCLR encoder space (illicit vs licit).
-    Works directly with PyG Data objects (5-D features, col 0 = label stripped).
-    """
+    try:
+        import umap
+    except ImportError:
+        print("  [skip] umap-learn not installed — skipping latent space plot")
+        return
+
     from torch_geometric.data import Data as _Data, Batch as _Batch
 
     ext, labels = [], []
     for g in graphs:
-        # No label prepending — encoder expects 5-dim after label-leakage fix.
         ext.append(_Data(x=g.x.clone(), edge_index=g.edge_index))
         labels.append(int(g.y.item()))
 
@@ -156,80 +202,49 @@ def _plot_latent_space_pyg(graphs, encoder, device, save_path):
 
 def _plot_comparison_pyg(gen_outputs, gen_embeddings, H_all_n, graphs, results_dir,
                          seed_graphs=None):
-    """
-    Four-panel comparison figure for each Elliptic generated network.
-
-    Panel 1 — Generated network (built from diffusion output adj + x_denorm col 0)
-    Panel 2 — Seed ego-subgraph (PyG Data object used to initialise generation)
-    Panel 3 — Closest training ego-subgraph by cosine sim to generated embedding
-    Panel 4 — Grouped bar chart of structural statistics across all three
-
-    One PNG per generated network saved to results_dir/comparison/.
-
-    Differences from the IBM version in latent_seed_generation.py:
-    - Seed / closest-training panels built from PyG edge_index (no igraph needed)
-    - No "collapsed hub" node type — all training nodes coloured by graph label
-      (red = illicit ego anchor, blue = licit ego anchor)
-    - "% pred illicit nodes" replaces "% laundering nodes" for the bar chart
-      (generated: col 0 of x_denorm; training: graph-level .y label broadcast)
-    """
     import networkx as nx
     from matplotlib.patches import Patch
 
     comp_dir = results_dir / "comparison"
     comp_dir.mkdir(exist_ok=True)
 
-    H_np = H_all_n.numpy()   # [N, 128]
+    H_np = H_all_n.numpy()
 
-    # ── helper: build NetworkX graph from a PyG Data object ──────────────────
     def _build_nx_pyg(g):
-        """Returns (G, node_colors, n_nodes, graph_label)."""
-        n  = g.x.shape[0]
+        n   = g.x.shape[0]
         lbl = int(g.y.item())
-        G  = nx.Graph()
+        G   = nx.Graph()
         G.add_nodes_from(range(n))
-        ei = g.edge_index
+        ei  = g.edge_index
         if ei.shape[1] > 0:
             for u, v in zip(ei[0].tolist(), ei[1].tolist()):
-                if u < v:                           # undirected — add once
+                if u < v:
                     G.add_edge(u, v)
-        node_color = "#e74c3c" if lbl == 1 else "#aed6f1"
-        colors     = [node_color] * n
+        colors = ["#e74c3c" if lbl == 1 else "#aed6f1"] * n
         return G, colors, n, lbl
 
-    # ── helper: structural stats ──────────────────────────────────────────────
     def _stats(G, n):
         ne   = G.number_of_edges()
         dens = ne / max(n * (n - 1) / 2, 1)
         degs = [d for _, d in G.degree()]
-        return {
-            "edges":    ne,
-            "density":  dens,
-            "mean_deg": float(np.mean(degs)) if degs else 0.0,
-        }
+        return {"edges": ne, "density": dens, "mean_deg": float(np.mean(degs)) if degs else 0.0}
 
-    # ── helper: draw one network panel ───────────────────────────────────────
     def _draw_panel(ax, G, pos, colors, title, stats_str):
-        nx.draw_networkx_nodes(G, pos, ax=ax,
-                               node_color=colors, node_size=80, alpha=0.90)
-        nx.draw_networkx_edges(G, pos, ax=ax,
-                               edge_color="#555555", width=0.8, alpha=0.45,
-                               arrows=False)
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=colors, node_size=80, alpha=0.90)
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#555555", width=0.8,
+                               alpha=0.45, arrows=False)
         ax.set_title(title, fontsize=11, fontweight="bold")
         ax.axis("off")
-        ax.text(0.02, 0.02, stats_str,
-                transform=ax.transAxes, fontsize=8.5,
+        ax.text(0.02, 0.02, stats_str, transform=ax.transAxes, fontsize=8.5,
                 verticalalignment="bottom",
                 bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.85))
 
-    # ─────────────────────────────────────────────────────────────────────────
-
-    for i, ((x_denorm, adj_out, n_out), gen_emb) in enumerate(
+    for i, ((x_denorm, adj_out, n_out, *_), gen_emb) in enumerate(
             zip(gen_outputs, gen_embeddings)):
 
-        # ── Panel 1: Generated network ────────────────────────────────────
-        adj_np     = adj_out.cpu().numpy()
-        laund_prob = x_denorm[:, 0].cpu().numpy()   # col 0 = predicted illicit prob
+        adj_np     = adj_out.cpu().numpy() if isinstance(adj_out, torch.Tensor) else adj_out
+        laund_prob = x_denorm[:, 0].cpu().numpy() if isinstance(x_denorm, torch.Tensor) \
+                     else x_denorm[:, 0]
 
         G_gen = nx.Graph()
         G_gen.add_nodes_from(range(n_out))
@@ -237,95 +252,64 @@ def _plot_comparison_pyg(gen_outputs, gen_embeddings, H_all_n, graphs, results_d
             for b in range(a + 1, n_out):
                 if adj_np[a, b] > 0.5:
                     G_gen.add_edge(a, b)
-        gen_colors    = ["#e74c3c" if laund_prob[k] > 0.5 else "#aed6f1"
-                         for k in range(n_out)]
-        pct_illicit   = 100.0 * float((laund_prob > 0.5).mean())
-        s_gen         = _stats(G_gen, n_out)
-        pos_gen       = nx.spring_layout(G_gen, seed=42, k=2.0 / max(n_out ** 0.5, 1))
-        gen_stats_str = (
-            f"nodes={n_out}  edges={s_gen['edges']}\n"
-            f"density={s_gen['density']:.3f}  mean deg={s_gen['mean_deg']:.1f}\n"
-            f"pred. illicit nodes: {pct_illicit:.0f}%"
-        )
+        gen_colors  = ["#e74c3c" if laund_prob[k] > 0.5 else "#aed6f1" for k in range(n_out)]
+        pct_illicit = 100.0 * float((laund_prob > 0.5).mean())
+        s_gen       = _stats(G_gen, n_out)
+        pos_gen     = nx.spring_layout(G_gen, seed=42, k=2.0 / max(n_out ** 0.5, 1))
+        gen_stats   = (f"nodes={n_out}  edges={s_gen['edges']}\n"
+                       f"density={s_gen['density']:.3f}  mean deg={s_gen['mean_deg']:.1f}\n"
+                       f"pred. illicit nodes: {pct_illicit:.0f}%")
 
-        # ── Panel 2: Seed ego-subgraph ────────────────────────────────────
-        if seed_graphs is not None and i < len(seed_graphs):
-            seed_g = seed_graphs[i]
-        else:
-            cos_sims = H_np @ gen_emb
-            seed_g   = graphs[int(cos_sims.argmax())]
-
+        seed_g = seed_graphs[i] if (seed_graphs is not None and i < len(seed_graphs)) \
+                 else graphs[int((H_np @ gen_emb).argmax())]
         G_seed, seed_colors, n_seed, lbl_seed = _build_nx_pyg(seed_g)
-        s_seed        = _stats(G_seed, n_seed)
-        pos_seed      = nx.spring_layout(G_seed, seed=42, k=2.0 / max(n_seed ** 0.5, 1))
-        seed_stats_str = (
-            f"nodes={n_seed}  edges={s_seed['edges']}\n"
-            f"density={s_seed['density']:.3f}  mean deg={s_seed['mean_deg']:.1f}\n"
-            f"graph label: {'illicit' if lbl_seed == 1 else 'licit'}"
-        )
+        s_seed    = _stats(G_seed, n_seed)
+        pos_seed  = nx.spring_layout(G_seed, seed=42, k=2.0 / max(n_seed ** 0.5, 1))
+        seed_stats = (f"nodes={n_seed}  edges={s_seed['edges']}\n"
+                      f"density={s_seed['density']:.3f}  mean deg={s_seed['mean_deg']:.1f}\n"
+                      f"graph label: {'illicit' if lbl_seed == 1 else 'licit'}")
 
-        # ── Panel 3: Closest training graph by cosine sim ─────────────────
-        cos_sims    = H_np @ gen_emb
-        closest_idx = int(cos_sims.argmax())
-        cos_sim_val = float(cos_sims[closest_idx])
-        close_g     = graphs[closest_idx]
-
+        closest_idx  = int((H_np @ gen_emb).argmax())
+        cos_sim_val  = float((H_np @ gen_emb)[closest_idx])
+        close_g      = graphs[closest_idx]
         G_close, close_colors, n_close, lbl_close = _build_nx_pyg(close_g)
-        s_close        = _stats(G_close, n_close)
-        pos_close      = nx.spring_layout(G_close, seed=42,
-                                          k=2.0 / max(n_close ** 0.5, 1))
-        close_stats_str = (
-            f"nodes={n_close}  edges={s_close['edges']}\n"
-            f"density={s_close['density']:.3f}  mean deg={s_close['mean_deg']:.1f}\n"
-            f"graph label: {'illicit' if lbl_close == 1 else 'licit'}\n"
-            f"cosine sim = {cos_sim_val:.4f}"
-        )
+        s_close   = _stats(G_close, n_close)
+        pos_close = nx.spring_layout(G_close, seed=42, k=2.0 / max(n_close ** 0.5, 1))
+        close_stats = (f"nodes={n_close}  edges={s_close['edges']}\n"
+                       f"density={s_close['density']:.3f}  mean deg={s_close['mean_deg']:.1f}\n"
+                       f"graph label: {'illicit' if lbl_close == 1 else 'licit'}\n"
+                       f"cosine sim = {cos_sim_val:.4f}")
 
-        # ── Panel 4: Grouped bar chart ────────────────────────────────────
-        bar_labels = ["Density ×100", "Mean degree", "% Illicit nodes (pred/label)"]
+        fig, axes = plt.subplots(1, 4, figsize=(32, 8),
+                                 gridspec_kw={"width_ratios": [2, 2, 2, 1.5]})
+        ax_gen, ax_seed, ax_close, ax_bar = axes
+        fig.suptitle(f"Generated #{i+1}  |  seed → generated → closest training  (Elliptic)",
+                     fontsize=13, fontweight="bold")
+
+        _draw_panel(ax_gen,   G_gen,   pos_gen,   gen_colors,   "Generated Network",  gen_stats)
+        _draw_panel(ax_seed,  G_seed,  pos_seed,  seed_colors,  "Seed Ego-Subgraph",  seed_stats)
+        _draw_panel(ax_close, G_close, pos_close, close_colors, "Closest Training",   close_stats)
+
+        bar_labels = ["Density ×100", "Mean degree", "% Illicit nodes"]
         gen_vals   = [s_gen["density"]   * 100, s_gen["mean_deg"],   pct_illicit]
         seed_vals  = [s_seed["density"]  * 100, s_seed["mean_deg"],  100.0 * lbl_seed]
         close_vals = [s_close["density"] * 100, s_close["mean_deg"], 100.0 * lbl_close]
-
-        # ── Figure ────────────────────────────────────────────────────────
-        fig, axes = plt.subplots(
-            1, 4, figsize=(32, 8),
-            gridspec_kw={"width_ratios": [2, 2, 2, 1.5]},
-        )
-        ax_gen, ax_seed, ax_close, ax_bar = axes
-
-        fig.suptitle(
-            f"Generated #{i+1}  |  seed → generated → closest training  (Elliptic)",
-            fontsize=13, fontweight="bold",
-        )
-
-        _draw_panel(ax_gen,   G_gen,   pos_gen,   gen_colors,   "Generated Network",   gen_stats_str)
-        _draw_panel(ax_seed,  G_seed,  pos_seed,  seed_colors,  "Seed Ego-Subgraph",   seed_stats_str)
-        _draw_panel(ax_close, G_close, pos_close, close_colors, "Closest Training",    close_stats_str)
-
-        x      = np.arange(len(bar_labels))
-        width  = 0.25
+        x = np.arange(len(bar_labels)); width = 0.25
         ax_bar.bar(x - width, gen_vals,   width, label="Generated",        color="#e74c3c", alpha=0.85)
         ax_bar.bar(x,         seed_vals,  width, label="Seed",             color="#f39c12", alpha=0.85)
         ax_bar.bar(x + width, close_vals, width, label="Closest training", color="#3498db", alpha=0.85)
-        ax_bar.set_xticks(x)
-        ax_bar.set_xticklabels(bar_labels, fontsize=9)
-        ax_bar.set_ylabel("Value", fontsize=10)
-        ax_bar.set_title("Structural Statistics", fontsize=11, fontweight="bold")
+        ax_bar.set_xticks(x); ax_bar.set_xticklabels(bar_labels, fontsize=9)
+        ax_bar.set_ylabel("Value"); ax_bar.set_title("Structural Statistics", fontsize=11, fontweight="bold")
         ax_bar.legend(fontsize=8, loc="upper right")
-        ax_bar.spines["top"].set_visible(False)
-        ax_bar.spines["right"].set_visible(False)
+        ax_bar.spines["top"].set_visible(False); ax_bar.spines["right"].set_visible(False)
         for bars in ax_bar.containers:
             ax_bar.bar_label(bars, fmt="%.1f", fontsize=7, padding=2)
 
-        legend_els = [
-            Patch(facecolor="#e74c3c", label="Illicit ego / pred. illicit node"),
-            Patch(facecolor="#aed6f1", label="Licit ego / pred. licit node"),
-        ]
-        fig.legend(handles=legend_els, loc="lower center",
-                   ncol=2, fontsize=9, frameon=True,
+        from matplotlib.patches import Patch
+        fig.legend(handles=[Patch(facecolor="#e74c3c", label="Illicit / pred. illicit"),
+                             Patch(facecolor="#aed6f1", label="Licit / pred. licit")],
+                   loc="lower center", ncol=2, fontsize=9,
                    bbox_to_anchor=(0.40, 0.0))
-
         fig.tight_layout(rect=[0, 0.06, 1, 0.94])
         out = comp_dir / f"comparison_gen_{i+1:02d}.png"
         fig.savefig(out, dpi=200)
@@ -334,13 +318,8 @@ def _plot_comparison_pyg(gen_outputs, gen_embeddings, H_all_n, graphs, results_d
 
 
 def _fit_training_distribution_pyg(graphs):
-    """
-    Like fit_training_distribution() but accepts Elliptic PyG Data objects.
-    Converts each graph to dense (x6, adj) on the fly for graph_feature_vector().
-    """
     from scipy.spatial.distance import mahalanobis
     FEAT_DIM = 10
-
     print("Computing Elliptic training graph-feature distribution …")
     feats = []
     for g in graphs:
@@ -352,23 +331,18 @@ def _fit_training_distribution_pyg(graphs):
             src, dst = ei[0][valid], ei[1][valid]
             inbounds = (src < n) & (dst < n)
             adj[src[inbounds], dst[inbounds]] = 1.0
-
-        # Build 6-D x matching IBM convention: col 0 = label, cols 1-5 = structural
         label_col = torch.full((n, 1), float(g.y.item()))
         x6        = torch.cat([label_col, g.x], dim=1)
-
         feats.append(graph_feature_vector(x6, adj))
 
-    F_train = np.stack(feats, axis=0)
-    mu      = F_train.mean(axis=0)
-    cov     = np.cov(F_train.T) + np.eye(FEAT_DIM) * 1e-4
-    cov_inv = np.linalg.inv(cov)
-
+    F_train       = np.stack(feats, axis=0)
+    mu            = F_train.mean(axis=0)
+    cov           = np.cov(F_train.T) + np.eye(FEAT_DIM) * 1e-4
+    cov_inv       = np.linalg.inv(cov)
     train_mah     = np.array([mahalanobis(fv, mu, cov_inv) for fv in F_train])
     mah_p95       = np.percentile(train_mah, 95)
     realism_scale = mah_p95 * 2.0
-    print(f"  Mahalanobis  mean={train_mah.mean():.2f}  "
-          f"p95={mah_p95:.2f}  scale={realism_scale:.2f}")
+    print(f"  Mahalanobis  mean={train_mah.mean():.2f}  p95={mah_p95:.2f}")
     return mu, cov_inv, realism_scale
 
 
@@ -376,25 +350,24 @@ def _fit_training_distribution_pyg(graphs):
 # IBM path
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_ibm(device, results_dir, ibm_csv):
+def run_ibm(args, device, results_dir):
     import pickle
 
-    csv_stem   = Path(ibm_csv).stem
+    ibm_csv  = args.ibm_csv if args.ibm_csv else IBM_CSV_PATH
+    csv_stem = Path(ibm_csv).stem
+
+    # -- 1. Load / extract networks ------------------------------------------
     cache_path = DATA_DIR / f"networks_cache_{csv_stem}.pkl"
     df_full    = preprocess_df(ibm_csv)
 
-    # -- 1. Load / extract networks ------------------------------------------
     if cache_path.exists():
         print(f"Loading networks from cache: {cache_path} …")
         with open(cache_path, "rb") as f:
             networks = pickle.load(f)
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
-        n_laund = sum(1 for n in networks if len(n["laundering_nodes"]) > 0)
-        print(f"Loaded {len(networks)} networks "
-              f"({n_laund} laundering, {len(networks) - n_laund} clean) from cache\n")
     else:
-        print("Extracting networks from CSV (this may take a while) …")
+        print("Extracting networks from CSV …")
         networks = extract_networks_igraph(
             df_full, max_depth=4, max_networks=4000,
             collapse_threshold=10, max_nodes=300,
@@ -406,63 +379,135 @@ def run_ibm(device, results_dir, ibm_csv):
         with open(cache_path, "wb") as f:
             pickle.dump(networks_to_cache, f)
         print(f"Saved network cache → {cache_path}")
-        n_laund = sum(1 for n in networks if len(n["laundering_nodes"]) > 0)
-        print(f"Loaded {len(networks)} networks "
-              f"({n_laund} laundering, {len(networks) - n_laund} clean)\n")
 
-    # -- 2. SimCLR latent space plot -----------------------------------------
-    print("Plotting SimCLR latent space …")
-    fig = plot_simclr_latent_space_laundering_vs_clean(networks, df_full)
-    out = results_dir / "simclr_latent_space.png"
-    fig.savefig(out, dpi=300)
-    plt.close(fig)
-    print(f"Saved → {out}\n")
-    
-    # -- 3. Load models -------------------------------------------------------
+    n_laund = sum(1 for n in networks if len(n["laundering_nodes"]) > 0)
+    print(f"Loaded {len(networks)} networks ({n_laund} laundering, "
+          f"{len(networks) - n_laund} clean)\n")
+
+    # -- 2. Load models -------------------------------------------------------
     print("Loading models …")
     encoder = load_simclr_encoder(device)
     diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
 
+    # -- 3. SimCLR latent space plot -----------------------------------------
+    print("Plotting SimCLR latent space …")
+    fig = plot_simclr_latent_space_laundering_vs_clean(networks, df_full, encoder=encoder)
+    out = results_dir / "simclr_latent_space.png"
+    fig.savefig(out, dpi=300); plt.close(fig)
+    print(f"Saved → {out}\n")
+
     # -- 4. Encode + train probe ---------------------------------------------
-    print("\nEncoding training networks …")
+    print("Encoding training networks …")
     H_all_n, y_all = encode_all_networks(networks, encoder, device)
     probe = train_mlp_probe(H_all_n, y_all, device)
 
-    # -- 5. Guided generation -------------------------------------------------
-    print("\nRunning guided generation …")
+    # -- 5. Direction 3: embedding separation diagnostic ----------------------
+    if args.sep_check:
+        print("\n[Direction 3] SimCLR embedding separation diagnostic …")
+        from torch_geometric.data import Data as _D
+        _pyg_nets = []
+        for net in networks:
+            try:
+                from diffusion.diff_util import network_to_dense as _ntd
+                xd, ad = (net["x_dense"], net["adj_dense"]) \
+                         if ("x_dense" in net and "adj_dense" in net) else _ntd(net)
+                n   = xd.shape[0]
+                ei  = (ad > 0.5).nonzero(as_tuple=False).T.contiguous()
+                x5  = xd[:, 1:6].float()   # cols 1-5: structural features
+                _pyg_nets.append(_D(x=x5, edge_index=ei,
+                                    y=torch.tensor([1 if len(net["laundering_nodes"]) > 0 else 0])))
+            except Exception:
+                continue
+        if _pyg_nets:
+            _sep_labels = [d.y.item() for d in _pyg_nets]
+            _sep        = compute_embedding_separation(_pyg_nets, _sep_labels, encoder, device)
+            print(f"  Silhouette score    : {_sep['silhouette']:.4f}  "
+                  f"(>0.05 good, <0.05 poor class separation)")
+            print(f"  Linear probe AUC    : {_sep['linear_probe_auc']:.4f}  "
+                  f"(>0.65 good, <0.65 guidance signal too weak)")
+            if _sep["silhouette"] < 0.05:
+                print("  WARNING: silhouette < 0.05 — retrain SimCLR with higher supcon_weight.")
+            if _sep["linear_probe_auc"] < 0.65:
+                print("  WARNING: linear probe AUC < 0.65 — guidance will be unreliable.")
+        print()
+
+    # -- 6. Direction 4: tune guidance hyperparameters ------------------------
+    gs = args.guidance_scale if args.guidance_scale is not None else GUIDE_SCALE
+    nw = args.novelty_weight if args.novelty_weight is not None else NOVELTY_WEIGHT
+    dp = args.degree_penalty if args.degree_penalty is not None else DEGREE_PENALTY
+    t_start = args.t_start if args.t_start is not None else T_START
+
+    if args.tune_guidance:
+        print(f"\n[Direction 4] Tuning guidance params "
+              f"({args.tune_trials} trials × {args.tune_gen_per_trial} graphs) …")
+        laund_nets   = [n for n in networks if len(n["laundering_nodes"]) > 0]
+        H_laund      = H_all_n[y_all == 1]
+        from torch_geometric.data import Data as _D2
+        train_laund_pyg = []
+        for net in laund_nets:
+            try:
+                from diffusion.diff_util import network_to_dense as _ntd2
+                xd, ad = (net["x_dense"], net["adj_dense"]) \
+                         if ("x_dense" in net and "adj_dense" in net) else _ntd2(net)
+                n   = xd.shape[0]
+                ei  = (ad > 0.5).nonzero(as_tuple=False).T.contiguous()
+                x5  = xd[:, 1:6].float()
+                train_laund_pyg.append(_D2(x=x5, edge_index=ei,
+                                           y=torch.tensor([1])))
+            except Exception:
+                continue
+        best_params, _ = tune_guidance_params(
+            networks, encoder, probe, diff_model, diffusion,
+            x_mean, x_std, H_all_n,
+            train_laund_pyg, H_laund, device,
+            n_trials=args.tune_trials,
+            n_gen_per_trial=args.tune_gen_per_trial,
+            t_start=t_start,
+            results_dir=results_dir,
+        )
+        gs = best_params.get("guidance_scale", gs)
+        nw = best_params.get("novelty_weight", nw)
+        dp = best_params.get("degree_penalty", dp)
+        print(f"  Using tuned params: guidance_scale={gs:.3f}  "
+              f"novelty_weight={nw:.3f}  degree_penalty={dp:.3f}\n")
+
+    # -- 7. Guided generation -------------------------------------------------
+    n_gen = args.n_gen
+    print(f"\nRunning guided generation  "
+          f"(n={n_gen}  t_start={t_start}  gs={gs:.2f}  nw={nw:.2f}  dp={dp:.2f}) …")
     gen_outputs, gen_embeddings, seeds = run_guided_generation(
         networks, encoder, probe, diff_model, diffusion,
         x_mean, x_std, H_all_n, device,
         target_label=TARGET,
-        n_gen=N_GEN,
-        t_start=T_START,
-        guidance_scale=GUIDE_SCALE,
-        novelty_weight=NOVELTY_WEIGHT,
+        n_gen=n_gen,
+        t_start=t_start,
+        guidance_scale=gs,
+        novelty_weight=nw,
+        degree_penalty=dp,
         guide_every=GUIDE_EVERY,
         guide_from=GUIDE_FROM,
     )
 
-    # -- 6. UMAP plot ---------------------------------------------------------
+    # -- 8. UMAP plot ---------------------------------------------------------
     print("\nPlotting UMAP …")
     _plot_umap(
         H_all_n, y_all.tolist(), gen_embeddings, seeds,
-        TARGET, T_START, NOVELTY_WEIGHT,
+        TARGET, t_start, nw,
         results_dir / "simclr_guided_generation.png",
         pos_label="laundering",
     )
 
-    # -- 7. Per-network comparison plots -------------------------------------
+    # -- 9. Per-network comparison plots -------------------------------------
     print("\nPlotting generated vs closest training comparisons …")
     plot_generated_vs_closest_training(
         gen_outputs, gen_embeddings, H_all_n, networks, results_dir,
         seed_networks=seeds,
     )
 
-    # -- 8. Fit training distribution ----------------------------------------
+    # -- 10. Fit training distribution + score --------------------------------
     print()
     mu, cov_inv, realism_scale = fit_training_distribution(networks)
 
-    # -- 9. Score generated networks -----------------------------------------
     gen_scores = []
     for i, (x_d, adj_d, *_) in enumerate(gen_outputs):
         s = score_network(x_d, adj_d, encoder, H_all_n, device,
@@ -472,83 +517,148 @@ def run_ibm(device, results_dir, ibm_csv):
     _print_scores_table(gen_scores, "Generated networks")
     _save_scores_csv(gen_scores, results_dir / "generated_scores.csv", "generated")
 
-    # -- 10. Calibration: score real training networks -----------------------
-    from diffusion.diff_util import network_to_dense as _ntd
+    from diffusion.diff_util import network_to_dense as _ntd_c
     calib_nets   = _random.sample(networks, min(N_CALIB, len(networks)))
     calib_scores = []
     for net in calib_nets:
         xr, adjr = (net["x_dense"], net["adj_dense"]) \
-                   if ("x_dense" in net and "adj_dense" in net) else _ntd(net)
-        s = score_network(xr, adjr, encoder, H_all_n, device,
-                          mu, cov_inv, realism_scale)
+                   if ("x_dense" in net and "adj_dense" in net) else _ntd_c(net)
+        s = score_network(xr, adjr, encoder, H_all_n, device, mu, cov_inv, realism_scale)
         calib_scores.append(s)
     _print_scores_table(calib_scores, f"Calibration: {N_CALIB} real training networks")
     _save_scores_csv(calib_scores, results_dir / "calibration_scores.csv", "training")
+
+    # -- 11. Direction 5: Tier-1 Q-score quality report ----------------------
+    if gen_outputs:
+        print("\n[Direction 5] Computing Tier-1 quality metrics (Q-score) …")
+        laund_nets_all = [n for n in networks if len(n["laundering_nodes"]) > 0]
+        from torch_geometric.data import Data as _Dq
+        train_laund_pyg_q = []
+        for net in laund_nets_all:
+            try:
+                from diffusion.diff_util import network_to_dense as _ntd_q
+                xd, ad = (net["x_dense"], net["adj_dense"]) \
+                         if ("x_dense" in net and "adj_dense" in net) else _ntd_q(net)
+                n   = xd.shape[0]
+                ei  = (ad > 0.5).nonzero(as_tuple=False).T.contiguous()
+                x5  = xd[:, 1:6].float()
+                train_laund_pyg_q.append(_Dq(x=x5, edge_index=ei, y=torch.tensor([1])))
+            except Exception:
+                continue
+
+        H_laund_q = H_all_n[y_all == 1]
+        gen_pyg   = [_gen_to_pyg(x, a, n, lbl) for (x, a, n, lbl) in gen_outputs]
+
+        quality   = score_generated_graphs(
+            gen_pyg, train_laund_pyg_q, H_laund_q, encoder, device)
+        print_quality_report(quality)
+
+        _q_suffix = "ibm"
+        save_quality_csv(quality, results_dir / f"graph_quality_{_q_suffix}.csv")
+        plot_quality_extremes(quality, gen_pyg,
+                              results_dir / f"quality_extremes_{_q_suffix}.png",
+                              n=min(20, len(gen_pyg)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Elliptic path
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_elliptic(device, results_dir):
+def run_elliptic(args, device, results_dir):
     from data.elliptic_adapter import load_elliptic_pyg_graphs
 
     # -- 1. Load ego subgraphs -----------------------------------------------
     print("Loading Elliptic ego subgraphs …")
-    graphs  = load_elliptic_pyg_graphs(max_nodes=100)
-    n_ill   = sum(g.y.item() == 1 for g in graphs)
+    graphs = load_elliptic_pyg_graphs(max_nodes=100)
+    n_ill  = sum(g.y.item() == 1 for g in graphs)
     print(f"Loaded {len(graphs)} graphs ({n_ill} illicit, {len(graphs)-n_ill} licit)\n")
 
-    # -- 2. SimCLR latent space plot -----------------------------------------
+    # -- 2. Load models -------------------------------------------------------
     print("Loading Elliptic SimCLR encoder …")
     encoder = load_simclr_encoder_elliptic(device)
     print("Plotting SimCLR latent space …")
     _plot_latent_space_pyg(graphs, encoder, device,
                            results_dir / "simclr_latent_space.png")
-    print()
 
-    # -- 3. Load diffusion model ----------------------------------------------
-    print("Loading Elliptic diffusion model …")
+    print("\nLoading Elliptic diffusion model …")
     diff_model, diffusion, x_mean, x_std = load_diffusion_model_elliptic(device)
 
-    # -- 4. Encode + train probe ---------------------------------------------
+    # -- 3. Encode + train probe ---------------------------------------------
     print("\nEncoding graphs …")
     H_all_n, y_all = encode_all_pyg_graphs(graphs, encoder, device)
     probe = train_mlp_probe(H_all_n, y_all, device)
 
-    # -- 5. Guided generation ------------------------------------------------
-    print("\nRunning guided generation …")
+    # -- 4. Direction 3: embedding separation diagnostic ----------------------
+    if args.sep_check:
+        print("\n[Direction 3] SimCLR embedding separation diagnostic …")
+        _sep_labels_e = [g.y.item() for g in graphs]
+        _sep_e        = compute_embedding_separation(graphs, _sep_labels_e, encoder, device)
+        print(f"  Silhouette score    : {_sep_e['silhouette']:.4f}")
+        print(f"  Linear probe AUC    : {_sep_e['linear_probe_auc']:.4f}")
+        if _sep_e["silhouette"] < 0.05:
+            print("  WARNING: silhouette < 0.05 — guidance will be poorly class-conditioned.")
+        print()
+
+    # -- 5. Direction 4: tune guidance hyperparameters ------------------------
+    gs = args.guidance_scale if args.guidance_scale is not None else GUIDE_SCALE
+    nw = args.novelty_weight if args.novelty_weight is not None else NOVELTY_WEIGHT
+    dp = args.degree_penalty if args.degree_penalty is not None else DEGREE_PENALTY
+    t_start = args.t_start if args.t_start is not None else T_START
+
+    if args.tune_guidance:
+        print(f"\n[Direction 4] Tuning guidance params (Elliptic, {args.tune_trials} trials) …")
+        train_laund_e = [g for g in graphs if g.y.item() == 1]
+        H_laund_e     = H_all_n[y_all == 1]
+        best_params_e, _ = tune_guidance_params(
+            graphs, encoder, probe, diff_model, diffusion,
+            x_mean, x_std, H_all_n,
+            train_laund_e, H_laund_e, device,
+            n_trials=args.tune_trials,
+            n_gen_per_trial=args.tune_gen_per_trial,
+            t_start=t_start,
+            results_dir=results_dir,
+        )
+        gs = best_params_e.get("guidance_scale", gs)
+        nw = best_params_e.get("novelty_weight", nw)
+        dp = best_params_e.get("degree_penalty", dp)
+        print(f"  Using tuned params: guidance_scale={gs:.3f}  "
+              f"novelty_weight={nw:.3f}  degree_penalty={dp:.3f}\n")
+
+    # -- 6. Guided generation ------------------------------------------------
+    n_gen = args.n_gen
+    print(f"\nRunning guided generation  "
+          f"(n={n_gen}  t_start={t_start}  gs={gs:.2f}  nw={nw:.2f}  dp={dp:.2f}) …")
     gen_outputs, gen_embeddings, seeds = run_guided_generation_elliptic(
         graphs, encoder, probe, diff_model, diffusion,
         x_mean, x_std, H_all_n, device,
         target_label=TARGET,
-        n_gen=N_GEN,
-        t_start=T_START,
-        guidance_scale=GUIDE_SCALE,
-        novelty_weight=NOVELTY_WEIGHT,
+        n_gen=n_gen,
+        t_start=t_start,
+        guidance_scale=gs,
+        novelty_weight=nw,
+        degree_penalty=dp,
         guide_every=GUIDE_EVERY,
         guide_from=GUIDE_FROM,
     )
 
-    # -- 6. UMAP plot --------------------------------------------------------
+    # -- 7. UMAP plot --------------------------------------------------------
     print("\nPlotting UMAP …")
     _plot_umap(
         H_all_n, y_all.tolist(), gen_embeddings, seeds,
-        TARGET, T_START, NOVELTY_WEIGHT,
+        TARGET, t_start, nw,
         results_dir / "simclr_guided_generation.png",
         pos_label="illicit",
     )
 
-    # -- 7. Per-network comparison plots -------------------------------------
+    # -- 8. Per-network comparison plots -------------------------------------
     print("\nPlotting generated vs closest training comparisons …")
     _plot_comparison_pyg(gen_outputs, gen_embeddings, H_all_n, graphs,
                          results_dir, seed_graphs=seeds)
 
-    # -- 8. Fit training distribution ----------------------------------------
+    # -- 9. Fit training distribution + score --------------------------------
     print()
     mu, cov_inv, realism_scale = _fit_training_distribution_pyg(graphs)
 
-    # -- 8. Score generated networks -----------------------------------------
     gen_scores = []
     for i, (x_d, adj_d, *_) in enumerate(gen_outputs):
         s = score_network(x_d, adj_d, encoder, H_all_n, device,
@@ -558,7 +668,6 @@ def run_elliptic(device, results_dir):
     _print_scores_table(gen_scores, "Generated Elliptic networks")
     _save_scores_csv(gen_scores, results_dir / "generated_scores.csv", "generated")
 
-    # -- 9. Calibration: score real training graphs --------------------------
     calib_graphs = _random.sample(graphs, min(N_CALIB, len(graphs)))
     calib_scores = []
     for g in calib_graphs:
@@ -566,17 +675,30 @@ def run_elliptic(device, results_dir):
         adj = torch.zeros(n, n)
         ei  = g.edge_index
         if ei.shape[1] > 0:
-            valid = ei[0] != ei[1]
+            valid    = ei[0] != ei[1]
             src, dst = ei[0][valid], ei[1][valid]
             inbounds = (src < n) & (dst < n)
             adj[src[inbounds], dst[inbounds]] = 1.0
         label_col = torch.full((n, 1), float(g.y.item()))
         x6        = torch.cat([label_col, g.x], dim=1)
-        s = score_network(x6, adj, encoder, H_all_n, device,
-                          mu, cov_inv, realism_scale)
+        s = score_network(x6, adj, encoder, H_all_n, device, mu, cov_inv, realism_scale)
         calib_scores.append(s)
     _print_scores_table(calib_scores, f"Calibration: {N_CALIB} real Elliptic graphs")
     _save_scores_csv(calib_scores, results_dir / "calibration_scores.csv", "training")
+
+    # -- 10. Direction 5: Tier-1 Q-score quality report ----------------------
+    if gen_outputs:
+        print("\n[Direction 5] Computing Tier-1 quality metrics (Q-score) …")
+        train_laund_e_q = [g for g in graphs if g.y.item() == 1]
+        H_laund_e_q     = H_all_n[y_all == 1]
+        gen_pyg_e       = [_gen_to_pyg(x, a, n, lbl) for (x, a, n, lbl) in gen_outputs]
+        quality_e       = score_generated_graphs(
+            gen_pyg_e, train_laund_e_q, H_laund_e_q, encoder, device)
+        print_quality_report(quality_e)
+        save_quality_csv(quality_e, results_dir / "graph_quality_elliptic.csv")
+        plot_quality_extremes(quality_e, gen_pyg_e,
+                              results_dir / "quality_extremes_elliptic.png",
+                              n=min(20, len(gen_pyg_e)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,25 +706,49 @@ def run_elliptic(device, results_dir):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", choices=["ibm", "elliptic"], default="ibm",
-                        help="Dataset to use: ibm (default) or elliptic")
+    parser = argparse.ArgumentParser(
+        description="Evaluate guided generation: plots, scores, quality metrics."
+    )
+    parser.add_argument("--dataset", choices=["ibm", "elliptic"], default="ibm")
     parser.add_argument("--ibm-csv", type=str, default=None, metavar="PATH",
                         help="Override the IBM CSV path (default: LI-Small_Trans.csv)")
+    parser.add_argument("--n-gen", type=int, default=N_GEN,
+                        help=f"Number of networks to generate (default {N_GEN})")
+    parser.add_argument("--t-start", type=int, default=None,
+                        help=f"Diffusion noise start level (default {T_START})")
+    # ── Guidance hyperparams ─────────────────────────────────────────────────
+    parser.add_argument("--guidance-scale", type=float, default=None,
+                        help=f"Classification guidance scale (default {GUIDE_SCALE})")
+    parser.add_argument("--novelty-weight", type=float, default=None,
+                        help=f"Novelty repulsion weight (default {NOVELTY_WEIGHT})")
+    parser.add_argument("--degree-penalty", type=float, default=None,
+                        help=f"Degree/density penalty (default {DEGREE_PENALTY})")
+    # ── Direction 3: embedding separation ───────────────────────────────────
+    parser.add_argument("--sep-check", action="store_true",
+                        help="Compute silhouette score and linear probe AUC on training "
+                             "embeddings before generation. Low scores signal weak guidance.")
+    # ── Direction 4: guidance tuning ─────────────────────────────────────────
+    parser.add_argument("--tune-guidance", action="store_true",
+                        help="Bayesian/random search over guidance hyperparameters before "
+                             "generating. Uses Q-score as the objective. Overrides "
+                             "--guidance-scale / --novelty-weight / --degree-penalty.")
+    parser.add_argument("--tune-trials", type=int, default=15, metavar="N",
+                        help="Number of hyperparameter candidates (default 15)")
+    parser.add_argument("--tune-gen-per-trial", type=int, default=6, metavar="K",
+                        help="Graphs per tuning trial for Q-score estimation (default 6)")
     args = parser.parse_args()
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     suffix      = args.dataset
     results_dir = ROOT_DIR / "results" / suffix
-    results_dir.mkdir(exist_ok=True)
+    results_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
     print(f"Results will be saved to {results_dir}\n")
 
     if args.dataset == "ibm":
-        ibm_csv = args.ibm_csv if args.ibm_csv else IBM_CSV_PATH
-        run_ibm(device, results_dir, ibm_csv)
+        run_ibm(args, device, results_dir)
     else:
-        run_elliptic(device, results_dir)
+        run_elliptic(args, device, results_dir)
 
     print(f"\nAll results saved to {results_dir}")
 

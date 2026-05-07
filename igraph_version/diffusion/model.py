@@ -141,12 +141,13 @@ class DiffusionGNN(nn.Module):
         hidden_dim=128,
         time_dim=128,
         num_layers=4,
+        class_conditional=False,
     ):
 
         super().__init__()
 
         self.time_dim = time_dim
-
+        self.class_conditional = class_conditional
 
         # Time embedding MLP
         self.time_mlp = nn.Sequential(
@@ -155,6 +156,11 @@ class DiffusionGNN(nn.Module):
             nn.Linear(time_dim * 4, time_dim),
         )
 
+
+        # Class conditioning: indices 0=clean, 1=laundering, 2=null (CFG dropout token)
+        if class_conditional:
+            self.class_embed = nn.Embedding(3, time_dim)
+            nn.init.normal_(self.class_embed.weight, std=0.02)
 
         # Input projection
         self.input_proj = nn.Linear(node_dim, hidden_dim)
@@ -186,8 +192,12 @@ class DiffusionGNN(nn.Module):
         nn.init.normal_(self.adj_lin.weight,   std=0.01)
         nn.init.normal_(self.adj_proj.weight,  std=0.02)
 
+        # Node existence prediction: learned from the same node embeddings.
+        # Predicts a logit per node — whether that node should be active.
+        self.node_existence_head = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x, t, adj=None, node_mask=None):
+
+    def forward(self, x, t, adj=None, node_mask=None, class_labels=None):
 
         """
         x         : [B, N, F]
@@ -207,9 +217,11 @@ class DiffusionGNN(nn.Module):
 
         # Time embedding
         t_emb = timestep_embedding(t, self.time_dim)
-
         t_emb = self.time_mlp(t_emb)
 
+        # Add class conditioning when enabled and labels are provided
+        if self.class_conditional and class_labels is not None:
+            t_emb = t_emb + self.class_embed(class_labels)
 
         # Project input
         h = self.input_proj(x)
@@ -239,4 +251,7 @@ class DiffusionGNN(nn.Module):
         if node_mask is not None:
             adj_pred = adj_pred * node_mask[:, :, None] * node_mask[:, None, :]
 
-        return out, adj_pred, None
+        # Node existence logits — raw (not sigmoid'd), one per padded position
+        node_logits = self.node_existence_head(h).squeeze(-1)   # [B, N]
+
+        return out, adj_pred, node_logits

@@ -22,23 +22,34 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(ROOT_DIR / "simclr")):
 
 def _enforce_connectivity(adj_bin):
     """
-    Given a [N, N] binary CPU tensor, add the minimum number of edges so that
-    all nodes are in a single connected component.  Components are chained in
-    order: comp[0]-comp[1], comp[1]-comp[2], …
+    Connect every isolated component to the main (largest) component via hub
+    attachment: each disconnected component is joined by a single edge from its
+    highest-degree node to the highest-degree node in the main component.
 
-    Returns the connected adjacency and the number of edges added.
+    Hub attachment is more realistic for transaction graphs than sequential
+    chaining (which produces a visual chain/trace in spring-layout plots because
+    every isolated node ends up with exactly one edge, causing spring-layout to
+    pull them into a long line).
+
+    Returns (connected adjacency, number of edges added).
     """
     G = nx.from_numpy_array(adj_bin.numpy())
-    components = list(nx.connected_components(G))
+    components = sorted(nx.connected_components(G), key=len, reverse=True)
     if len(components) == 1:
         return adj_bin, 0
     adj_conn = adj_bin.clone()
-    for i in range(len(components) - 1):
-        u = min(components[i])
-        v = min(components[i + 1])
-        adj_conn[u, v] = 1.0
-        adj_conn[v, u] = 1.0
-    return adj_conn, len(components) - 1
+    degrees   = dict(G.degree())
+    main_comp = components[0]
+    # Highest-degree node in the main component acts as the attachment hub
+    hub = max(main_comp, key=lambda u: degrees[u])
+    edges_added = 0
+    for comp in components[1:]:
+        # Best node in the isolated component (highest existing degree, or any if all zero)
+        anchor = max(comp, key=lambda u: degrees[u])
+        adj_conn[hub, anchor] = 1.0
+        adj_conn[anchor, hub] = 1.0
+        edges_added += 1
+    return adj_conn, edges_added
 
 
 def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
@@ -52,6 +63,8 @@ def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
     deg_n  = deg / deg.detach().max().clamp(min=1.0)
     x_feat = torch.cat([deg_n, x_cont[:, 1:]], dim=-1)   # [n, 5] — col 0 stripped
     ei = (adj_soft.detach() > 0.5).nonzero(as_tuple=False).T.contiguous()
+    if ei.shape[1] > 0:
+        ei = ei[:, ei[0] != ei[1]]   # remove self-loops
     if ei.shape[1] == 0:
         ei = torch.zeros(2, 0, dtype=torch.long, device=device)
     return Data(x=x_feat, edge_index=ei,
@@ -73,9 +86,14 @@ def load_simclr_encoder(device):
             pass
     print(f"Best SimCLR checkpoint: {best_ckpt_path.name}  (loss={best_loss:.4f})")
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
-    in_dim = ckpt["encoder_state_dict"]["conv1.lin.weight"].shape[1]
-    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=64, out_dim=128).to(device)
-    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    sd         = ckpt["encoder_state_dict"]
+    in_dim     = sd["conv1.lin.weight"].shape[1]
+    hidden_dim = sd["conv1.lin.weight"].shape[0]
+    n_layers   = 3 if "conv3.lin.weight" in sd else 2
+    use_bn     = "bn1.weight" in sd
+    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
+                           n_layers=n_layers, use_bn=use_bn).to(device)
+    encoder.load_state_dict(sd)
     encoder.eval()
     return encoder
 
@@ -84,9 +102,11 @@ def load_diffusion_model(device):
     """Load diffusion model and normalisation stats. Returns (model, diffusion, x_mean, x_std)."""
     from diffusion.model import DiffusionGNN
     from diffusion.diff_util import create_diffusion
-    ckpt       = torch.load(CKPT_DIR / "diffusion_ibm" / "model.pt", map_location=device, weights_only=False)
-    node_dim   = ckpt["model"]["input_proj.weight"].shape[1]
-    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4).to(device)
+    ckpt            = torch.load(CKPT_DIR / "diffusion_ibm" / "model.pt", map_location=device, weights_only=False)
+    node_dim        = ckpt["model"]["input_proj.weight"].shape[1]
+    class_cond_ckpt = ckpt.get("class_conditional", False)
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4,
+                              class_conditional=class_cond_ckpt).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
     diffusion  = create_diffusion(T=500)
@@ -145,7 +165,7 @@ def guided_generate(
     H_train,
     device,
     target_label=1,
-    t_start=350,
+    t_start=200,
     guidance_scale=2.0,
     novelty_weight=2.0,
     novelty_k=10,
@@ -154,7 +174,7 @@ def guided_generate(
     degree_penalty=0.5,
     target_mean_degree=None,
     adj_threshold=0.5,
-    adj_gamma=2.5,
+    adj_gamma=1.5,
     target_density=None,
     max_nodes=None,
     pbar=None,
@@ -298,34 +318,59 @@ def guided_generate(
                 ap_logit = ap_logit - guidance_scale * cached_grad_adj
                 ap = torch.sigmoid(ap_logit)
 
-            # Gamma compression: squash mid-range probabilities toward zero,
-            # preserving only high-confidence edges.  Counters the over-dense
-            # predictions from checkpoints trained with high pos_weight.
-            ap = ap ** adj_gamma
-
             if t_curr > 0:
+                # Intermediate steps: sample binary adjacency without gamma
+                # compression.  Applying gamma at every step squashes mid-range
+                # probabilities repeatedly, producing too many isolated nodes that
+                # then get chained by _enforce_connectivity.  The model was trained
+                # on binary {0,1} adjacency, so stochastic bernoulli sampling here
+                # stays in-distribution.
                 adj_t = torch.bernoulli(ap)
-            elif target_density is not None:
-                # Density-calibrated threshold: keep only enough edges to match
-                # the training mean density, selecting the highest-confidence ones.
-                n_active = int(mask[0].sum().item())
-                n_keep   = max(1, round(target_density * n_active * (n_active - 1) / 2))
-                ap_flat  = ap[0, :n, :n].reshape(-1)
-                if n_keep * 2 < len(ap_flat):
-                    kth   = ap_flat.kthvalue(len(ap_flat) - n_keep * 2).values.item()
-                    adj_t = (ap > max(kth, 0.05)).float()
+            else:
+                # Final step only: apply gamma compression to select high-confidence
+                # edges before thresholding.  Concentrating it here avoids the
+                # feedback loop where the model over-predicts to compensate for
+                # artificially sparse intermediate adjacency.
+                ap = ap ** adj_gamma
+                if target_density is not None:
+                    # Density-calibrated threshold: keep only enough edges to match
+                    # the training mean density, selecting the highest-confidence ones.
+                    n_active = int(mask[0].sum().item())
+                    n_keep   = max(1, round(target_density * n_active * (n_active - 1) / 2))
+                    ap_flat  = ap[0, :n, :n].reshape(-1)
+                    if n_keep * 2 < len(ap_flat):
+                        kth   = ap_flat.kthvalue(len(ap_flat) - n_keep * 2).values.item()
+                        adj_t = (ap > max(kth, 0.05)).float()
+                    else:
+                        adj_t = (ap > adj_threshold).float()
                 else:
                     adj_t = (ap > adj_threshold).float()
-            else:
-                adj_t = (ap > adj_threshold).float()
 
             adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2 * mask[:, :, None] * mask[:, None, :]
+
+            # Final step: connect any 0-degree active nodes to their most
+            # confident neighbour according to ap, before the state is locked in.
+            # This uses the model's own predictions rather than hub-attachment,
+            # producing more realistic local topology.
+            if t_curr == 0 and n > 1:
+                _deg_f = adj_t[0, :n, :n].sum(dim=-1)          # [n]
+                _iso   = (_deg_f < 0.5) & (mask[0, :n] > 0.5)  # isolated active nodes
+                if _iso.any():
+                    _probs = ap[0, :n, :n].clone()
+                    _arange = torch.arange(n, device=_probs.device)
+                    _probs[_arange, _arange] = -1.0             # no self-loops
+                    _best  = _probs.argmax(dim=-1)              # [n]
+                    _i_idx = _iso.nonzero(as_tuple=True)[0]
+                    _j_idx = _best[_i_idx]
+                    adj_t[0, _i_idx, _j_idx] = 1.0
+                    adj_t[0, _j_idx, _i_idx] = 1.0
 
         if pbar is not None:
             pbar.update(1)
 
     # Guarantee a single connected component before returning
     adj_out = adj_t[0, :n, :n].cpu()
+    adj_out.fill_diagonal_(0.0)   # remove self-loops before connectivity check
     adj_out, n_patches = _enforce_connectivity(adj_out)
     # Return patch count so callers can log/filter graphs that needed heavy repair
     return x_t[0, :n].cpu(), adj_out, n, n_patches
@@ -343,13 +388,14 @@ def run_guided_generation(
     device,
     target_label=1,
     n_gen=8,
-    t_start=350,
+    t_start=200,
     guidance_scale=2.0,
     novelty_weight=2.0,
     guide_every=5,
     guide_from=0.25,
     degree_penalty=0.5,
     adj_threshold=0.5,
+    adj_gamma=1.5,
 ):
     """
     Generate n_gen networks using guided diffusion.
@@ -417,6 +463,7 @@ def run_guided_generation(
                 degree_penalty=degree_penalty,
                 target_mean_degree=target_mean_degree,
                 adj_threshold=adj_threshold,
+                adj_gamma=adj_gamma,
                 target_density=target_density,
                 pbar=pbar,
             )
@@ -429,6 +476,15 @@ def run_guided_generation(
             if density_ceil is not None and gen_density > density_ceil:
                 print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
                       f"> 2× target ({target_density:.3f})")
+                n_discarded += 1
+                continue
+            # Discard graphs that are far too sparse — these are degenerate outputs
+            # where most edges were lost during denoising, forcing _enforce_connectivity
+            # to add many artificial hub-to-node edges.
+            density_floor = (target_density * 0.2) if target_density is not None else 0.0
+            if gen_density < density_floor:
+                print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
+                      f"< 20% of target ({target_density:.3f})")
                 n_discarded += 1
                 continue
             if n_out < size_5th:
@@ -464,6 +520,212 @@ def run_guided_generation(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Direction 4 — Learnable augmentation policy
+# Bayesian / random search over guidance hyperparameters using Q-score as proxy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def tune_guidance_params(
+    networks,
+    encoder,
+    probe,
+    diff_model,
+    diffusion,
+    x_mean,
+    x_std,
+    H_train,
+    train_laund_data,
+    H_train_laund,
+    device,
+    n_trials=15,
+    n_gen_per_trial=6,
+    t_start=150,
+    search_space=None,
+    results_dir=None,
+):
+    """
+    Search for guided-generation hyperparameters that maximise mean Q-score
+    on a small batch of generated laundering graphs.  Q-score is a cheap proxy
+    for downstream classifier utility (correlation r ≈ 0.6 empirically).
+
+    Uses Optuna (TPE sampler) when available; falls back to uniform random
+    search otherwise.  Bayesian optimisation converges faster because it builds
+    a probabilistic model of the objective and samples from high-expected-
+    improvement regions — effectively learning which combinations of
+    guidance_scale / novelty_weight / degree_penalty produce realistic graphs.
+
+    Parameters
+    ----------
+    networks          : list of IBM network dicts (training set)
+    encoder           : frozen SimCLR GraphEncoder
+    probe             : frozen MLP probe (trained on encoder embeddings)
+    diff_model        : trained DiffusionGNN
+    diffusion         : GaussianDiffusion scheduler
+    x_mean, x_std     : feature normalisation tensors
+    H_train           : Tensor [N_train, 128]  all training embeddings
+    train_laund_data  : list[PyG Data]  real laundering training graphs
+    H_train_laund     : Tensor [M, 128]  laundering-only training embeddings
+    device            : torch.device
+    n_trials          : number of hyperparameter candidates to evaluate
+    n_gen_per_trial   : graphs generated per candidate (more = less variance, slower)
+    t_start           : diffusion noise start level (fixed across trials)
+    search_space      : dict of (lo, hi) bounds for each parameter; defaults to
+                        {"guidance_scale": (0.5, 5.0),
+                         "novelty_weight": (0.0, 4.0),
+                         "degree_penalty": (0.0, 2.0)}
+    results_dir       : optional Path — saves trial CSV to results_dir/tuning_trials.csv
+
+    Returns
+    -------
+    best_params : dict  {"guidance_scale": …, "novelty_weight": …, "degree_penalty": …}
+    history     : list[dict]  all trials with their Q-scores, sorted best-first
+    """
+    try:
+        from generation.graph_quality_metrics import score_generated_graphs
+    except ImportError:
+        from graph_quality_metrics import score_generated_graphs
+
+    from torch_geometric.data import Data as _Data
+
+    if search_space is None:
+        search_space = {
+            "guidance_scale": (0.5, 5.0),
+            "novelty_weight": (0.0, 4.0),
+            "degree_penalty": (0.0, 2.0),
+        }
+
+    _DEFAULT_PARAMS = {
+        "guidance_scale": 2.0,
+        "novelty_weight": 2.0,
+        "degree_penalty": 0.5,
+    }
+
+    def _gen_to_pyg(x_denorm, adj_out, n_out, label, adj_threshold=0.5):
+        """Minimal (x_denorm, adj, n, label) → PyG Data, mirroring gen_output_to_pyg."""
+        adj_np = adj_out[:n_out, :n_out]
+        if isinstance(adj_np, torch.Tensor):
+            adj_np = adj_np.numpy()
+        ei = (torch.tensor(adj_np) > adj_threshold).nonzero(as_tuple=False).T.contiguous()
+        if ei.shape[1] == 0:
+            ei = torch.zeros(2, 0, dtype=torch.long)
+        return _Data(
+            x=x_denorm,
+            edge_index=ei,
+            y=torch.tensor([label], dtype=torch.long),
+        )
+
+    def _objective(guidance_scale, novelty_weight, degree_penalty):
+        """Generate n_gen_per_trial graphs and return their mean Q-score."""
+        try:
+            gen_outs, _, _ = run_guided_generation(
+                networks, encoder, probe, diff_model, diffusion,
+                x_mean, x_std, H_train, device,
+                target_label=1,
+                n_gen=n_gen_per_trial,
+                t_start=t_start,
+                guidance_scale=guidance_scale,
+                novelty_weight=novelty_weight,
+                degree_penalty=degree_penalty,
+            )
+        except Exception as e:
+            print(f"    [tune] generation error: {e}")
+            return 0.0
+
+        if not gen_outs:
+            return 0.0
+
+        gen_pyg = [_gen_to_pyg(x, a, n, lbl)
+                   for (x, a, n, lbl) in gen_outs]
+
+        try:
+            quality = score_generated_graphs(
+                gen_pyg, train_laund_data, H_train_laund,
+                encoder, device, k=min(3, len(train_laund_data)),
+            )
+            return float(np.mean(quality["Q"]))
+        except Exception as e:
+            print(f"    [tune] quality scoring error: {e}")
+            return 0.0
+
+    best_score  = -1.0
+    best_params = dict(_DEFAULT_PARAMS)
+    history     = []
+
+    # ── Try Optuna first (TPE Bayesian optimisation) ──────────────────────────
+    _use_optuna = False
+    try:
+        import optuna
+        _use_optuna = True
+    except ImportError:
+        pass
+
+    if _use_optuna:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+        def _optuna_obj(trial):
+            params = {
+                k: trial.suggest_float(k, lo, hi)
+                for k, (lo, hi) in search_space.items()
+            }
+            score = _objective(**params)
+            print(f"  [tune] trial {trial.number+1}/{n_trials}  "
+                  f"gs={params['guidance_scale']:.2f}  "
+                  f"nw={params['novelty_weight']:.2f}  "
+                  f"dp={params['degree_penalty']:.2f}  →  Q={score:.4f}")
+            return score
+
+        study = optuna.create_study(direction="maximize",
+                                    sampler=optuna.samplers.TPESampler(seed=42))
+        study.optimize(_optuna_obj, n_trials=n_trials, show_progress_bar=False)
+        best_params = study.best_params
+        best_score  = study.best_value
+        history = [
+            {**t.params, "q_score": t.value}
+            for t in study.trials if t.value is not None
+        ]
+        print(f"\n  [tune] Optuna best: {best_params}  Q={best_score:.4f}")
+
+    else:
+        # ── Uniform random search (no extra dependencies) ─────────────────────
+        print(f"  [tune] Optuna not installed — running random search "
+              f"({n_trials} trials)")
+        rng = np.random.default_rng(seed=42)
+        for trial_i in range(n_trials):
+            params = {
+                k: float(rng.uniform(lo, hi))
+                for k, (lo, hi) in search_space.items()
+            }
+            score = _objective(**params)
+            history.append({**params, "q_score": score})
+            print(f"  [tune] trial {trial_i+1}/{n_trials}  "
+                  f"gs={params['guidance_scale']:.2f}  "
+                  f"nw={params['novelty_weight']:.2f}  "
+                  f"dp={params['degree_penalty']:.2f}  →  Q={score:.4f}")
+            if score > best_score:
+                best_score  = score
+                best_params = dict(params)
+
+        print(f"\n  [tune] best: {best_params}  Q={best_score:.4f}")
+
+    # Sort history best-first
+    history = sorted(history, key=lambda d: d.get("q_score", 0.0), reverse=True)
+
+    # Save trial log
+    if results_dir is not None:
+        import csv as _csv_mod
+        from pathlib import Path as _Path
+        trial_csv = _Path(results_dir) / "tuning_trials.csv"
+        trial_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(trial_csv, "w", newline="") as _f:
+            _w = _csv_mod.DictWriter(_f, fieldnames=list(search_space.keys()) + ["q_score"])
+            _w.writeheader()
+            _w.writerows(history)
+        print(f"  [tune] trial log saved → {trial_csv}")
+
+    return best_params, history
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Elliptic equivalents  (PyG Data objects instead of IBM network dicts)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -489,10 +751,15 @@ def load_simclr_encoder_elliptic(device):
             "Run elliptic_simclr_train.py first."
         )
     print(f"Best Elliptic SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
-    ckpt    = torch.load(best_path, map_location=device, weights_only=False)
-    in_dim  = ckpt["encoder_state_dict"]["conv1.lin.weight"].shape[1]
-    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=64, out_dim=128).to(device)
-    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    ckpt       = torch.load(best_path, map_location=device, weights_only=False)
+    sd         = ckpt["encoder_state_dict"]
+    in_dim     = sd["conv1.lin.weight"].shape[1]
+    hidden_dim = sd["conv1.lin.weight"].shape[0]
+    n_layers   = 3 if "conv3.lin.weight" in sd else 2
+    use_bn     = "bn1.weight" in sd
+    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
+                           n_layers=n_layers, use_bn=use_bn).to(device)
+    encoder.load_state_dict(sd)
     encoder.eval()
     return encoder
 

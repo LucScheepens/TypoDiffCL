@@ -211,6 +211,151 @@ def compute_edge_densities(gen_data):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Metric 4 — Degree-distribution KL divergence  (Direction 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_degree_kl_divergence(gen_data, train_laund_data):
+    """
+    Per-graph KL divergence KL(gen || real) between each generated graph's
+    node-degree distribution and the pooled degree distribution of real
+    laundering training graphs.
+
+    Uses Laplace-smoothed histograms so no bin is ever zero.
+    Lower divergence means the generated graph's degree sequence is closer
+    to real laundering data — a good proxy for realistic topology.
+
+    Parameters
+    ----------
+    gen_data         : list[PyG Data]  generated graphs
+    train_laund_data : list[PyG Data]  real laundering training graphs
+
+    Returns
+    -------
+    kl_divs : np.ndarray [N_gen]  KL divergence ≥ 0.  Lower is better.
+    """
+    if len(gen_data) == 0:
+        return np.array([], dtype=np.float32)
+    if len(train_laund_data) == 0:
+        return np.full(len(gen_data), np.nan, dtype=np.float32)
+
+    def _node_degrees(data_list):
+        """Collect per-node degree (out-degree from edge_index[0]) across all graphs."""
+        degs = []
+        for g in data_list:
+            n = g.num_nodes
+            if g.edge_index.shape[1] > 0:
+                src = g.edge_index[0].numpy()
+                degs.extend(np.bincount(src, minlength=n).tolist())
+            else:
+                degs.extend([0] * n)
+        return np.array(degs, dtype=np.float32)
+
+    real_degs = _node_degrees(train_laund_data)
+    # Cap bins at 99th-percentile to avoid sparse high-degree tails
+    max_deg = max(int(np.percentile(real_degs, 99)), 1)
+    bins    = np.arange(0, max_deg + 2)
+
+    # Reference histogram with Laplace smoothing
+    real_hist, _ = np.histogram(real_degs, bins=bins)
+    real_prob    = (real_hist.astype(float) + 1.0)
+    real_prob   /= real_prob.sum()
+
+    kl_divs = []
+    for g in gen_data:
+        n = g.num_nodes
+        if g.edge_index.shape[1] > 0:
+            src = g.edge_index[0].numpy()
+            deg = np.bincount(src, minlength=n)
+        else:
+            deg = np.zeros(n, dtype=np.int64)
+
+        gen_hist, _ = np.histogram(deg, bins=bins)
+        gen_prob    = (gen_hist.astype(float) + 1.0)
+        gen_prob   /= gen_prob.sum()
+
+        kl = float(np.sum(gen_prob * np.log(gen_prob / real_prob)))
+        kl_divs.append(kl)
+
+    return np.array(kl_divs, dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Diagnostic — SimCLR embedding class separation  (Direction 3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_embedding_separation(data_list, labels, encoder, device):
+    """
+    Measure how well the SimCLR encoder separates laundering from clean graphs
+    BEFORE generation.  Poor separation means the probe will produce weak guidance
+    signals, so the generated graphs will not be meaningfully class-conditional.
+
+    Two complementary metrics:
+    - Silhouette score  ∈ [-1, 1]  — higher → cleaner cluster separation in
+      embedding space (computed with cosine distance).
+    - Linear probe AUC  ∈ [0, 1]  — 5-fold CV AUC of a logistic regression
+      trained on the frozen embeddings.  Measures whether class signal is
+      linearly decodable (the minimum bar for useful guidance).
+
+    Call this after loading the encoder and before running generation.
+    If silhouette < 0.05 or linear_probe_auc < 0.65, consider retraining
+    SimCLR with stronger SupCon loss (supcon_weight > 0.5) or more epochs.
+
+    Parameters
+    ----------
+    data_list : list[PyG Data]  training graphs (all classes)
+    labels    : list[int]       binary label per graph
+    encoder   : GraphEncoder in eval mode
+    device    : torch.device
+
+    Returns
+    -------
+    dict with keys "silhouette" and "linear_probe_auc"
+    """
+    from sklearn.metrics import silhouette_score
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_score
+
+    labels_arr = np.array(labels, dtype=int)
+    if len(np.unique(labels_arr)) < 2 or len(data_list) < 10:
+        return {"silhouette": float("nan"), "linear_probe_auc": float("nan")}
+
+    # Encode all graphs
+    ext_graphs = [Data(x=g.x.clone(), edge_index=g.edge_index.clone())
+                  for g in data_list]
+    H_list = []
+    with torch.no_grad():
+        for i in range(0, len(ext_graphs), 64):
+            chunk = Batch.from_data_list(ext_graphs[i : i + 64]).to(device)
+            H_list.append(encoder(chunk).cpu())
+    H   = torch.cat(H_list, dim=0)
+    H_n = F.normalize(H, dim=1).numpy()  # [N, 128]
+
+    # Silhouette score — subsample to ≤2000 for speed
+    try:
+        n = len(labels_arr)
+        if n > 2000:
+            rng = np.random.default_rng(42)
+            idx = rng.choice(n, 2000, replace=False)
+            sil = float(silhouette_score(H_n[idx], labels_arr[idx], metric="cosine"))
+        else:
+            sil = float(silhouette_score(H_n, labels_arr, metric="cosine"))
+    except Exception:
+        sil = float("nan")
+
+    # Linear probe AUC (5-fold CV), cap folds by minority class size
+    try:
+        n_pos  = int(labels_arr.sum())
+        n_folds = min(5, max(2, n_pos))
+        clf    = LogisticRegression(max_iter=500, C=1.0, random_state=42)
+        aucs   = cross_val_score(clf, H_n, labels_arr, cv=n_folds, scoring="roc_auc")
+        lp_auc = float(aucs.mean())
+    except Exception:
+        lp_auc = float("nan")
+
+    return {"silhouette": sil, "linear_probe_auc": lp_auc}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Composite scoring
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -236,6 +381,7 @@ def score_generated_graphs(gen_data, train_laund_data, H_train_laund,
         "wass_dist"     np.ndarray [N_gen]  mean Wasserstein-1 (↓ better)
         "wass_per_feat" np.ndarray [N_gen, 5]  per-feature breakdown
         "density"       np.ndarray [N_gen]  edge density (↓ better)
+        "degree_kl"     np.ndarray [N_gen]  degree-distribution KL (↓ better)
         "Q"             np.ndarray [N_gen]  composite quality ∈ [0,1] (↑ better)
     """
     print("  [quality] computing SimCLR embedding distances …")
@@ -249,18 +395,25 @@ def score_generated_graphs(gen_data, train_laund_data, H_train_laund,
     print("  [quality] computing edge densities …")
     density       = compute_edge_densities(gen_data)
 
-    # Composite score: each raw metric normalised to [0,1], then inverted so
-    # higher is better, then averaged.
+    print("  [quality] computing degree-distribution KL divergence …")
+    degree_kl     = compute_degree_kl_divergence(gen_data, train_laund_data)
+
+    # Composite score: 4 components, each normalised to [0,1] then inverted
+    # (higher = better), then averaged equally.
+    # degree_kl replaces nothing — it adds topology information absent from
+    # the Wasserstein distance (which operates on node features, not graph structure).
     emb_score  = 1.0 - _normalize_01(emb_dist)
     wass_score = 1.0 - _normalize_01(wass_dist)
     dens_score = 1.0 - _normalize_01(density)
-    Q          = (emb_score + wass_score + dens_score) / 3.0
+    kl_score   = 1.0 - _normalize_01(np.nan_to_num(degree_kl, nan=0.0))
+    Q          = (emb_score + wass_score + dens_score + kl_score) / 4.0
 
     return {
         "emb_dist":      emb_dist,
         "wass_dist":     wass_dist,
         "wass_per_feat": wass_per_feat,
         "density":       density,
+        "degree_kl":     degree_kl,
         "Q":             Q,
     }
 
@@ -287,31 +440,35 @@ def print_quality_report(metrics, top_n=None):
     top_n = n if top_n is None else min(top_n, n)
     rank  = np.argsort(-Q)      # descending by quality
 
-    sep = "─" * 74
+    sep = "─" * 86
     print("\n" + sep)
     print("GENERATED GRAPH QUALITY REPORT  "
           "(Tier-1 metrics  |  Q: higher = better quality)")
     print(sep)
     print(f"{'Rank':>4}  {'Graph':>6}  {'Q':>6}  "
-          f"{'EmbDist':>9}  {'WassDist':>9}  {'Density':>8}")
+          f"{'EmbDist':>9}  {'WassDist':>9}  {'Density':>8}  {'DegKL':>8}")
     print(sep)
 
+    has_kl = "degree_kl" in metrics and len(metrics["degree_kl"]) == n
     for pos in range(top_n):
         i = rank[pos]
+        kl_str = f"{metrics['degree_kl'][i]:>8.4f}" if has_kl else "       —"
         print(f"{pos+1:>4}  {i:>6}  {Q[i]:>6.3f}  "
               f"{metrics['emb_dist'][i]:>9.4f}  "
               f"{metrics['wass_dist'][i]:>9.4f}  "
-              f"{metrics['density'][i]:>8.4f}")
+              f"{metrics['density'][i]:>8.4f}  "
+              f"{kl_str}")
 
     if n > top_n:
         print(f"  … ({n - top_n} more graphs not shown, use top_n=None to see all)")
 
     print(sep)
     # Per-metric summary
+    extra_keys = [("DegKL    ", "degree_kl")] if has_kl else []
     for label, key in [("Q        ", "Q"),
                         ("EmbDist  ", "emb_dist"),
                         ("WassDist ", "wass_dist"),
-                        ("Density  ", "density")]:
+                        ("Density  ", "density")] + extra_keys:
         arr = metrics[key]
         print(f"  {label}  mean={arr.mean():.4f}  std={arr.std():.4f}  "
               f"min={arr.min():.4f}  max={arr.max():.4f}")
@@ -338,22 +495,26 @@ def save_quality_csv(metrics, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    wf   = metrics["wass_per_feat"]
-    n    = len(metrics["Q"])
+    wf     = metrics["wass_per_feat"]
+    n      = len(metrics["Q"])
+    has_kl = "degree_kl" in metrics and len(metrics["degree_kl"]) == n
 
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         header = (["graph_idx", "Q", "emb_dist", "wass_dist", "density"]
+                  + (["degree_kl"] if has_kl else [])
                   + [f"wass_{fn}" for fn in _FEAT_NAMES])
         writer.writerow(header)
         for i in range(n):
             per_feat_vals = list(wf[i]) if wf.size > 0 else [""] * len(_FEAT_NAMES)
+            kl_val = [f"{metrics['degree_kl'][i]:.6f}"] if has_kl else []
             writer.writerow([
                 i,
                 f"{metrics['Q'][i]:.6f}",
                 f"{metrics['emb_dist'][i]:.6f}",
                 f"{metrics['wass_dist'][i]:.6f}",
                 f"{metrics['density'][i]:.6f}",
+                *kl_val,
                 *[f"{v:.6f}" for v in per_feat_vals],
             ])
     print(f"Quality metrics saved → {path}")

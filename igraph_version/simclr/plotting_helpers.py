@@ -10,7 +10,7 @@ from torch_geometric.data import Batch
 from augmentation import augment_network_view_fast
 from simclr import GraphEncoder, prepare_networks, network_to_pyg_data_fast
 
-_CHECKPOINT_DIR = Path(__file__).resolve().parent / "model_checkpoints"
+_CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints" / "simclr_ibm"
 
 
 def plot_graph_from_dict_igraph(graph_dict, save_path=None, show=True, dpi=300):
@@ -129,22 +129,27 @@ def plot_graph_from_dict_igraph(graph_dict, save_path=None, show=True, dpi=300):
 
 def plot_simclr_latent_space_laundering_vs_clean(
     networks,
-    df_full
+    df_full,
+    encoder=None,
 ):
     """
     Plot the SimCLR encoder latent space, colored by presence of laundering nodes.
-    """ 
+
+    encoder : optional pre-loaded GraphEncoder in eval mode.  If None the best
+              checkpoint is loaded from _CHECKPOINT_DIR automatically.
+    """
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    checkpoint = torch.load(_CHECKPOINT_DIR / "best_model.pt", map_location=device)
-
-    # Infer in_dim from the checkpoint so this is robust across old (6-dim)
-    # and new (5-dim, after label-leakage fix) checkpoints.
-    _in_dim = checkpoint["encoder_state_dict"]["conv1.lin.weight"].shape[1]
-    encoder = GraphEncoder(in_dim=_in_dim, hidden_dim=64, out_dim=128).to(device)
-    encoder.load_state_dict(checkpoint["encoder_state_dict"])
-    encoder.eval()
+    if encoder is None:
+        checkpoint = torch.load(_CHECKPOINT_DIR / "best_model.pt", map_location=device)
+        # Infer in_dim from the checkpoint weights — robust across feature-dim changes.
+        _in_dim = checkpoint["encoder_state_dict"]["conv1.lin.weight"].shape[1]
+        encoder = GraphEncoder(in_dim=_in_dim, hidden_dim=64, out_dim=128).to(device)
+        encoder.load_state_dict(checkpoint["encoder_state_dict"])
+        encoder.eval()
+    else:
+        encoder = encoder.to(device)
 
     full_graph = prepare_networks(networks, df_full)
 

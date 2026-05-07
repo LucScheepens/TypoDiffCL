@@ -3,6 +3,7 @@ scoring.py — shared metric helpers used by test.py and latent_seed_generation.
 """
 
 import csv
+import networkx as nx
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -15,36 +16,61 @@ NOVELTY_K = 10
 
 def graph_feature_vector(x, adj):
     """
-    Compute a 10-D graph-level feature vector from node features + adjacency.
-    Betweenness (x[:,3]) is excluded — the diffusion model does not predict it
-    reliably and it was zeroed during SimCLR encoder training.
+    Compute a 10-D graph-level feature vector from the adjacency structure.
+    All structural metrics are derived from the graph topology so the function
+    is independent of the node-feature column layout — enabling consistent
+    comparison between training graphs (7-col x) and generated graphs (6-col x).
 
-    x   : [n, 7]  node features in ORIGINAL scale
-    adj : [n, n]  binary adjacency
+    x   : [n, F]  node features (used only for n when adj unavailable)
+    adj : [n, n]  binary adjacency (symmetrised internally)
     """
     if isinstance(x, torch.Tensor):
-        x   = x.cpu().numpy()
+        x = x.cpu().numpy()
+    if isinstance(adj, torch.Tensor):
         adj = adj.cpu().numpy()
 
-    n     = x.shape[0]
-    edges = float(adj.sum()) / 2
+    n = x.shape[0]
+
+    # Symmetrise and strip self-loops so metrics are well-defined
+    adj_s = np.clip(adj + adj.T, 0, 1).astype(float)
+    np.fill_diagonal(adj_s, 0)
+
+    edges = float(adj_s.sum()) / 2
     dens  = edges / max(n * (n - 1) / 2, 1)
-    deg   = adj.sum(axis=1)
-    clust = x[:, 4]
-    pr    = x[:, 5]
-    assort = float(x[0, 5])
+    deg   = adj_s.sum(axis=1)
+
+    G = nx.from_numpy_array(adj_s)
+
+    # Clustering coefficients — 0 for isolated nodes (correct default)
+    clust_d = nx.clustering(G)
+    clust   = np.array([clust_d[i] for i in range(n)])
+
+    # PageRank — uniform 1/n for edgeless graphs
+    if G.number_of_edges() > 0:
+        pr_d = nx.pagerank(G, alpha=0.85, max_iter=200, tol=1e-6)
+        pr   = np.array([pr_d[i] for i in range(n)])
+    else:
+        pr = np.full(n, 1.0 / max(n, 1))
+
+    # Degree assortativity — 0 for trivial graphs
+    try:
+        assort = float(nx.degree_assortativity_coefficient(G))
+    except Exception:
+        assort = 0.0
+    if not np.isfinite(assort):
+        assort = 0.0
 
     return np.array([
-        n,                       # 0  n_nodes
-        edges,                   # 1  n_edges
-        dens,                    # 2  density
-        deg.mean(),              # 3  mean degree
-        deg.std()   + 1e-8,      # 4  std degree
-        clust.mean(),            # 5  mean clustering
-        clust.std() + 1e-8,      # 6  std clustering
-        pr.mean(),               # 7  mean pagerank
-        pr.std()    + 1e-8,      # 8  std pagerank
-        assort,                  # 9  assortativity
+        n,                     # 0  n_nodes
+        edges,                 # 1  n_edges
+        dens,                  # 2  density
+        deg.mean(),            # 3  mean degree
+        deg.std()   + 1e-8,    # 4  std degree
+        clust.mean(),          # 5  mean clustering
+        clust.std() + 1e-8,    # 6  std clustering
+        pr.mean(),             # 7  mean pagerank
+        pr.std()    + 1e-8,    # 8  std pagerank
+        assort,                # 9  assortativity
     ], dtype=np.float64)
 
 

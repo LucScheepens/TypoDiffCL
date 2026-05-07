@@ -1,6 +1,7 @@
 import random
 from collections import deque
 import igraph as ig
+import numpy as np
 import time
 import copy
 
@@ -9,11 +10,9 @@ def build_igraph_from_transactions(tx_df):
     """
     Build an undirected igraph graph from transactions dataframe.
     """
-    g = ig.Graph.DataFrame(
-        tx_df[["From_Account_int", "To_Account_int"]],
-        directed=False,
-        use_vids=False
-    )
+    edges = tx_df[["From_Account_int", "To_Account_int"]]
+    edges = edges[edges["From_Account_int"] != edges["To_Account_int"]]
+    g = ig.Graph.DataFrame(edges, directed=False, use_vids=False)
     return g
 
 
@@ -31,11 +30,9 @@ def _get_or_build_graph(network):
     nodes = network["nodes"]
 
     if len(txs) > 0:
-        g = ig.Graph.DataFrame(
-            txs[["From_Account_int", "To_Account_int"]],
-            directed=True,
-            use_vids=False,
-        )
+        edges = txs[["From_Account_int", "To_Account_int"]]
+        edges = edges[edges["From_Account_int"] != edges["To_Account_int"]]
+        g = ig.Graph.DataFrame(edges, directed=True, use_vids=False)
         # Add isolated nodes that appear in the node set but have no transactions
         existing = {v["name"] for v in g.vs}
         for n in nodes:
@@ -89,7 +86,11 @@ def crop_network(network, crop_ratio=0.8, random_seed=None):
 
 
 def delete_random_edges(network, delete_frac=0.15, random_seed=None):
-    """Delete a random fraction of edges — no bridge detection overhead."""
+    """
+    Delete random edges without disconnecting the network.
+    Bridge detection runs on the undirected view so it works correctly
+    for directed graphs produced by util.py.
+    """
     if random_seed is not None:
         random.seed(random_seed)
 
@@ -97,10 +98,24 @@ def delete_random_edges(network, delete_frac=0.15, random_seed=None):
     if g.ecount() < 2:
         return {**network, "graph": g}
 
-    all_eids = list(range(g.ecount()))
-    target = max(1, int(len(all_eids) * delete_frac))
-    random.shuffle(all_eids)
-    g.delete_edges(all_eids[:target])
+    # Bridges on the undirected view — O(V+E), fast
+    g_undir = g.as_undirected(combine_edges="first")
+    bridge_pairs = set()
+    for eid in g_undir.bridges():
+        e = g_undir.es[eid]
+        bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+
+    # Any directed edge whose undirected pair is a bridge is excluded
+    non_bridges = [
+        e.index for e in g.es
+        if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
+    ]
+    if not non_bridges:
+        return {**network, "graph": g}
+
+    target = max(1, int(len(non_bridges) * delete_frac))
+    random.shuffle(non_bridges)
+    g.delete_edges(non_bridges[:target])
 
     return {**network, "graph": g}
 
@@ -223,14 +238,18 @@ def augment_network_view_fast(
     network,
     p_crop=0.6,
     p_edge_drop=0.2,
+    p_node_delete=0.2,
+    p_node_add=0.2,
     crop_ratio_range=(0.6, 0.9),
     edge_drop_range=(0.05, 0.2),
+    node_delete_frac=0.15,
+    num_new_nodes=5,
     random_seed=None,
 ):
     if random_seed is not None:
         random.seed(random_seed)
 
-    aug_net = {**network}
+    aug_net = {**network}  # shallow copy — augmentation fns always return new dicts/graphs
 
     if random.random() < p_crop:
         ratio = random.uniform(*crop_ratio_range)
@@ -239,5 +258,208 @@ def augment_network_view_fast(
     if random.random() < p_edge_drop:
         frac = random.uniform(*edge_drop_range)
         aug_net = delete_random_edges(aug_net, delete_frac=frac)
+
+    if random.random() < p_node_delete:
+        aug_net = delete_nodes(aug_net, delete_frac=node_delete_frac)
+
+    if random.random() < p_node_add:
+        aug_net = add_nodes(aug_net, num_new_nodes=num_new_nodes)
+
+    return aug_net
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Motif-preserving edge deletion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def delete_edges_motif_preserving(network, delete_frac=0.15, random_seed=None):
+    """
+    Delete edges biased toward structurally unimportant ones.
+
+    Uses edge betweenness centrality (computed on the undirected view via
+    igraph's C implementation) as an importance proxy.  High-betweenness edges
+    sit on many shortest paths and are likely structurally critical; they are
+    given a low deletion probability.  Bridges are never deleted.
+    """
+    if random_seed is not None:
+        random.seed(random_seed)
+
+    g = _get_or_build_graph(network)
+    if g.ecount() < 2:
+        return {**network, "graph": g}
+
+    g_undir = g.as_undirected(combine_edges="first")
+
+    bridge_pairs = set()
+    for eid in g_undir.bridges():
+        e = g_undir.es[eid]
+        bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+
+    non_bridges = [
+        e.index for e in g.es
+        if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
+    ]
+    if not non_bridges:
+        return {**network, "graph": g}
+
+    # Edge betweenness on undirected graph, normalised to [0,1]
+    eb     = g_undir.edge_betweenness(directed=False)
+    max_eb = max(eb) if max(eb) > 0 else 1.0
+
+    # Build (min_vid, max_vid) → normalised betweenness lookup
+    eb_by_pair = {}
+    for eid, e in enumerate(g_undir.es):
+        pair = (min(e.source, e.target), max(e.source, e.target))
+        eb_by_pair[pair] = eb[eid] / max_eb
+
+    # Invert: low importance = high deletion probability
+    weights = []
+    for eid in non_bridges:
+        e = g.es[eid]
+        pair = (min(e.source, e.target), max(e.source, e.target))
+        importance = eb_by_pair.get(pair, 0.5)
+        weights.append(1.0 - importance + 0.01)
+
+    probs = np.array(weights) / sum(weights)
+    target = max(1, int(len(non_bridges) * delete_frac))
+    chosen = list(np.random.choice(non_bridges,
+                                   size=min(target, len(non_bridges)),
+                                   replace=False, p=probs))
+    g.delete_edges(chosen)
+    return {**network, "graph": g}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Saliency-guided node deletion
+# ─────────────────────────────────────────────────────────────────────────────
+
+def delete_nodes_saliency_guided(network, delete_frac=0.15,
+                                  node_importance=None, random_seed=None):
+    """
+    Delete nodes with a bias toward low-importance ones.
+
+    node_importance: dict {account_name (int) -> importance_score in [0,1]}.
+      High scores → keep.  Falls back to uniform random deletion when None.
+    Laundering nodes and articulation points are never deleted.
+    """
+    if random_seed is not None:
+        random.seed(random_seed)
+
+    g = _get_or_build_graph(network)
+    if g.vcount() < 3:
+        return {**network, "graph": g}
+
+    g_undir       = g.as_undirected(combine_edges="first")
+    art_vids      = set(g_undir.articulation_points())
+    laundering    = network["laundering_nodes"]
+    has_names     = "name" in g.vs.attributes()
+
+    deletable_vids = [
+        v.index for v in g.vs
+        if v.index not in art_vids
+        and (g.vs[v.index]["name"] if has_names else v.index) not in laundering
+    ]
+
+    if not deletable_vids:
+        return {**network, "graph": g}
+
+    target = max(1, int(len(deletable_vids) * delete_frac))
+
+    if node_importance is not None:
+        weights = []
+        for vid in deletable_vids:
+            name = g.vs[vid]["name"] if has_names else vid
+            importance = node_importance.get(int(name), 0.5)
+            weights.append(1.0 - importance + 0.01)
+        probs = np.array(weights) / sum(weights)
+        chosen_vids = list(np.random.choice(deletable_vids,
+                                             size=min(target, len(deletable_vids)),
+                                             replace=False, p=probs))
+    else:
+        random.shuffle(deletable_vids)
+        chosen_vids = deletable_vids[:target]
+
+    deleted_names = {(g.vs[vid]["name"] if has_names else vid) for vid in chosen_vids}
+    g.delete_vertices(chosen_vids)
+    remaining = network["nodes"] - deleted_names
+
+    return {
+        **network,
+        "nodes": remaining,
+        "laundering_nodes": network["laundering_nodes"] - deleted_names,
+        "collapsed_nodes":  network["collapsed_nodes"]  - deleted_names,
+        "node_depths": {n: d for n, d in network["node_depths"].items()
+                        if n not in deleted_names},
+        "graph": g,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Smart augmentation: curriculum + motif-preserving + saliency
+# ─────────────────────────────────────────────────────────────────────────────
+
+def augment_network_view_smart(
+    network,
+    aug_strength=1.0,
+    node_importance=None,
+    p_crop=0.6,
+    p_edge_drop=0.3,
+    p_node_delete=0.3,
+    p_node_add=0.2,
+    crop_ratio_range=(0.6, 0.9),
+    edge_drop_range=(0.05, 0.25),
+    node_delete_frac=0.20,
+    num_new_nodes=5,
+    use_motif_preserving=True,
+    random_seed=None,
+):
+    """
+    Augmentation combining three task-aware ideas:
+
+    1. Curriculum strength (aug_strength ∈ [0,1]): at 0, transformations are
+       very mild (the network is barely changed); at 1, full-strength augmentation
+       is applied.  This allows the encoder to learn stable representations before
+       harder views are introduced.
+
+    2. Motif-preserving edge dropping: instead of uniform random edge deletion,
+       edges are sampled with probability inversely proportional to their edge
+       betweenness centrality, so structurally critical edges (bridges between
+       communities, flow bottlenecks) are less likely to be removed.
+
+    3. Saliency-guided node deletion: nodes with high probe-gradient importance
+       scores are protected from deletion, preserving the most discriminative
+       structural elements for the downstream classification task.
+    """
+    if random_seed is not None:
+        random.seed(random_seed)
+
+    # Scale from mild (0.3) at the start to full (1.0) at the end
+    base_scale = 0.3 + 0.7 * aug_strength
+
+    aug_net = {**network}
+
+    if random.random() < p_crop * base_scale:
+        lo = crop_ratio_range[0] + (1.0 - aug_strength) * (1.0 - crop_ratio_range[0])
+        hi = crop_ratio_range[1] + (1.0 - aug_strength) * (1.0 - crop_ratio_range[1])
+        ratio = random.uniform(lo, hi)
+        aug_net = crop_network(aug_net, crop_ratio=ratio)
+
+    if random.random() < p_edge_drop * base_scale:
+        lo_d  = edge_drop_range[0] * aug_strength
+        hi_d  = edge_drop_range[1] * aug_strength
+        frac  = random.uniform(max(0.01, lo_d), max(0.02, hi_d))
+        if use_motif_preserving:
+            aug_net = delete_edges_motif_preserving(aug_net, delete_frac=frac)
+        else:
+            aug_net = delete_random_edges(aug_net, delete_frac=frac)
+
+    if random.random() < p_node_delete * base_scale:
+        frac = node_delete_frac * max(0.1, aug_strength)
+        aug_net = delete_nodes_saliency_guided(aug_net, delete_frac=frac,
+                                               node_importance=node_importance)
+
+    if random.random() < p_node_add * base_scale:
+        n_new = max(1, int(num_new_nodes * aug_strength))
+        aug_net = add_nodes(aug_net, num_new_nodes=n_new)
 
     return aug_net

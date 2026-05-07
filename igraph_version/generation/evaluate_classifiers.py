@@ -66,9 +66,12 @@ Usage
 import sys
 import argparse
 import csv
+import functools
 import pickle
 import random
 from pathlib import Path
+
+import pandas as pd
 
 import numpy as np
 import torch
@@ -99,9 +102,8 @@ from augmentation import build_igraph_from_transactions
 
 # ── hyper-parameters ──────────────────────────────────────────────────────────
 CSV_PATH    = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"  # default
-IN_CHANNELS = 10       # topology (5) + transaction features (5): degree, betweenness, clustering,
-                       # pagerank, assortativity, log_mean_amount, log_max_amount,
-                       # tx_count, payment_format_entropy, temporal_span
+IN_CHANNELS        = 10       # topology (5) + transaction features (5)
+FRAUDGT_IN_CHANNELS = IN_CHANNELS + 1   # +1 for ego_id feature
 HIDDEN      = 64
 NUM_LAYERS  = 3
 HEADS       = 4        # attention heads for GraphTransformer
@@ -308,6 +310,68 @@ class DeepSetsClassifier(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Model 5 — FraudGT  (bidirectional Graph Transformer + ego ID)
+# ─────────────────────────────────────────────────────────────────────────────
+class FraudGTClassifier(nn.Module):
+    """
+    FraudGT-inspired Graph Transformer (Ju et al., ACM FinSys 2024).
+
+    Core contributions adapted for subgraph-level AML classification:
+
+    1. Bidirectional message passing — separate TransformerConv streams for
+       forward (A→B) and reverse (B→A) directions, combined per layer via a
+       learned linear projection.  Money flows follow directed patterns;
+       separating directions lets the model distinguish sender/receiver roles.
+
+    2. Ego ID — a binary node feature (col −1 of x) marking the focal account
+       at the centre of the ego subgraph.  Lets the model weight whether the
+       hub node IS the suspicious account or merely a transit node.
+
+    3. Mean+Max readout — captures both average connectivity and the most
+       extreme node embedding (the potential hub launderer).
+
+    Difference from existing GraphTransformerClassifier:
+    - Two separate conv streams (fwd / rev) instead of one
+    - Streams combined with a linear projection + residual before LayerNorm
+    - Extra ego_id input feature (in_channels = IN_CHANNELS + 1)
+    """
+    def __init__(self, in_channels=FRAUDGT_IN_CHANNELS, hidden=HIDDEN,
+                 num_layers=NUM_LAYERS, heads=HEADS, dropout=DROPOUT):
+        super().__init__()
+        assert hidden % heads == 0, "hidden must be divisible by heads"
+        head_dim = hidden // heads
+        self.input_proj = nn.Linear(in_channels, hidden)
+        self.fwd_convs = nn.ModuleList([
+            TransformerConv(hidden, head_dim, heads=heads, dropout=dropout, concat=True)
+            for _ in range(num_layers)
+        ])
+        self.rev_convs = nn.ModuleList([
+            TransformerConv(hidden, head_dim, heads=heads, dropout=dropout, concat=True)
+            for _ in range(num_layers)
+        ])
+        self.combines = nn.ModuleList([
+            nn.Linear(hidden * 2, hidden) for _ in range(num_layers)
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(num_layers)])
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 2),
+        )
+
+    def forward(self, x, edge_index, batch):
+        rev_ei = edge_index[[1, 0]]          # flip src/dst for reverse pass
+        x = self.input_proj(x).relu()
+        for fwd, rev, combine, norm in zip(
+                self.fwd_convs, self.rev_convs, self.combines, self.norms):
+            msg = combine(torch.cat([fwd(x, edge_index), rev(x, rev_ei)], dim=-1))
+            x   = norm(msg + x)
+        h = torch.cat([global_mean_pool(x, batch), global_max_pool(x, batch)], dim=-1)
+        return self.head(h)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Data conversion helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _adj_to_edge_index(adj):
@@ -354,16 +418,75 @@ def network_to_pyg(x_dense, adj_dense, label):
 def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
     """
     Convert a diffusion-generated triple to a PyG Data object.
-    x_denorm col 0 is normalized degree (deg_n) — col 0 is NOT the laundering
-    flag after the label-leakage fix; all 10 columns are topology features.
+
+    Node features and adjacency are used exactly as produced by the diffusion
+    model — no post-hoc recomputation.  The model is responsible for learning
+    to generate internally consistent (feature, topology) pairs.  Any gap
+    between predicted features and the actual adjacency is a signal that the
+    generation process needs improvement, not something to paper over here.
+
+    # ── AUGMENTATION IMPROVEMENT DIRECTIONS ──────────────────────────────────
+    #
+    # The core challenge: the diffusion model must jointly learn to generate
+    # realistic node features AND meaningful graph topology.  Current pain points
+    # and concrete directions to address them:
+    #
+    # 1. FEATURE-TOPOLOGY COUPLING (highest priority)
+    #    Problem: the model generates features and adjacency largely independently,
+    #    so e.g. a node predicted to have high PageRank may sit in a low-degree
+    #    position in the generated adj — an impossible combination in real data.
+    #    Direction: add a consistency regularisation term to the diffusion training
+    #    loss that penalises divergence between predicted structural features and
+    #    the features implied by the generated adjacency (e.g. soft L2 on
+    #    recomputed degree/clustering vs predicted degree/clustering).
+    #
+    # 2. TOPOLOGY-AWARE DIFFUSION TRAINING
+    #    Problem: the diffusion model is trained with a generic MSE loss on
+    #    (x, adj) jointly, giving equal weight to all elements of the adjacency
+    #    matrix even though most entries are 0 in sparse real graphs.
+    #    Direction: weight the adjacency reconstruction loss by edge rarity
+    #    (class-balanced BCE on adj entries), or use a graph-structured denoising
+    #    objective (e.g. GDSS, NVDiff) that directly models the adjacency as a
+    #    discrete structure rather than a continuous density matrix.
+    #
+    # 3. CLASS-CONDITIONAL GENERATION QUALITY
+    #    Problem: guidance is applied via a probe trained on SimCLR embeddings,
+    #    but the probe signal is weak if the encoder has not learned to separate
+    #    laundering vs clean graphs in embedding space.
+    #    Direction: evaluate embedding-space class separation (e.g. silhouette
+    #    score, linear probe accuracy) before generation; use that as a diagnostic
+    #    for when SimCLR needs retraining.  Consider hard-negative mining or a
+    #    supervised contrastive loss (SupCon) to improve class separation.
+    #
+    # 4. AUGMENTATION AS A LEARNABLE POLICY (long-term)
+    #    Problem: the current approach generates graphs and then selects useful
+    #    ones — but the generator never receives a signal about *which* generated
+    #    graphs were actually useful for the downstream classifier.
+    #    Direction: bilevel optimisation — treat the generation parameters
+    #    (guidance scale, novelty weight) as meta-parameters and optimise them
+    #    to maximise downstream val F1 via a differentiable proxy or Bayesian
+    #    optimisation loop over the (guidance_scale, novelty_weight) space.
+    #
+    # 5. GRAPH STRUCTURE DISTRIBUTION MATCHING
+    #    Problem: generated graphs are often too dense (near-complete adjacency),
+    #    which makes GNN aggregation behave very differently from real sparse graphs.
+    #    Direction: add a degree-distribution regulariser during generation (already
+    #    partly done via degree_penalty); measure KL divergence between real and
+    #    generated degree distributions and report it as a generation quality metric
+    #    alongside the existing Q-score.
+    # ─────────────────────────────────────────────────────────────────────────
     """
-    x_topo = x_denorm[:n_out].float()
-    x_np   = x_topo.numpy()
+    x_np = x_denorm[:n_out].float().numpy().copy()
 
     adj_np = adj_out[:n_out, :n_out]
-    adj_np = adj_np.numpy() if isinstance(adj_np, torch.Tensor) else adj_np
+    adj_np = adj_np.numpy() if isinstance(adj_np, torch.Tensor) else np.array(adj_np, dtype=float)
 
-    ei = _adj_to_edge_index(adj_np)
+    # Symmetrise and threshold the generated adjacency for edge_index extraction.
+    # The model output is a continuous density — treat values > 0.5 as edges.
+    adj_s = np.clip(adj_np + adj_np.T, 0, 1).astype(float)
+    np.fill_diagonal(adj_s, 0)
+
+    ei = _adj_to_edge_index(adj_s)
     if ei.shape[1] == 0:
         ei = _fallback_edges(n_out)
 
@@ -374,6 +497,217 @@ def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
         timestep      = torch.tensor([-1], dtype=torch.long),
         timestamp_val = -1.0,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FraudGT data helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def network_to_pyg_fraudgt(x_dense, adj_dense, label, net):
+    """
+    Like network_to_pyg but appends an ego_id feature (last column of x).
+
+    ego_id = 1 for the focal/root account (net["start_node"]), 0 for all
+    other nodes.  Falls back to highest-degree node when start_node is absent.
+    """
+    if isinstance(x_dense, torch.Tensor):
+        x_np   = x_dense[:, 1:].float().numpy()
+        adj_np = adj_dense.numpy() if isinstance(adj_dense, torch.Tensor) else adj_dense
+    else:
+        x_np   = x_dense[:, 1:].astype(np.float32)
+        adj_np = np.asarray(adj_dense, dtype=np.float32)
+
+    n      = x_np.shape[0]
+    ego_id = np.zeros((n, 1), dtype=np.float32)
+
+    start_node = net.get("start_node", None)
+    g          = net.get("graph", None)
+    if start_node is not None and g is not None and "name" in g.vs.attributes():
+        names = [int(g.vs[i]["name"]) for i in range(min(n, g.vcount()))]
+        if start_node in names:
+            ego_id[names.index(start_node)] = 1.0
+        else:
+            ego_id[int(np.argmax(adj_np.sum(axis=1)))] = 1.0
+    elif n > 0:
+        ego_id[int(np.argmax(adj_np.sum(axis=1)))] = 1.0
+
+    ei = _adj_to_edge_index(adj_np)
+    if ei.shape[1] == 0:
+        ei = _fallback_edges(n)
+
+    return Data(
+        x             = torch.tensor(np.concatenate([x_np, ego_id], axis=1), dtype=torch.float),
+        edge_index    = ei,
+        y             = torch.tensor([label], dtype=torch.long),
+        timestep      = torch.tensor([-1], dtype=torch.long),
+        timestamp_val = -1.0,
+    )
+
+
+def _to_fraudgt_format(data):
+    """Append ego_id=0 column to a standard Data object (for generated graphs)."""
+    n = data.x.shape[0]
+    return Data(
+        x             = torch.cat([data.x, torch.zeros(n, 1)], dim=1),
+        edge_index    = data.edge_index,
+        y             = data.y,
+        timestep      = getattr(data, "timestep",      torch.tensor([-1])),
+        timestamp_val = getattr(data, "timestamp_val", -1.0),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ExSTraQt — feature extraction + sklearn classifier
+# ─────────────────────────────────────────────────────────────────────────────
+
+_EXSTRAQT_FEAT_NAMES = [
+    # Account role counts (Tariq et al. §3.2)
+    "num_sources", "num_targets", "num_passthrough", "num_transactions",
+    # Transaction amount statistics
+    "amount_mean", "amount_max", "amount_std", "amount_median",
+    "log_amount_mean", "log_amount_std",
+    # Temporal spread
+    "ts_range_hours", "ts_std_hours",
+    # Net money flow imbalance
+    "turnover",
+    # Graph topology
+    "num_nodes", "num_edges", "max_degree", "mean_degree", "density",
+    "assortativity", "num_biconn", "num_articulation_points",
+]
+
+
+def _extract_exstraqt_features(net):
+    """
+    Compute ExSTraQt-style feature vector for one IBM network dict.
+
+    Mirrors the feature set described in Tariq et al. (arXiv 2604.02899):
+    account role fractions, transaction amount/temporal statistics, turnover,
+    and graph topology metrics.  Returns a fixed-length float32 array.
+    """
+    feat = dict.fromkeys(_EXSTRAQT_FEAT_NAMES, 0.0)
+    txs  = net.get("transactions", None)
+    g    = net.get("graph", None)
+
+    if txs is not None and len(txs) > 0 and "From_Account_int" in txs.columns:
+        srcs = set(txs["From_Account_int"])
+        dsts = set(txs["To_Account_int"])
+        both = srcs & dsts
+        feat["num_sources"]      = float(len(srcs - dsts))
+        feat["num_targets"]      = float(len(dsts - srcs))
+        feat["num_passthrough"]  = float(len(both))
+        feat["num_transactions"] = float(len(txs))
+
+        amt_col = next((c for c in ("Amount_Paid", "amount", "Amount") if c in txs.columns), None)
+        if amt_col:
+            amounts = np.abs(txs[amt_col].values.astype(float)) + 1e-8
+            feat["amount_mean"]     = float(np.mean(amounts))
+            feat["amount_max"]      = float(np.max(amounts))
+            feat["amount_std"]      = float(np.std(amounts))
+            feat["amount_median"]   = float(np.median(amounts))
+            log_a = np.log1p(amounts)
+            feat["log_amount_mean"] = float(np.mean(log_a))
+            feat["log_amount_std"]  = float(np.std(log_a))
+
+            out_sum = txs.groupby("From_Account_int")[amt_col].sum()
+            in_sum  = txs.groupby("To_Account_int")[amt_col].sum()
+            all_acc = set(out_sum.index) | set(in_sum.index)
+            feat["turnover"] = float(
+                np.sum([abs(out_sum.get(a, 0.0) - in_sum.get(a, 0.0)) for a in all_acc])
+            )
+
+        ts_col = next((c for c in ("Timestamp", "timestamp") if c in txs.columns), None)
+        if ts_col:
+            try:
+                ts = pd.to_datetime(txs[ts_col]).astype("int64") / 1e9
+                feat["ts_range_hours"] = float((ts.max() - ts.min()) / 3600.0)
+                feat["ts_std_hours"]   = float(ts.std() / 3600.0)
+            except Exception:
+                pass
+
+    if g is not None:
+        n    = g.vcount()
+        degs = g.degree()
+        feat["num_nodes"]   = float(n)
+        feat["num_edges"]   = float(g.ecount())
+        feat["max_degree"]  = float(max(degs)) if degs else 0.0
+        feat["mean_degree"] = float(np.mean(degs)) if degs else 0.0
+        feat["density"]     = float(g.density()) if n > 1 else 0.0
+        a = g.assortativity_degree(directed=False)
+        feat["assortativity"] = 0.0 if (a is None or np.isnan(float(a))) else float(a)
+        try:
+            feat["num_biconn"] = float(len(list(g.biconnected_components())))
+        except Exception:
+            feat["num_biconn"] = 1.0
+        try:
+            feat["num_articulation_points"] = float(len(g.articulation_points()))
+        except Exception:
+            pass
+
+    return np.array([feat[k] for k in _EXSTRAQT_FEAT_NAMES], dtype=np.float32)
+
+
+def _get_net_label(net):
+    """Extract binary laundering label from a network dict."""
+    if "tx_label" in net:
+        return int(net["tx_label"])
+    return int(len(net.get("laundering_nodes", set())) > 0)
+
+
+def run_experiment_exstraqt(train_nets, val_nets, test_nets, seed=0):
+    """
+    Train and evaluate an ExSTraQt-style gradient-boosted classifier.
+
+    Uses XGBoost if available, otherwise sklearn HistGradientBoostingClassifier.
+    Threshold is tuned on the validation set (same protocol as GNN experiments).
+
+    Returns a metrics dict with keys: auc, f1, precision, recall.
+    """
+    X_train = np.stack([_extract_exstraqt_features(n) for n in train_nets])
+    y_train = np.array([_get_net_label(n) for n in train_nets])
+    X_val   = np.stack([_extract_exstraqt_features(n) for n in val_nets])
+    y_val   = np.array([_get_net_label(n) for n in val_nets])
+    X_test  = np.stack([_extract_exstraqt_features(n) for n in test_nets])
+    y_test  = np.array([_get_net_label(n) for n in test_nets])
+
+    n_pos       = int(y_train.sum())
+    n_neg       = len(y_train) - n_pos
+    scale_pos   = max(1.0, n_neg / max(n_pos, 1))
+
+    try:
+        import xgboost as xgb
+        clf = xgb.XGBClassifier(
+            n_estimators=400, max_depth=5, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            scale_pos_weight=scale_pos, random_state=seed,
+            eval_metric="logloss", verbosity=0,
+        )
+        clf.fit(X_train, y_train,
+                eval_set=[(X_val, y_val)],
+                early_stopping_rounds=25, verbose=False)
+        _clf_name = "XGBoost"
+    except ImportError:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        clf = HistGradientBoostingClassifier(
+            max_iter=400, max_depth=5, learning_rate=0.05,
+            class_weight={0: 1.0, 1: scale_pos},
+            random_state=seed,
+            early_stopping=True, validation_fraction=0.1, n_iter_no_change=25,
+        )
+        clf.fit(X_train, y_train)
+        _clf_name = "HistGBT"
+
+    val_probs  = clf.predict_proba(X_val)[:, 1]
+    best_thresh, _ = _best_f1_threshold(y_val, val_probs)
+
+    test_probs = clf.predict_proba(X_test)[:, 1]
+    test_preds = (test_probs >= best_thresh).astype(int)
+
+    auc  = roc_auc_score(y_test, test_probs) if len(np.unique(y_test)) > 1 else 0.5
+    f1   = f1_score(y_test, test_preds, average="binary", zero_division=0)
+    prec = precision_score(y_test, test_preds, average="binary", zero_division=0)
+    rec  = recall_score(y_test, test_preds, average="binary", zero_division=0)
+    return {"auc": auc, "f1": f1, "precision": prec, "recall": rec,
+            "_clf": _clf_name}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -753,17 +1087,39 @@ def main():
     parser.add_argument("--t-start", type=int, default=None,
                         help="Override t_start (starting diffusion timestep) in guided "
                              "generation (default 150 for Elliptic).")
+    # ── Direction 3: embedding separation diagnostic ──────────────────────────
+    parser.add_argument("--sep-check", action="store_true",
+                        help="After loading the SimCLR encoder, compute and print silhouette "
+                             "score and linear probe AUC on the training embeddings. "
+                             "Low scores (silhouette < 0.05, AUC < 0.65) indicate the encoder "
+                             "does not separate classes well — retrain SimCLR before generating.")
+    # ── Direction 4: learnable augmentation policy ────────────────────────────
+    parser.add_argument("--tune-guidance", action="store_true",
+                        help="Before generating augmentation data, run a Bayesian/random "
+                             "search over (guidance_scale, novelty_weight, degree_penalty) "
+                             "to find the combination that maximises mean Q-score. "
+                             "Overrides --guidance-scale / --novelty-weight / --degree-penalty "
+                             "with the tuned values.  Implies --augment.")
+    parser.add_argument("--tune-trials", type=int, default=15, metavar="N",
+                        help="Number of hyperparameter candidates to evaluate during guidance "
+                             "tuning (default 15). More trials = better optimum but slower. "
+                             "Each trial generates --tune-gen-per-trial graphs.")
+    parser.add_argument("--tune-gen-per-trial", type=int, default=6, metavar="K",
+                        help="Graphs generated per tuning trial for Q-score estimation "
+                             "(default 6). Higher = less variance but linearly more compute.")
     args = parser.parse_args()
 
     if args.augment_select:
-        args.augment = True   # augment-select implies augment
+        args.augment = True
+    if args.tune_guidance:
+        args.augment = True   # tuning implies we'll generate augmentation data
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
     from generation.graph_quality_metrics import (
         score_generated_graphs, print_quality_report, save_quality_csv,
-        plot_quality_extremes,
+        plot_quality_extremes, compute_embedding_separation,
     )
 
     # ── 1. Load PyG graphs ───────────────────────────────────────────────────
@@ -773,6 +1129,10 @@ def main():
     # ibm_data_networks[i] is the IBM network dict that produced all_data[i]
     # (only populated for IBM graphs; used later to restrict probe to training fold)
     ibm_data_networks: list = []
+
+    # Parallel FraudGT data list — same graphs with ego_id appended as last feature
+    # Only populated for IBM data (ego_id requires start_node from network dicts)
+    fraudgt_all_data: list = []
 
     if args.dataset in ("ibm", "both"):
         ibm_csv = args.ibm_csv if args.ibm_csv else CSV_PATH
@@ -799,6 +1159,12 @@ def main():
             )
             for net in networks:
                 net["graph"] = build_igraph_from_transactions(net["transactions"])
+            # Save cache — exclude igraph objects which are not picklable
+            networks_to_cache = [{k: v for k, v in net.items() if k != "graph"}
+                                 for net in networks]
+            with open(CACHE_PATH, "wb") as f:
+                pickle.dump(networks_to_cache, f)
+            print(f"Saved IBM network cache → {CACHE_PATH.name}")
 
         print(f"IBM networks: {len(networks)}")
         from diffusion.diff_util import network_to_dense as _ntd
@@ -822,6 +1188,9 @@ def main():
                 if "timestamp" in net else -1.0
             all_data.append(pyg)
             ibm_data_networks.append(net)
+            _fgt_pyg = network_to_pyg_fraudgt(x_d, adj_d, label, net)
+            _fgt_pyg.timestamp_val = pyg.timestamp_val
+            fraudgt_all_data.append(_fgt_pyg)
 
         if skipped:
             print(f"  [{skipped} IBM networks skipped]")
@@ -942,6 +1311,20 @@ def main():
               f"training graphs ({args.low_data:.0%})")
         print()
 
+    # ── 3c. FraudGT and ExSTraQt splits (IBM only) ───────────────────────────
+    # Mirror the main all_data split; idx_tr / idx_val / idx_test_arr are set above.
+    n_ibm = len(ibm_data_networks)
+    if fraudgt_all_data:
+        fgt_train = [fraudgt_all_data[i] for i in idx_tr  if i < n_ibm]
+        fgt_val   = [fraudgt_all_data[i] for i in idx_val if i < n_ibm]
+        fgt_test  = [fraudgt_all_data[i] for i in idx_test_arr if i < n_ibm]
+    else:
+        fgt_train = fgt_val = fgt_test = []
+
+    xq_train_nets = [ibm_data_networks[i] for i in idx_tr      if i < n_ibm]
+    xq_val_nets   = [ibm_data_networks[i] for i in idx_val     if i < n_ibm]
+    xq_test_nets  = [ibm_data_networks[i] for i in idx_test_arr if i < n_ibm]
+
     # ── 4. Optionally generate augmentation data ─────────────────────────────
     gen_data = []
     if args.augment:
@@ -987,16 +1370,57 @@ def main():
             H_all_e, y_all_e = encode_all_pyg_graphs(data_train, encoder_e, device)
             probe_e = train_mlp_probe(H_all_e, y_all_e, device)
 
+            # ── Direction 3: embedding separation diagnostic (Elliptic) ──────
+            if args.sep_check:
+                print("\n[Direction 3] SimCLR embedding separation diagnostic …")
+                _sep_labels_e = [d.y.item() for d in data_train]
+                _sep_e        = compute_embedding_separation(
+                                    data_train, _sep_labels_e, encoder_e, device)
+                print(f"  Silhouette score    : {_sep_e['silhouette']:.4f}")
+                print(f"  Linear probe AUC    : {_sep_e['linear_probe_auc']:.4f}")
+                if _sep_e["silhouette"] < 0.05:
+                    print("  WARNING: silhouette < 0.05 — guidance will be poorly class-conditioned.")
+                print()
+
+            _e_t_start = args.t_start if args.t_start is not None else 150
+            _e_gs = args.guidance_scale
+            _e_nw = args.novelty_weight
+            _e_dp = args.degree_penalty
+
+            # ── Direction 4: tune guidance hyperparameters (Elliptic) ────────
+            if args.tune_guidance:
+                from generation.generation import tune_guidance_params as _tune_e
+                print(f"\n[Direction 4] Tuning guidance params (Elliptic, "
+                      f"{args.tune_trials} trials) …")
+                _train_laund_e_pre = [g for g in data_train if g.y.item() == 1]
+                _H_laund_e_pre     = H_all_e[y_all_e == 1]
+                # Elliptic uses PyG graphs not IBM network dicts — pass as networks=None;
+                # the objective falls back gracefully if run_guided_generation can't seed.
+                _best_e, _ = _tune_e(
+                    list(data_train), encoder_e, probe_e,
+                    diff_model_e, diffusion_e, x_mean_e, x_std_e, H_all_e,
+                    _train_laund_e_pre, _H_laund_e_pre, device,
+                    n_trials=args.tune_trials,
+                    n_gen_per_trial=args.tune_gen_per_trial,
+                    t_start=_e_t_start,
+                    results_dir=ROOT_DIR / "results",
+                )
+                _e_gs = _best_e.get("guidance_scale", 2.0)
+                _e_nw = _best_e.get("novelty_weight", 2.0)
+                _e_dp = _best_e.get("degree_penalty", 0.5)
+                print(f"  Using tuned params: guidance_scale={_e_gs:.3f}  "
+                      f"novelty_weight={_e_nw:.3f}  degree_penalty={_e_dp:.3f}\n")
+
             _gen_kwargs_shared = dict(
                 n_gen=args.n_gen // 2,   # half per class for balanced augmentation
-                t_start=args.t_start if args.t_start is not None else 150,
+                t_start=_e_t_start,
             )
-            if args.guidance_scale is not None:
-                _gen_kwargs_shared["guidance_scale"] = args.guidance_scale
-            if args.novelty_weight is not None:
-                _gen_kwargs_shared["novelty_weight"] = args.novelty_weight
-            if args.degree_penalty is not None:
-                _gen_kwargs_shared["degree_penalty"] = args.degree_penalty
+            if _e_gs is not None:
+                _gen_kwargs_shared["guidance_scale"] = _e_gs
+            if _e_nw is not None:
+                _gen_kwargs_shared["novelty_weight"] = _e_nw
+            if _e_dp is not None:
+                _gen_kwargs_shared["degree_penalty"] = _e_dp
 
             # Generate for both classes to match the real class balance and
             # avoid biasing the augmented training set toward class 1.
@@ -1073,6 +1497,7 @@ def main():
                 from generation.generation import (
                     load_simclr_encoder, load_diffusion_model,
                     encode_all_networks, train_mlp_probe, run_guided_generation,
+                    tune_guidance_params,
                 )
                 encoder = load_simclr_encoder(device)
                 diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
@@ -1092,15 +1517,63 @@ def main():
                 H_all_n, y_all = encode_all_networks(train_ibm_nets, encoder, device)
                 probe = train_mlp_probe(H_all_n, y_all, device)
 
+                # ── Direction 3: embedding separation diagnostic ───────────
+                if args.sep_check:
+                    print("\n[Direction 3] SimCLR embedding separation diagnostic …")
+                    _sep_labels = [d.y.item() for d in data_train]
+                    _sep        = compute_embedding_separation(
+                                    data_train, _sep_labels, encoder, device)
+                    print(f"  Silhouette score    : {_sep['silhouette']:.4f}  "
+                          f"(>0.05 good, <0.05 poor class separation)")
+                    print(f"  Linear probe AUC    : {_sep['linear_probe_auc']:.4f}  "
+                          f"(>0.65 good, <0.65 guidance signal too weak)")
+                    if _sep["silhouette"] < 0.05:
+                        print("  WARNING: silhouette < 0.05 — encoder may not separate classes. "
+                              "Retrain SimCLR with higher supcon_weight (e.g. 1.0).")
+                    if _sep["linear_probe_auc"] < 0.65:
+                        print("  WARNING: linear probe AUC < 0.65 — guidance will be unreliable. "
+                              "Consider more SimCLR epochs or a larger encoder.")
+                    print()
+
+                # ── Direction 4: tune guidance hyperparameters ─────────────
+                _gs = args.guidance_scale
+                _nw = args.novelty_weight
+                _dp = args.degree_penalty
+
+                if args.tune_guidance:
+                    print(f"\n[Direction 4] Tuning guidance params "
+                          f"({args.tune_trials} trials × {args.tune_gen_per_trial} graphs) …")
+                    _train_laund_ibm_pre = [g for g in data_train if g.y.item() == 1]
+                    _H_laund_ibm_pre     = H_all_n[y_all == 1]
+                    _best_params, _history = tune_guidance_params(
+                        networks, encoder, probe, diff_model, diffusion,
+                        x_mean, x_std, H_all_n,
+                        _train_laund_ibm_pre, _H_laund_ibm_pre, device,
+                        n_trials=args.tune_trials,
+                        n_gen_per_trial=args.tune_gen_per_trial,
+                        t_start=_t_start,
+                        results_dir=ROOT_DIR / "results",
+                    )
+                    _gs = _best_params.get("guidance_scale", 2.0)
+                    _nw = _best_params.get("novelty_weight", 2.0)
+                    _dp = _best_params.get("degree_penalty", 0.5)
+                    print(f"  Using tuned params: guidance_scale={_gs:.3f}  "
+                          f"novelty_weight={_nw:.3f}  degree_penalty={_dp:.3f}\n")
+
                 # Generate for both classes (balanced) — avoids biasing the
                 # augmented training set toward class 1 only.
+                _gen_kwargs = dict(t_start=_t_start)
+                if _gs is not None: _gen_kwargs["guidance_scale"] = _gs
+                if _nw is not None: _gen_kwargs["novelty_weight"] = _nw
+                if _dp is not None: _gen_kwargs["degree_penalty"] = _dp
+
                 for _lbl in (1, 0):
                     _outs, _, _ = run_guided_generation(
                         networks, encoder, probe, diff_model, diffusion,
                         x_mean, x_std, H_all_n, device,
                         target_label=_lbl,
                         n_gen=args.n_gen // 2,
-                        t_start=_t_start,
+                        **_gen_kwargs,
                     )
                     for (x_denorm, adj_out, n_out, label) in _outs:
                         gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
@@ -1223,6 +1696,63 @@ def main():
             results[f"{model_name}_{condition}"] = {
                 k: _mean_std(v) for k, v in run_metrics.items()
             }
+
+    # ── 6b. FraudGT (IBM only — requires ego_id feature) ────────────────────
+    if fgt_train:
+        _fgt_cls = functools.partial(FraudGTClassifier, in_channels=FRAUDGT_IN_CHANNELS)
+        for condition in conditions:
+            if condition == "baseline":
+                fgt_tr = list(fgt_train)
+            elif condition == "augmented":
+                fgt_gen = [_to_fraudgt_format(g) for g in gen_data]
+                fgt_tr  = list(fgt_train) + fgt_gen
+                random.shuffle(fgt_tr)
+            elif condition == "selected":
+                fgt_gen = [_to_fraudgt_format(g) for g in gen_data_selected]
+                fgt_tr  = list(fgt_train) + fgt_gen
+                random.shuffle(fgt_tr)
+            else:
+                fgt_tr = list(fgt_train)
+
+            label_counts = {0: 0, 1: 0}
+            for d in fgt_tr:
+                label_counts[d.y.item()] += 1
+            print(f"[FraudGT / {condition}]  "
+                  f"train={len(fgt_tr)} "
+                  f"(clean={label_counts[0]}, laund={label_counts[1]})  "
+                  f"running {N_RUNS} seeds …")
+
+            run_metrics = {k: [] for k in ["auc", "f1", "precision", "recall"]}
+            for seed in range(N_RUNS):
+                m = run_experiment(fgt_tr, fgt_val, fgt_test, _fgt_cls, device, seed,
+                                   focal=args.focal_loss)
+                for k in run_metrics:
+                    run_metrics[k].append(m[k])
+                print(f"  seed {seed}: AUC={m['auc']:.3f}  F1={m['f1']:.3f}")
+
+            results[f"FraudGT_{condition}"] = {
+                k: _mean_std(v) for k, v in run_metrics.items()
+            }
+    else:
+        print("[FraudGT] skipped — only runs on IBM data (ego_id requires network dicts)")
+
+    # ── 6c. ExSTraQt (IBM only — requires transaction-level network dicts) ───
+    if xq_train_nets:
+        print(f"\n[ExSTraQt / baseline]  "
+              f"train={len(xq_train_nets)}  "
+              f"running {N_RUNS} seeds …")
+        run_metrics_xq = {k: [] for k in ["auc", "f1", "precision", "recall"]}
+        for seed in range(N_RUNS):
+            m = run_experiment_exstraqt(xq_train_nets, xq_val_nets, xq_test_nets, seed=seed)
+            for k in run_metrics_xq:
+                run_metrics_xq[k].append(m[k])
+            print(f"  seed {seed}: AUC={m['auc']:.3f}  F1={m['f1']:.3f}  [{m['_clf']}]")
+        results["ExSTraQt_baseline"] = {
+            k: _mean_std(v) for k, v in run_metrics_xq.items()
+            if k != "_clf"
+        }
+    else:
+        print("[ExSTraQt] skipped — only runs on IBM data (requires transaction dicts)")
 
     # ── 6. Report ────────────────────────────────────────────────────────────
     _print_table(results)

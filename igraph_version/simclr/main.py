@@ -23,7 +23,7 @@ if str(BASE_DIR) not in sys.path:
 from diffusion.model import DiffusionGNN
 from diffusion.diff_util import create_diffusion, network_to_dense
 
-from simclr import GraphEncoder, ProjectionHead, train_simclr_fast
+from simclr import GraphEncoder, ProjectionHead, train_simclr_fast, train_simclr_pbt
 from augmentation import build_igraph_from_transactions
 from util import preprocess_df, extract_networks_igraph
 
@@ -113,15 +113,21 @@ if __name__ == "__main__":
     # Load the trained diffusion model (optional — falls back gracefully if absent)
     diff_model, diffusion, x_mean, x_std = load_diffusion(device)
 
-    # in_dim=5: col 0 (laundering flag) stripped before encoder (label-leakage fix)
-    encoder   = GraphEncoder(in_dim=5, hidden_dim=64, out_dim=128).to(device)
+    # IBM: 11 node features, strip col 0 (laundering flag) → in_dim=10.
+    # 3-layer GCN, BatchNorm, mean+max pooling for class-separation capacity.
+    IN_DIM    = 10
+    encoder   = GraphEncoder(in_dim=IN_DIM, hidden_dim=128, out_dim=128,
+                             n_layers=3, use_bn=True).to(device)
     projector = ProjectionHead(in_dim=128, proj_dim=64).to(device)
 
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(projector.parameters()),
-        lr=1e-3,
+        lr=3e-4,
+        weight_decay=1e-4,
     )
 
+    # ── Standard training with all task-aware augmentation improvements ───────
+    # To run Population-Based Training instead, see the block below.
     train_simclr_fast(
         networks=networks,
         full_df=df_full,
@@ -130,14 +136,56 @@ if __name__ == "__main__":
         optimizer=optimizer,
         device=device,
         batch_size=128,
-        epochs=100,
+        epochs=200,
         checkpoint_dir=str(BASE_DIR.parent / "checkpoints" / "simclr_ibm"),
-        # Diffusion augmentation (ignored if diff_model is None)
+        checkpoint_interval=20,
+        # Supervised contrastive loss — dominant class-separation signal
+        supcon_weight=2.0,
+        supcon_temperature=0.07,
+        # Online probe: classification gradient flows into encoder + enables saliency
+        probe_weight=0.5,
+        # Classifier-guided diffusion views (n_steps=5 keeps overhead manageable)
+        view_type="guided",
+        diff_n_steps=5,
+        diff_t_start_frac=0.4,
+        diff_guidance_scale=1.5,
         diffusion_model=diff_model,
         diffusion=diffusion,
         x_mean=x_mean,
         x_std=x_std,
         p_diffusion=0.3,
-        diffusion_t_frac=0.3,
         max_nodes=300,
+        # LR schedule: warmup + cosine decay
+        warmup_epochs=10,
+        use_cosine_schedule=True,
+        # Task-aware augmentation
+        use_curriculum=True,
+        curriculum_epochs=80,       # ramp aug strength over first 80 epochs
+        use_motif_preserving=True,  # protect high-betweenness edges from dropping
+        use_saliency=True,          # probe-gradient node importance (needs probe_weight>0)
+        saliency_update_interval=20,
     )
+
+    # ── Population-Based Training (alternative — uncomment to use) ────────────
+    # Trains n_workers=4 models in sequence, each with a different augmentation
+    # config, and evolves configs toward better downstream probe accuracy.
+    # Expect ~4× longer wall time than standard training.
+    #
+    # encoder, projector, best_cfg = train_simclr_pbt(
+    #     networks=networks,
+    #     full_df=df_full,
+    #     device=device,
+    #     in_dim=IN_DIM,
+    #     n_workers=4,
+    #     gen_epochs=15,
+    #     n_generations=10,
+    #     perturb_factor=0.25,
+    #     batch_size=128,
+    #     checkpoint_dir=str(BASE_DIR.parent / "checkpoints" / "simclr_ibm_pbt"),
+    #     diffusion_model=diff_model,
+    #     diffusion=diffusion,
+    #     x_mean=x_mean,
+    #     x_std=x_std,
+    #     max_nodes=300,
+    # )
+    # print(f"PBT best aug config: {best_cfg}")
