@@ -1,9 +1,18 @@
 import math
+import sys
 import numpy as np
 import torch
+from pathlib import Path
 from masked_diffusion import GaussianDiffusion
 from masked_diffusion import ModelMeanType, ModelVarType, LossType
 import igraph as ig
+
+# Make igraph_version/ importable so patterns.detector can be found
+_IGRAPH_DIR = Path(__file__).resolve().parent.parent
+if str(_IGRAPH_DIR) not in sys.path:
+    sys.path.insert(0, str(_IGRAPH_DIR))
+
+from patterns.detector import compute_pattern_features
 
 def cosine_beta_schedule(T, s=0.008, max_beta=0.999):
     """
@@ -48,9 +57,9 @@ def create_diffusion(T=1000, schedule="cosine"):
 
 def network_to_dense(net):
     """
-    Convert a single network dict to (x [n, 11], adj [n,n]) dense tensors.
+    Convert a single network dict to (x [n, 19], adj [n,n]) dense tensors.
 
-    Node features (11 total):
+    Node features (19 total):
       col 0  — laundering flag (binary, excluded from classifier input)
       col 1  — normalised degree
       col 2  — normalised betweenness
@@ -63,15 +72,25 @@ def network_to_dense(net):
       col 9  — payment format entropy (diversity of payment types used)
       col 10 — temporal span in hours (normalised by 30 days)
 
-    The last 5 are derived from net["transactions"] when available;
-    they default to 0 for networks loaded from old caches that lack
-    the amount / payment-format columns.
+      AML typological pattern features (cols 11-18):
+      col 11 — out_degree_norm      (fan-out / structuring signal)
+      col 12 — in_degree_norm       (fan-in / aggregation signal)
+      col 13 — degree_asymmetry     (|out-in| / (out+in+1))
+      col 14 — is_passthrough       (in==1 & out==1, stack interior node)
+      col 15 — stack_depth_norm     (chain length / n)
+      col 16 — in_cycle             (SCC size > 1, round-tripping)
+      col 17 — scatter_gather_score (between fan-out upstream & fan-in downstream)
+      col 18 — bipartite_score      (graph-level fraction of cross-partition edges)
+
+    Cols 6-10 default to 0 for networks without transaction data.
+    Cols 11-17 default to 0 for networks without directed transaction data.
+    Col 18 is always computed from the undirected graph.
     """
     graph      = net["graph"]
     n          = graph.vcount()
     laundering = net["laundering_nodes"]
 
-    x = torch.zeros(n, 11)
+    x = torch.zeros(n, 19)
 
     # ── Topology features (cols 0-5) ─────────────────────────────────────────
     degrees_raw     = graph.degree()
@@ -149,6 +168,11 @@ def network_to_dense(net):
             if len(tss) > 1:
                 node_span  = (max(tss) - min(tss)) / 3600.0
                 x[i, 10]  = node_span / (30 * 24)
+
+    # ── AML typological pattern features (cols 11-18) ────────────────────────
+    pattern_feats = compute_pattern_features(net)   # [n, 8]
+    if pattern_feats.shape[0] == n:
+        x[:, 11:19] = pattern_feats
 
     # clamp to [0,1]: IBM data can have parallel edges (multigraph) so
     # get_adjacency() may return counts > 1 — we want a binary adjacency.

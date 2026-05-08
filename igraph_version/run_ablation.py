@@ -3,7 +3,7 @@ run_ablation.py
 ──────────────────────────────────────────────────────────────────────────────
 Orchestrates the full ablation study for the SimCLR + diffusion pipeline.
 
-Two families of ablations are run:
+Three families of ablations are run:
 
   A. SimCLR encoder ablations  (require re-training the encoder)
      Vary: augmentation type, supervised contrastive loss, diffusion views
@@ -12,6 +12,11 @@ Two families of ablations are run:
   B. Generation ablations  (use the default trained encoder, vary generation)
      Vary: guidance scale, novelty weight, degree penalty
      No retraining needed — only evaluate_classifiers.py is re-run.
+
+  C. AML pattern feature ablations  (IBM only, require re-training)
+     Systematically zero out each group of pattern features (fan-in/out,
+     stack, cycle, scatter-gather, bipartite) to isolate their contribution.
+     Compares pat_full vs. pat_none vs. each individual group removed.
 
 Results are written to:
   checkpoints/simclr_elliptic_ablation/<condition>/best_model.pt  (encoders)
@@ -30,6 +35,12 @@ Usage
 
   # Quick smoke test with fewer epochs and graphs
   python run_ablation.py --dataset elliptic --n-gen 10 --epochs 10 --low-data 0.2
+
+  # Run only AML pattern feature ablations (IBM, Part C)
+  python run_ablation.py --dataset ibm --n-gen 40 --pattern-only
+
+  # Run a specific pattern condition
+  python run_ablation.py --dataset ibm --n-gen 40 --pattern-only --conditions pat_none pat_full
 """
 
 import argparse
@@ -160,6 +171,48 @@ IBM_ENCODER_CONDITIONS = [
 # Kept for backwards compatibility — used when dataset is not "ibm"
 ENCODER_CONDITIONS = ELLIPTIC_ENCODER_CONDITIONS
 
+# ── AML pattern feature ablations (IBM only — requires directed tx data) ──────
+# Each entry removes one group of AML typological pattern features (cols 11-18)
+# and retrains the encoder.  Comparing each variant to "full" shows the
+# individual contribution of each pattern type to classification performance.
+IBM_PATTERN_CONDITIONS = [
+    (
+        "pat_full",
+        "All 8 AML pattern features active (reference for pattern ablation)",
+        [],
+    ),
+    (
+        "pat_none",
+        "No AML pattern features at all (cols 11-18 zeroed) — measures total contribution",
+        ["--no-pattern-features"],
+    ),
+    (
+        "pat_no_fan",
+        "No fan-out / fan-in / asymmetry features (cols 11-13 zeroed)",
+        ["--no-fan-features"],
+    ),
+    (
+        "pat_no_stack",
+        "No stack / passthrough / chain-depth features (cols 14-15 zeroed)",
+        ["--no-stack-features"],
+    ),
+    (
+        "pat_no_cycle",
+        "No in-cycle feature (col 16 zeroed) — round-tripping / U-turn signal",
+        ["--no-cycle-feature"],
+    ),
+    (
+        "pat_no_sg",
+        "No scatter-gather score (col 17 zeroed) — bipartite fan-out→fan-in bridge",
+        ["--no-sg-feature"],
+    ),
+    (
+        "pat_no_bipartite",
+        "No graph-level bipartite score (col 18 zeroed)",
+        ["--no-bipartite-feature"],
+    ),
+]
+
 # Each entry: (condition_name, description, extra_eval_args)
 # These all use the DEFAULT trained encoder (checkpoints/simclr_elliptic)
 GENERATION_CONDITIONS = [
@@ -289,6 +342,8 @@ def main():
                         help="Only run generation ablations (skip encoder ablations)")
     parser.add_argument("--encoder-only", action="store_true",
                         help="Only run encoder ablations (skip generation ablations)")
+    parser.add_argument("--pattern-only", action="store_true",
+                        help="Only run AML pattern feature ablations (IBM only, skip other parts)")
     parser.add_argument("--conditions", nargs="*", default=None,
                         help="Run only these named conditions (subset of all)")
     args = parser.parse_args()
@@ -394,6 +449,61 @@ def main():
             if not ok:
                 failures.append(f"eval:{condition}")
             all_results[condition] = _read_csv_results(condition, args.dataset)
+
+    # ── C. AML pattern feature ablations (IBM only) ──────────────────────────
+    run_pattern = (
+        not args.gen_only
+        and not args.encoder_only
+        and (args.pattern_only or args.dataset in ("ibm", "both"))
+    )
+    if run_pattern:
+        print("\n" + "="*60)
+        print("PART C: AML Pattern Feature Ablations  [IBM]")
+        print("  Trains one encoder per pattern group, each with that group zeroed out.")
+        print("  Compare every row to pat_full to see individual feature contributions.")
+        print("="*60)
+
+        pat_ckpt_root = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
+        pat_ckpt_root.mkdir(parents=True, exist_ok=True)
+
+        for condition, description, extra_train_args in IBM_PATTERN_CONDITIONS:
+            if args.conditions and condition not in args.conditions:
+                continue
+
+            ckpt_dir  = pat_ckpt_root / condition
+            best_ckpt = ckpt_dir / "best_model.pt"
+
+            # C1. Train encoder with selected pattern features zeroed out
+            if not (args.skip_training and best_ckpt.exists()):
+                ok = _run(
+                    [IBM_TRAIN_SCRIPT,
+                     "--condition", condition,
+                     "--epochs",    str(args.epochs),
+                     ] + extra_train_args,
+                    f"Train IBM encoder [pattern ablation]: {condition} — {description}",
+                )
+                if not ok:
+                    failures.append(f"train:{condition}")
+                    continue
+            else:
+                print(f"\n[skip] Pattern ablation checkpoint exists for '{condition}'")
+
+            # C2. Evaluate
+            label = f"pat_{condition}" if not condition.startswith("pat_") else condition
+            ok = _run(
+                [EVAL_SCRIPT,
+                 "--dataset",        "ibm",
+                 "--augment",
+                 "--n-gen",          str(args.n_gen),
+                 "--encoder-dir",    str(ckpt_dir),
+                 "--ablation-label", label,
+                 "--low-data",       str(args.low_data),
+                 ],
+                f"Evaluate (pattern ablation): {condition}",
+            )
+            if not ok:
+                failures.append(f"eval:{condition}")
+            all_results[label] = _read_csv_results(label, "ibm")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     _print_summary(all_results)

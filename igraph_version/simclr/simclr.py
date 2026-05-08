@@ -62,7 +62,7 @@ def network_to_pyg_data_fast(network):
         edge_index = torch.zeros(2, 0, dtype=torch.long)
 
     # Use precomputed features if available, size matches, and dim matches current schema
-    _TARGET_DIM = 11
+    _TARGET_DIM = 19
     if ("x_dense" in network and network["x_dense"] is not None
             and network["x_dense"].shape[0] == n
             and network["x_dense"].shape[1] == _TARGET_DIM):

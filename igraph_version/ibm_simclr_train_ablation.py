@@ -64,7 +64,7 @@ def _cache_stale(nets):
     for n in nets:
         xd = n.get("x_dense")
         if xd is not None:
-            return xd.shape[1] != 11
+            return xd.shape[1] != 19
     return False
 
 
@@ -106,7 +106,7 @@ def _load_diffusion(device):
     model_path = BASE_DIR / "checkpoints" / "diffusion_ibm" / "model.pt"
     if not model_path.exists():
         print(f"[diffusion] Checkpoint not found at {model_path} — diffusion views disabled.")
-        return None, None, None, None, 11
+        return None, None, None, None, 19
 
     try:
         from diffusion.model     import DiffusionGNN
@@ -125,7 +125,42 @@ def _load_diffusion(device):
 
     except Exception as e:
         print(f"[diffusion] Load failed ({e}) — diffusion views disabled.")
-        return None, None, None, None, 11
+        return None, None, None, None, 19
+
+
+# ── pattern feature masking ────────────────────────────────────────────────────
+
+# Column indices of the 8 AML pattern features inside the 19-dim x_dense tensor.
+# These match the layout defined in network_to_dense() / detector.py.
+_PAT_COLS = {
+    "fan_out":       [11],        # out_degree_norm
+    "fan_in":        [12],        # in_degree_norm
+    "fan_asymmetry": [13],        # degree_asymmetry
+    "stack":         [14, 15],    # is_passthrough + stack_depth_norm
+    "cycle":         [16],        # in_cycle (SCC size > 1)
+    "scatter_gather":[17],        # scatter_gather_score
+    "bipartite":     [18],        # bipartite_score
+}
+_PAT_ALL_COLS = list(range(11, 19))
+
+
+def _apply_pattern_masking(networks, cols_to_zero):
+    """
+    Force-compute x_dense for every network then zero out the specified
+    pattern feature columns.  This must be called before training so that
+    network_to_pyg_data_fast picks up the masked cache instead of
+    recomputing from network_to_dense.
+    """
+    if not cols_to_zero:
+        return
+    from diffusion.diff_util import network_to_dense
+
+    for net in networks:
+        if "x_dense" not in net or net["x_dense"] is None:
+            x, _ = network_to_dense(net)
+            net["x_dense"] = x
+        for col in cols_to_zero:
+            net["x_dense"][:, col] = 0.0
 
 
 # ── training ──────────────────────────────────────────────────────────────────
@@ -143,6 +178,20 @@ def train(args, device):
     networks = _load_networks(args.ibm_csv)
     n_laund  = sum(len(n["laundering_nodes"]) > 0 for n in networks)
     print(f"  {len(networks)} networks  ({n_laund} laundering, {len(networks)-n_laund} clean)")
+
+    # ── pattern feature masking (ablation) ────────────────────────────────────
+    cols_to_zero = []
+    if args.no_pattern_features:
+        cols_to_zero = _PAT_ALL_COLS
+    else:
+        if args.no_fan_features:        cols_to_zero += _PAT_COLS["fan_out"] + _PAT_COLS["fan_in"] + _PAT_COLS["fan_asymmetry"]
+        if args.no_stack_features:      cols_to_zero += _PAT_COLS["stack"]
+        if args.no_cycle_feature:       cols_to_zero += _PAT_COLS["cycle"]
+        if args.no_sg_feature:          cols_to_zero += _PAT_COLS["scatter_gather"]
+        if args.no_bipartite_feature:   cols_to_zero += _PAT_COLS["bipartite"]
+    if cols_to_zero:
+        print(f"  [pattern ablation] zeroing cols {sorted(set(cols_to_zero))} in x_dense …")
+        _apply_pattern_masking(networks, list(set(cols_to_zero)))
 
     # ── diffusion model ────────────────────────────────────────────────────────
     diff_model, diffusion, x_mean, x_std, node_dim = _load_diffusion(device)
@@ -235,6 +284,19 @@ if __name__ == "__main__":
     # Data path override
     parser.add_argument("--ibm-csv",       type=str,   default=DEFAULT_CSV,
                         help="Path to IBM transactions CSV (default: LI-Small_Trans.csv)")
+    # ── AML pattern feature ablation flags ────────────────────────────────────
+    parser.add_argument("--no-pattern-features",  action="store_true",
+                        help="Zero out ALL AML pattern features (cols 11-18) — full removal ablation")
+    parser.add_argument("--no-fan-features",      action="store_true",
+                        help="Zero out fan-out/fan-in/asymmetry features (cols 11-13)")
+    parser.add_argument("--no-stack-features",    action="store_true",
+                        help="Zero out stack/passthrough/chain-depth features (cols 14-15)")
+    parser.add_argument("--no-cycle-feature",     action="store_true",
+                        help="Zero out in-cycle feature (col 16)")
+    parser.add_argument("--no-sg-feature",        action="store_true",
+                        help="Zero out scatter-gather score (col 17)")
+    parser.add_argument("--no-bipartite-feature", action="store_true",
+                        help="Zero out bipartite score (col 18)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
