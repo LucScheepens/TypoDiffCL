@@ -55,7 +55,7 @@ def create_diffusion(T=1000, schedule="cosine"):
 
     return diffusion
 
-def network_to_dense(net):
+def network_to_dense(net, skip_patterns=False):
     """
     Convert a single network dict to (x [n, 19], adj [n,n]) dense tensors.
 
@@ -95,7 +95,7 @@ def network_to_dense(net):
     # ── Topology features (cols 0-5) ─────────────────────────────────────────
     degrees_raw     = graph.degree()
     max_deg         = max(max(degrees_raw), 1) if degrees_raw else 1
-    betweenness_raw = graph.betweenness(directed=False)
+    betweenness_raw = graph.betweenness(directed=graph.is_directed())
     betw_denom      = max(1.0, (n - 1) * (n - 2) / 2)
     clustering_raw  = graph.transitivity_local_undirected(mode="zero")
     pagerank_raw    = graph.pagerank()
@@ -170,9 +170,10 @@ def network_to_dense(net):
                 x[i, 10]  = node_span / (30 * 24)
 
     # ── AML typological pattern features (cols 11-18) ────────────────────────
-    pattern_feats = compute_pattern_features(net)   # [n, 8]
-    if pattern_feats.shape[0] == n:
-        x[:, 11:19] = pattern_feats
+    if not skip_patterns:
+        pattern_feats = compute_pattern_features(net)   # [n, 8]
+        if pattern_feats.shape[0] == n:
+            x[:, 11:19] = pattern_feats
 
     # clamp to [0,1]: IBM data can have parallel edges (multigraph) so
     # get_adjacency() may return counts > 1 — we want a binary adjacency.
@@ -195,11 +196,11 @@ def preprocess(networks, save_path="cached_dataset.pt"):
 
 def build_igraph_from_transactions(tx_df):
     """
-    Build an undirected igraph graph from transactions dataframe.
+    Build a directed igraph graph from transactions dataframe.
     """
     g = ig.Graph.DataFrame(
         tx_df[["From_Account_int", "To_Account_int"]],
-        directed=False,
+        directed=True,
         use_vids=False
     )
     return g

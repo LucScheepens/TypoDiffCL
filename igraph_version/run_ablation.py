@@ -41,6 +41,12 @@ Usage
 
   # Run a specific pattern condition
   python run_ablation.py --dataset ibm --n-gen 40 --pattern-only --conditions pat_none pat_full
+
+  # Run all ablations but evaluate only one classifier (much faster)
+  python run_ablation.py --dataset ibm --n-gen 40 --classifier ExSTraQt
+
+  # Combine with other filters
+  python run_ablation.py --dataset elliptic --n-gen 40 --gen-only --classifier GIN GraphSAGE
 """
 
 import argparse
@@ -332,9 +338,9 @@ def main():
                              "Elliptic uses elliptic_simclr_train_ablation.py.")
     parser.add_argument("--n-gen",    type=int,   default=40,
                         help="Generated graphs per condition (default 40)")
-    parser.add_argument("--low-data", type=float, default=1.0,
+    parser.add_argument("--low-data", type=float, default=0.01,
                         help="Training data fraction, e.g. 0.2 for low-data regime")
-    parser.add_argument("--epochs",   type=int,   default=10,
+    parser.add_argument("--epochs",   type=int,   default=100,
                         help="SimCLR training epochs per condition (default 100)")
     parser.add_argument("--skip-training", action="store_true",
                         help="Skip SimCLR retraining if checkpoints already exist")
@@ -346,9 +352,18 @@ def main():
                         help="Only run AML pattern feature ablations (IBM only, skip other parts)")
     parser.add_argument("--conditions", nargs="*", default=None,
                         help="Run only these named conditions (subset of all)")
+    parser.add_argument("--classifier", nargs="+", default=None,
+                        metavar="MODEL",
+                        help="Restrict evaluation to these classifiers, e.g. "
+                             "--classifier GIN ExSTraQt. "
+                             "Valid: GIN, GraphTransformer, GraphSAGE, DeepSets, "
+                             "FraudGT, ExSTraQt. Default: all.")
     args = parser.parse_args()
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Extra args forwarded to every evaluate_classifiers.py call
+    _classifier_args = (["--models"] + args.classifier) if args.classifier else []
 
     # ── Select dataset-specific config ───────────────────────────────────────
     if args.dataset == "ibm":
@@ -404,7 +419,7 @@ def main():
                  "--encoder-dir",    str(ckpt_dir),
                  "--ablation-label", label,
                  "--low-data",       str(args.low_data),
-                 ],
+                 ] + _classifier_args,
                 f"Evaluate (augmented): {condition}",
             )
             if not ok:
@@ -419,7 +434,7 @@ def main():
                  "--dataset",        args.dataset,
                  "--ablation-label", label,
                  "--low-data",       str(args.low_data),
-                 ],
+                 ] + _classifier_args,
                 "Evaluate (baseline, no augmentation)",
             )
             if not ok:
@@ -443,7 +458,7 @@ def main():
                  "--n-gen",          str(args.n_gen),
                  "--ablation-label", condition,
                  "--low-data",       str(args.low_data),
-                 ] + extra_eval_args,
+                 ] + extra_eval_args + _classifier_args,
                 f"Evaluate: {condition} — {description}",
             )
             if not ok:
@@ -498,7 +513,7 @@ def main():
                  "--encoder-dir",    str(ckpt_dir),
                  "--ablation-label", label,
                  "--low-data",       str(args.low_data),
-                 ],
+                 ] + _classifier_args,
                 f"Evaluate (pattern ablation): {condition}",
             )
             if not ok:

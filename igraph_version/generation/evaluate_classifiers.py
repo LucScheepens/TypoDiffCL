@@ -43,8 +43,11 @@ Conditions
                (e.g. 0.2 = 20 %).  Augmentation benefit is most visible when
                labelled data is scarce.
 
-Input node features (5, structural — laundering label excluded to prevent leakage)
-  degree, betweenness, clustering, PageRank, assortativity
+Input node features (18 — laundering label col 0 excluded to prevent leakage)
+  degree, betweenness, clustering, PageRank, assortativity,
+  log_mean_amount, log_max_amount, tx_count, fmt_entropy, temporal_span,
+  out_degree_norm, in_degree_norm, degree_asymmetry, is_passthrough,
+  stack_depth_norm, in_cycle, scatter_gather_score, bipartite_score
 
 Graph label
   1 = network contains at least one laundering node
@@ -102,7 +105,7 @@ from augmentation import build_igraph_from_transactions
 
 # ── hyper-parameters ──────────────────────────────────────────────────────────
 CSV_PATH    = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"  # default
-IN_CHANNELS        = 10       # topology (5) + transaction features (5)
+IN_CHANNELS        = 18       # topology (5) + transaction (5) + AML patterns (8)
 FRAUDGT_IN_CHANNELS = IN_CHANNELS + 1   # +1 for ego_id feature
 HIDDEN      = 64
 NUM_LAYERS  = 3
@@ -478,12 +481,18 @@ def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
     """
     x_np = x_denorm[:n_out].float().numpy().copy()
 
+    # Pad to IN_CHANNELS if the diffusion model was trained on fewer features
+    # (e.g. NODE_DIM=6 → 5 usable features after stripping the label column).
+    if x_np.shape[1] < IN_CHANNELS:
+        pad  = np.zeros((x_np.shape[0], IN_CHANNELS - x_np.shape[1]), dtype=np.float32)
+        x_np = np.concatenate([x_np, pad], axis=1)
+
     adj_np = adj_out[:n_out, :n_out]
     adj_np = adj_np.numpy() if isinstance(adj_np, torch.Tensor) else np.array(adj_np, dtype=float)
 
-    # Symmetrise and threshold the generated adjacency for edge_index extraction.
-    # The model output is a continuous density — treat values > 0.5 as edges.
-    adj_s = np.clip(adj_np + adj_np.T, 0, 1).astype(float)
+    # Threshold the generated adjacency for edge_index extraction.
+    # Directed — do NOT symmetrise (adj_np is already the directed output).
+    adj_s = np.clip(adj_np, 0, 1).astype(float)
     np.fill_diagonal(adj_s, 0)
 
     ei = _adj_to_edge_index(adj_s)
@@ -653,17 +662,106 @@ def _get_net_label(net):
     return int(len(net.get("laundering_nodes", set())) > 0)
 
 
-def run_experiment_exstraqt(train_nets, val_nets, test_nets, seed=0):
+def _extract_exstraqt_features_from_pyg(data):
+    """
+    Approximate ExSTraQt features from a generated PyG Data object.
+    Used for generated graphs that lack raw transaction-level network dicts.
+
+    Node feature column mapping (18 cols, col 0 = laundering label excluded):
+      0=degree  1=betweenness  2=clustering  3=PageRank  4=assortativity
+      5=log_mean_amount  6=log_max_amount  7=tx_count  8=fmt_entropy
+      9=temporal_span  10=out_degree_norm  11=in_degree_norm
+      12=degree_asymmetry  13=is_passthrough  14=stack_depth_norm
+      15=in_cycle  16=scatter_gather_score  17=bipartite_score
+    """
+    feat = dict.fromkeys(_EXSTRAQT_FEAT_NAMES, 0.0)
+    x  = data.x.numpy()
+    ei = data.edge_index.numpy()
+    n, e = x.shape[0], ei.shape[1]
+
+    try:
+        import igraph as ig
+        edges   = list(zip(ei[0].tolist(), ei[1].tolist())) if e > 0 else []
+        g       = ig.Graph(n=n, edges=edges, directed=True)
+        out_deg = np.array(g.outdegree())
+        in_deg  = np.array(g.indegree())
+        deg     = out_deg + in_deg
+        feat["density"] = float(g.density()) if n > 1 else 0.0
+        a = g.assortativity_degree(directed=False)
+        feat["assortativity"] = 0.0 if (a is None or np.isnan(float(a))) else float(a)
+        try:
+            feat["num_biconn"] = float(len(list(g.biconnected_components())))
+        except Exception:
+            feat["num_biconn"] = 1.0
+        try:
+            feat["num_articulation_points"] = float(len(g.articulation_points()))
+        except Exception:
+            pass
+    except ImportError:
+        out_deg = np.bincount(ei[0], minlength=n) if e > 0 else np.zeros(n, dtype=np.int64)
+        in_deg  = np.bincount(ei[1], minlength=n) if e > 0 else np.zeros(n, dtype=np.int64)
+        deg     = out_deg + in_deg
+        feat["density"]   = float(e / (n * (n - 1))) if n > 1 else 0.0
+        feat["num_biconn"] = 1.0
+
+    feat["num_nodes"]   = float(n)
+    feat["num_edges"]   = float(e)
+    feat["max_degree"]  = float(deg.max())  if n > 0 else 0.0
+    feat["mean_degree"] = float(deg.mean()) if n > 0 else 0.0
+
+    is_pt = x[:, 13] > 0.5 if x.shape[1] > 13 else np.zeros(n, dtype=bool)
+    feat["num_passthrough"]  = float(is_pt.sum())
+    feat["num_sources"]      = float(np.sum((out_deg > 0) & (in_deg == 0)))
+    feat["num_targets"]      = float(np.sum((in_deg > 0) & (out_deg == 0)))
+    feat["num_transactions"] = float(e)
+
+    if x.shape[1] > 6:
+        log_mean_a = x[:, 5]
+        log_max_a  = x[:, 6]
+        feat["log_amount_mean"] = float(log_mean_a.mean())
+        feat["log_amount_std"]  = float(log_mean_a.std())
+        amounts = np.expm1(np.clip(log_mean_a, 0, 20))
+        feat["amount_mean"]   = float(amounts.mean())
+        feat["amount_max"]    = float(np.expm1(np.clip(log_max_a.max(), 0, 20)))
+        feat["amount_std"]    = float(amounts.std())
+        feat["amount_median"] = float(np.median(amounts))
+
+    if x.shape[1] > 9:
+        ts = x[:, 9]
+        feat["ts_range_hours"] = float(ts.max())
+        feat["ts_std_hours"]   = float(ts.std())
+
+    return np.array([feat[k] for k in _EXSTRAQT_FEAT_NAMES], dtype=np.float32)
+
+
+def _exstraqt_features(item):
+    """Route to the right feature extractor: network dict or PyG Data."""
+    if isinstance(item, Data):
+        return _extract_exstraqt_features_from_pyg(item)
+    return _extract_exstraqt_features(item)
+
+
+def _exstraqt_label(item):
+    """Extract label from a network dict or a PyG Data object."""
+    if isinstance(item, Data):
+        return int(item.y.item())
+    return _get_net_label(item)
+
+
+def run_experiment_exstraqt(train_items, val_nets, test_nets, seed=0):
     """
     Train and evaluate an ExSTraQt-style gradient-boosted classifier.
 
     Uses XGBoost if available, otherwise sklearn HistGradientBoostingClassifier.
     Threshold is tuned on the validation set (same protocol as GNN experiments).
 
+    train_items may be a mix of IBM network dicts and PyG Data objects (generated
+    graphs); val_nets / test_nets are always IBM network dicts.
+
     Returns a metrics dict with keys: auc, f1, precision, recall.
     """
-    X_train = np.stack([_extract_exstraqt_features(n) for n in train_nets])
-    y_train = np.array([_get_net_label(n) for n in train_nets])
+    X_train = np.stack([_exstraqt_features(n) for n in train_items])
+    y_train = np.array([_exstraqt_label(n)    for n in train_items])
     X_val   = np.stack([_extract_exstraqt_features(n) for n in val_nets])
     y_val   = np.array([_get_net_label(n) for n in val_nets])
     X_test  = np.stack([_extract_exstraqt_features(n) for n in test_nets])
@@ -1107,6 +1205,12 @@ def main():
     parser.add_argument("--tune-gen-per-trial", type=int, default=6, metavar="K",
                         help="Graphs generated per tuning trial for Q-score estimation "
                              "(default 6). Higher = less variance but linearly more compute.")
+    parser.add_argument("--models", nargs="+", default=None,
+                        metavar="MODEL",
+                        help="Run only the listed classifiers, e.g. "
+                             "--models GIN ExSTraQt. "
+                             "Valid names: GIN, GraphTransformer, GraphSAGE, DeepSets, "
+                             "FraudGT, ExSTraQt. Default: all.")
     args = parser.parse_args()
 
     if args.augment_select:
@@ -1654,12 +1758,17 @@ def main():
         print(f"Selection gains saved → {gains_path}")
 
     # ── 6. Run experiments ───────────────────────────────────────────────────
-    models     = [
+    _model_filter = {m.lower() for m in args.models} if args.models else None
+
+    models = [
         ("GIN",              GINClassifier),
         ("GraphTransformer", GraphTransformerClassifier),
         ("GraphSAGE",        GraphSAGEClassifier),
         ("DeepSets",         DeepSetsClassifier),
     ]
+    if _model_filter is not None:
+        models = [(n, c) for n, c in models if n.lower() in _model_filter]
+
     conditions = ["baseline"]
     if args.augment:
         conditions.append("augmented")
@@ -1698,7 +1807,7 @@ def main():
             }
 
     # ── 6b. FraudGT (IBM only — requires ego_id feature) ────────────────────
-    if fgt_train:
+    if fgt_train and (_model_filter is None or "fraudgt" in _model_filter):
         _fgt_cls = functools.partial(FraudGTClassifier, in_channels=FRAUDGT_IN_CHANNELS)
         for condition in conditions:
             if condition == "baseline":
@@ -1737,20 +1846,32 @@ def main():
         print("[FraudGT] skipped — only runs on IBM data (ego_id requires network dicts)")
 
     # ── 6c. ExSTraQt (IBM only — requires transaction-level network dicts) ───
-    if xq_train_nets:
-        print(f"\n[ExSTraQt / baseline]  "
-              f"train={len(xq_train_nets)}  "
-              f"running {N_RUNS} seeds …")
-        run_metrics_xq = {k: [] for k in ["auc", "f1", "precision", "recall"]}
-        for seed in range(N_RUNS):
-            m = run_experiment_exstraqt(xq_train_nets, xq_val_nets, xq_test_nets, seed=seed)
-            for k in run_metrics_xq:
-                run_metrics_xq[k].append(m[k])
-            print(f"  seed {seed}: AUC={m['auc']:.3f}  F1={m['f1']:.3f}  [{m['_clf']}]")
-        results["ExSTraQt_baseline"] = {
-            k: _mean_std(v) for k, v in run_metrics_xq.items()
-            if k != "_clf"
-        }
+    if xq_train_nets and (_model_filter is None or "exstraqt" in _model_filter):
+        for condition in conditions:
+            if condition == "baseline":
+                xq_tr = list(xq_train_nets)
+            elif condition == "augmented":
+                xq_tr = list(xq_train_nets) + list(gen_data)
+                random.shuffle(xq_tr)
+            elif condition == "selected":
+                xq_tr = list(xq_train_nets) + list(gen_data_selected)
+                random.shuffle(xq_tr)
+            else:
+                xq_tr = list(xq_train_nets)
+
+            print(f"\n[ExSTraQt / {condition}]  "
+                  f"train={len(xq_tr)}  "
+                  f"running {N_RUNS} seeds …")
+            run_metrics_xq = {k: [] for k in ["auc", "f1", "precision", "recall"]}
+            for seed in range(N_RUNS):
+                m = run_experiment_exstraqt(xq_tr, xq_val_nets, xq_test_nets, seed=seed)
+                for k in run_metrics_xq:
+                    run_metrics_xq[k].append(m[k])
+                print(f"  seed {seed}: AUC={m['auc']:.3f}  F1={m['f1']:.3f}  [{m['_clf']}]")
+            results[f"ExSTraQt_{condition}"] = {
+                k: _mean_std(v) for k, v in run_metrics_xq.items()
+                if k != "_clf"
+            }
     else:
         print("[ExSTraQt] skipped — only runs on IBM data (requires transaction dicts)")
 

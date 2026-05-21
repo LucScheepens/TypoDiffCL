@@ -226,7 +226,6 @@ class GaussianDiffusion:
             p_edge = p_edge.clamp(0.01, 0.5)
         rand_adj  = th.bernoulli(th.full_like(adj_start, p_edge.item()))
         adj_t = keep_adj * adj_start + (1 - keep_adj) * rand_adj
-        adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2          # keep symmetric
 
         if node_mask is not None:
             adj_t = adj_t * node_mask[:, :, None] * node_mask[:, None, :]
@@ -425,7 +424,6 @@ class GaussianDiffusion:
         adj_stoch   = th.bernoulli(adj_pred.clamp(0.0, 1.0))
         adj_determ  = (adj_pred > 0.5).float()
         adj_sample  = th.where(nonzero_adj.bool(), adj_stoch, adj_determ)
-        adj_sample  = (adj_sample + adj_sample.transpose(-1, -2)) / 2  # symmetric
 
         if node_mask is not None:
             adj_sample = adj_sample * node_mask[:, :, None] * node_mask[:, None, :]
@@ -481,7 +479,6 @@ class GaussianDiffusion:
         if adj_shape is not None:
             init_p = float(adj_init_p) if adj_init_p is not None else 0.5
             adj = th.bernoulli(th.full(adj_shape, init_p, device=device))
-            adj = (adj + adj.transpose(-1, -2)) / 2
             node_mask = model_kwargs.get("node_mask")
             if node_mask is not None:
                 adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
@@ -569,7 +566,6 @@ class GaussianDiffusion:
         if adj_shape is not None:
             init_p = float(adj_init_p) if adj_init_p is not None else 0.5
             adj    = th.bernoulli(th.full(adj_shape, init_p, device=device))
-            adj    = (adj + adj.transpose(-1, -2)) / 2
             node_mask = model_kwargs.get("node_mask")
             if node_mask is not None:
                 adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
@@ -642,7 +638,6 @@ class GaussianDiffusion:
                         adj = th.bernoulli(ap)
                     else:
                         adj = (ap > 0.5).float()
-                    adj = (adj + adj.transpose(-1, -2)) / 2
                     if node_mask is not None:
                         adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
 
@@ -744,9 +739,6 @@ class GaussianDiffusion:
                         rand_ghost_adj = (
                             th.bernoulli(th.full_like(adj_t, 0.5)) * ghost_edge_mask
                         )
-                        rand_ghost_adj = (
-                            rand_ghost_adj + rand_ghost_adj.transpose(-1, -2)
-                        ) / 2
                         adj_t = (adj_t + rand_ghost_adj).clamp(0.0, 1.0)
         else:
             node_mask_t = None

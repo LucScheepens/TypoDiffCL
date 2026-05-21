@@ -55,7 +55,7 @@ def network_to_pyg_data_fast(network):
     if elist:
         srcs, dsts = zip(*elist)
         edge_index = torch.tensor(
-            [list(srcs) + list(dsts), list(dsts) + list(srcs)],
+            [list(srcs), list(dsts)],
             dtype=torch.long,
         )
     else:
@@ -74,17 +74,25 @@ def network_to_pyg_data_fast(network):
             x[i, 0] = float(names[i] in laundering)
             x[i, 1] = degrees[i] / max_deg
     else:
-        # Recompute from network_to_dense (handles all feature dimensions correctly)
+        # If the parent network has a cached x_dense but n changed (crop/node-delete
+        # augmentation produced a different-size view), skip expensive SCC/BFS pattern
+        # recomputation — pattern cols stay zero for this augmented view only.
+        _parent_has_cache = (
+            "x_dense" in network and network["x_dense"] is not None
+            and network["x_dense"].shape[0] != n
+            and network["x_dense"].shape[1] == _TARGET_DIM
+        )
         from diffusion.diff_util import network_to_dense as _ntd
-        x, _ = _ntd(network)
+        x, _ = _ntd(network, skip_patterns=_parent_has_cache)
         # Refresh laundering flag in case augmentation changed the graph
         degrees = g.degree()
         max_deg = max(max(degrees), 1)
         for i in range(n):
             x[i, 0] = float(names[i] in laundering)
             x[i, 1] = degrees[i] / max_deg
-        # Cache for future calls within this session
-        network["x_dense"] = x
+        # Only cache when this is the original network (not a smaller augmented view)
+        if not _parent_has_cache:
+            network["x_dense"] = x
 
     # Strip col 0 (laundering flag) — the label must not flow through the GCN
     # layers, only through the SupCon loss term where it is used as a label signal.
@@ -261,10 +269,11 @@ def sup_con_loss(z, labels, temperature=0.07):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_connected_ei(edge_index, n_nodes):
-    """Return True iff the undirected graph described by edge_index is connected.
+    """Return True iff the graph described by edge_index is weakly connected.
 
+    Treats all edges as undirected for the connectivity check — a directed graph
+    is weakly connected if its underlying undirected graph is connected.
     Uses iterative DFS — O(V+E), no external dependencies.
-    edge_index must be a 2×E int tensor (both (i,j) and (j,i) rows expected).
     """
     if n_nodes <= 1:
         return True
@@ -274,6 +283,7 @@ def _is_connected_ei(edge_index, n_nodes):
     for s, d in edge_index.T.tolist():
         if 0 <= s < n_nodes and 0 <= d < n_nodes:
             adj[s].append(d)
+            adj[d].append(s)  # treat as undirected for weak connectivity
     visited = {0}
     stack = [0]
     while stack:
@@ -420,8 +430,7 @@ def _diffusion_view_multistep(
                 noise_cont = (x_t[..., 1:] - sqrt_ab_t * x0_pred[..., 1:]) / sqrt_1m_t
                 x_next_cont = sqrt_ab_s * x0_pred[..., 1:] + sqrt_1m_s * noise_cont
                 x_t   = torch.cat([x0_bin, x_next_cont], dim=-1) * mask.unsqueeze(-1)
-                adj_t = torch.bernoulli(adj_pred.clamp(0, 1))
-                adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2 * mask[:, :, None] * mask[:, None, :]
+                adj_t = torch.bernoulli(adj_pred.clamp(0, 1)) * mask[:, :, None] * mask[:, None, :]
 
     if was_training:
         diff_model.train()
@@ -507,8 +516,11 @@ def _diffusion_view_guided(
                     ei_g = ei_g[:, ei_g[0] != ei_g[1]]
                 if ei_g.shape[1] == 0:
                     ei_g = torch.zeros(2, 0, dtype=torch.long, device=device)
-                # Strip col 0 before passing to encoder (matches fixed network_to_pyg_data_fast)
-                pyg_tmp = Data(x=x_feat[:, 1:], edge_index=ei_g,
+                # Strip col 0 before passing to encoder, then trim to encoder's in_dim
+                # (handles old checkpoints trained before pattern features were added).
+                _in_dim = encoder.conv1.lin.weight.shape[1]
+                x_enc   = x_feat[:, 1:1 + _in_dim]
+                pyg_tmp = Data(x=x_enc, edge_index=ei_g,
                                batch=torch.zeros(n, dtype=torch.long, device=device))
 
                 h     = encoder(pyg_tmp)
@@ -551,8 +563,7 @@ def _diffusion_view_guided(
                 noise_cont = (x_t[..., 1:] - sqrt_ab_t * x0_pred[..., 1:]) / sqrt_1m_t
                 x_next_cont = sqrt_ab_s * x0_pred[..., 1:] + sqrt_1m_s * noise_cont
                 x_t   = torch.cat([x0_bin, x_next_cont], dim=-1) * mask.unsqueeze(-1)
-                adj_t = torch.bernoulli(adj_pred.clamp(0, 1))
-                adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2 * mask[:, :, None] * mask[:, None, :]
+                adj_t = torch.bernoulli(adj_pred.clamp(0, 1)) * mask[:, :, None] * mask[:, None, :]
 
     if was_diff_training:
         diff_model.train()
@@ -591,7 +602,11 @@ def _fit_probe(encoder, networks_or_graphs, device, n_epochs=300, is_pyg=False):
                 all_labels.append(int(item.y.item()))
             else:
                 v = augment_network_view_fast(item)
-                all_graphs.append(network_to_pyg_data_fast(v))
+                g = network_to_pyg_data_fast(v)
+                _in_dim = encoder.conv1.lin.weight.shape[1]
+                if g.x.shape[1] != _in_dim:
+                    g = Data(x=g.x[:, :_in_dim], edge_index=g.edge_index)
+                all_graphs.append(g)
                 all_labels.append(int(len(item["laundering_nodes"]) > 0))
         H = encoder(Batch.from_data_list(all_graphs).to(device)).cpu()
 
@@ -655,7 +670,9 @@ def compute_node_saliency(encoder, probe_head, networks, device, max_nets=300):
             if n == 0:
                 continue
 
-            x     = data.x.detach().clone().requires_grad_(True)
+            _in_dim = encoder.conv1.lin.weight.shape[1]
+            x_feat  = data.x[:, :_in_dim] if data.x.shape[1] != _in_dim else data.x
+            x     = x_feat.detach().clone().requires_grad_(True)
             batch = torch.zeros(n, dtype=torch.long, device=device)
             tmp   = Data(x=x, edge_index=data.edge_index, batch=batch)
 
@@ -850,6 +867,21 @@ def train_simclr_fast(
     _use_progressive     = view_type == "multistep_to_guided"
     probe                = None   # maintained across epochs for guided views
 
+    if use_diffusion:
+        _vt_labels = {
+            "single_step":        "single-step DDIM",
+            "multistep":          "multi-step DDIM",
+            "guided":             "guided DDIM",
+            "multistep_to_guided":"multistep→guided DDIM",
+        }
+        print(f"[simclr] Diffusion views enabled: {_vt_labels.get(view_type, view_type)}, "
+              f"p_diffusion={p_diffusion:.2f}, n_steps={diff_n_steps}, "
+              f"t_start_frac={diff_t_start_frac:.2f}"
+              + (f", guidance_scale={diff_guidance_scale:.2f}"
+                 if view_type in ("guided", "multistep_to_guided") else ""))
+    else:
+        print("[simclr] Diffusion views disabled — structural augmentation only.")
+
     # ── task-aware augmentation state ────────────────────────────────────────
     _curriculum_epochs  = curriculum_epochs if curriculum_epochs is not None else max(1, epochs // 2)
     _node_importances   = None   # list[dict|None] populated by compute_node_saliency
@@ -891,6 +923,7 @@ def train_simclr_fast(
               + (f"  [guided]"    if guided_this_epoch and use_diffusion else
                  f"  [multistep]" if _use_multistep and use_diffusion else ""))
         total_loss = total_ntxent = total_supcon = total_probe = 0.0
+        epoch_n_diff = epoch_n_rejected = epoch_n_fallback = 0
 
         for i in range(0, len(networks), batch_size):
             total_batches += 1
@@ -946,13 +979,16 @@ def train_simclr_fast(
                             and _is_connected_ei(diff_view.edge_index,
                                                  diff_view.x.shape[0])):
                         views2.append(diff_view)
+                        epoch_n_diff += 1
                         continue
+                    epoch_n_rejected += 1
                 # Fallback: smart structural augmentation
                 v2 = augment_network_view_smart(
                     net, aug_strength=curriculum_factor, node_importance=ni,
                     use_motif_preserving=use_motif_preserving,
                 )
                 views2.append(network_to_pyg_data_fast(v2))
+                epoch_n_fallback += 1
 
             # Binary labels for the batch (1 = laundering present, 0 = clean)
             labels = torch.tensor(
@@ -1032,6 +1068,11 @@ def train_simclr_fast(
         print(f"Epoch {epoch + 1}: loss={avg_loss:.4f} "
               f"(nt_xent={avg_ntxent:.4f}, supcon={avg_supcon:.4f}{probe_str}) "
               f"| lr={lr_now:.2e} | time={epoch_time:.2f}s")
+        if use_diffusion:
+            n_total = epoch_n_diff + epoch_n_fallback
+            pct = 100.0 * epoch_n_diff / max(n_total, 1)
+            rejected_str = f", rejected={epoch_n_rejected}" if epoch_n_rejected else ""
+            print(f"         diffusion views: {epoch_n_diff}/{n_total} ({pct:.1f}%){rejected_str}")
 
         # ✅ Save checkpoint every N epochs
         if (epoch + 1) % checkpoint_interval == 0:

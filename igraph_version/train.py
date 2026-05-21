@@ -169,7 +169,7 @@ def train_diffusion_ibm(device):
     print(f"  Save : {out_path}")
     print('='*60)
 
-    NODE_DIM = 11  # laundering flag (1) + topology (5) + transaction features (5)
+    NODE_DIM = 19  # laundering flag (1) + topology (5) + transaction (5) + AML patterns (8)
 
     def _needs_rebuild():
         if not cache_path.exists():
@@ -326,14 +326,15 @@ def train_diffusion_ibm(device):
                 x0_cont = (x_t[..., 1:].float().detach() - sqrt_1m * eps_pred_f[..., 1:]) / sqrt_ab
                 x0_cont = x0_cont * x_std[1:] + x_mean[1:]      # denormalise
                 pyg_pred_list, pyg_real_list = [], []
+                _enc_in = frozen_enc_ibm.conv1.lin.weight.shape[1]
                 for bi in range(x_batch.shape[0]):
                     n_bi = int(mask[bi].sum().item())
                     if n_bi < 2:
                         continue
                     ei_pred = (adj_pred_f[bi, :n_bi, :n_bi].detach() > 0.5).nonzero(as_tuple=False).T.contiguous()
                     ei_real = (adj_batch[bi, :n_bi, :n_bi] > 0.5).nonzero(as_tuple=False).T.contiguous()
-                    pyg_pred_list.append(_PygData(x=x0_cont[bi, :n_bi], edge_index=ei_pred))
-                    pyg_real_list.append(_PygData(x=x_batch[bi, :n_bi, 1:].detach(), edge_index=ei_real))
+                    pyg_pred_list.append(_PygData(x=x0_cont[bi, :n_bi, :_enc_in], edge_index=ei_pred))
+                    pyg_real_list.append(_PygData(x=x_batch[bi, :n_bi, 1:1+_enc_in].detach(), edge_index=ei_real))
                 if pyg_pred_list:
                     bp = _PygBatch.from_data_list(pyg_pred_list)
                     br = _PygBatch.from_data_list(pyg_real_list)
@@ -395,7 +396,7 @@ def train_simclr_ibm(device):
         for n in nets:
             xd = n.get("x_dense")
             if xd is not None:
-                return xd.shape[1] != 11
+                return xd.shape[1] != 19
         return False  # no x_dense yet — will be built on first use
 
     networks = None
@@ -449,6 +450,18 @@ def train_simclr_ibm(device):
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(projector.parameters()), lr=SIMCLR_IBM_LR
     )
+
+    # Precompute full 19-dim x_dense for every network once before training so that
+    # the inner loop's cache-miss branch (which calls compute_pattern_features) is
+    # never hit during training — only the fast cache-hit path runs per batch.
+    print("  Precomputing node features (19-dim) …")
+    from diffusion.diff_util import network_to_dense as _ntd_pre
+    for _net in networks:
+        _xd = _net.get("x_dense")
+        if _xd is None or _xd.shape[1] != 19:
+            _x, _ = _ntd_pre(_net)
+            _net["x_dense"] = _x
+    print(f"  Precomputation done ({len(networks)} networks).")
 
     train_simclr_fast(
         networks=networks, full_df=None,

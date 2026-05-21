@@ -46,8 +46,7 @@ def _enforce_connectivity(adj_bin):
     for comp in components[1:]:
         # Best node in the isolated component (highest existing degree, or any if all zero)
         anchor = max(comp, key=lambda u: degrees[u])
-        adj_conn[hub, anchor] = 1.0
-        adj_conn[anchor, hub] = 1.0
+        adj_conn[anchor, hub] = 1.0   # anchor → hub (directed)
         edges_added += 1
     return adj_conn, edges_added
 
@@ -123,10 +122,16 @@ def encode_all_networks(networks, encoder, device):
     """
     from augmentation import augment_network_view_fast
     from simclr import network_to_pyg_data_fast
+    # Infer expected feature dim from checkpoint weights — forward-compatible with
+    # both old (in_dim=10) and new (in_dim=18) encoders.
+    _in_dim = encoder.conv1.lin.weight.shape[1]
     all_graphs, all_labels = [], []
     for net in networks:
         v = augment_network_view_fast(net)
-        all_graphs.append(network_to_pyg_data_fast(v))
+        g = network_to_pyg_data_fast(v)
+        if g.x.shape[1] != _in_dim:
+            g = Data(x=g.x[:, :_in_dim], edge_index=g.edge_index)
+        all_graphs.append(g)
         all_labels.append(int(len(net["laundering_nodes"]) > 0))
     with torch.no_grad():
         H_all = encoder(Batch.from_data_list(all_graphs).to(device)).cpu()
@@ -346,15 +351,19 @@ def guided_generate(
                 else:
                     adj_t = (ap > adj_threshold).float()
 
-            adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2 * mask[:, :, None] * mask[:, None, :]
+            adj_t = adj_t * mask[:, :, None] * mask[:, None, :]
 
             # Final step: connect any 0-degree active nodes to their most
             # confident neighbour according to ap, before the state is locked in.
             # This uses the model's own predictions rather than hub-attachment,
             # producing more realistic local topology.
             if t_curr == 0 and n > 1:
-                _deg_f = adj_t[0, :n, :n].sum(dim=-1)          # [n]
-                _iso   = (_deg_f < 0.5) & (mask[0, :n] > 0.5)  # isolated active nodes
+                # Use total degree (out + in) so directed sink nodes (zero out-degree
+                # but positive in-degree) are not falsely treated as isolated.
+                _out_deg = adj_t[0, :n, :n].sum(dim=-1)         # [n]
+                _in_deg  = adj_t[0, :n, :n].sum(dim=-2)         # [n]
+                _deg_f   = _out_deg + _in_deg
+                _iso   = (_deg_f < 0.5) & (mask[0, :n] > 0.5)  # truly isolated active nodes
                 if _iso.any():
                     _probs = ap[0, :n, :n].clone()
                     _arange = torch.arange(n, device=_probs.device)
@@ -362,8 +371,7 @@ def guided_generate(
                     _best  = _probs.argmax(dim=-1)              # [n]
                     _i_idx = _iso.nonzero(as_tuple=True)[0]
                     _j_idx = _best[_i_idx]
-                    adj_t[0, _i_idx, _j_idx] = 1.0
-                    adj_t[0, _j_idx, _i_idx] = 1.0
+                    adj_t[0, _i_idx, _j_idx] = 1.0             # add i→j only
 
         if pbar is not None:
             pbar.update(1)
@@ -443,7 +451,6 @@ def run_guided_generation(
         for net in networks
     ]
     size_5th = float(np.percentile(train_sizes, 5)) if train_sizes else 3.0
-    density_ceil = 2.0 * target_density if target_density is not None else None
 
     gen_outputs, gen_embeddings = [], []
     n_discarded = 0
@@ -472,21 +479,6 @@ def run_guided_generation(
                 print(f"  [validity] graph {i+1}: connectivity repair added {n_patches} edge(s)")
 
             # ── Structural validity checks ─────────────────────────────────
-            gen_density = float(adj_out.sum()) / max(n_out * (n_out - 1), 1)
-            if density_ceil is not None and gen_density > density_ceil:
-                print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
-                      f"> 2× target ({target_density:.3f})")
-                n_discarded += 1
-                continue
-            # Discard graphs that are far too sparse — these are degenerate outputs
-            # where most edges were lost during denoising, forcing _enforce_connectivity
-            # to add many artificial hub-to-node edges.
-            density_floor = (target_density * 0.2) if target_density is not None else 0.0
-            if gen_density < density_floor:
-                print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
-                      f"< 20% of target ({target_density:.3f})")
-                n_discarded += 1
-                continue
             if n_out < size_5th:
                 print(f"  [validity] graph {i+1} discarded: "
                       f"n_nodes {n_out} < 5th-pct ({size_5th:.0f})")

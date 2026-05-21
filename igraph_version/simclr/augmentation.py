@@ -8,11 +8,11 @@ import copy
 
 def build_igraph_from_transactions(tx_df):
     """
-    Build an undirected igraph graph from transactions dataframe.
+    Build a directed igraph graph from transactions dataframe.
     """
     edges = tx_df[["From_Account_int", "To_Account_int"]]
     edges = edges[edges["From_Account_int"] != edges["To_Account_int"]]
-    g = ig.Graph.DataFrame(edges, directed=False, use_vids=False)
+    g = ig.Graph.DataFrame(edges, directed=True, use_vids=False)
     return g
 
 

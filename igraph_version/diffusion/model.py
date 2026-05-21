@@ -183,6 +183,7 @@ class DiffusionGNN(nn.Module):
         # same vector the bilinear term saturates, but unary + bias still
         # controls the global density prior.  W is not constrained to be
         # symmetric, giving strictly more expressiveness than inner-product.
+        
         D_e = hidden_dim // 4                                # 32 for hidden=128
         self.adj_proj  = nn.Linear(hidden_dim, D_e)
         self.adj_bilin = nn.Linear(D_e, D_e, bias=False)    # W in h_i^T W h_j
@@ -208,7 +209,7 @@ class DiffusionGNN(nn.Module):
         Returns
         -------
         out      : [B, N, F]   predicted noise / x_start per node feature
-        adj_pred : [B, N, N]   predicted clean adjacency (sigmoid, symmetric)
+        adj_pred : [B, N, N]   predicted clean adjacency (sigmoid, directed)
         """
 
         if node_mask is not None:
@@ -242,11 +243,9 @@ class DiffusionGNN(nn.Module):
         # Adjacency prediction via decomposed bilinear form (no large intermediate tensors)
         h_e   = F.silu(self.adj_proj(h))                          # [B, N, D_e]
         bilin = torch.bmm(self.adj_bilin(h_e), h_e.transpose(1, 2))  # [B, N, N]
-        bilin = (bilin + bilin.transpose(1, 2)) / 2               # symmetrise W
         unary = self.adj_lin(h_e).squeeze(-1)                     # [B, N]
         adj_logits = bilin + unary.unsqueeze(2) + unary.unsqueeze(1) + self.adj_bias
         adj_pred = torch.sigmoid(adj_logits)
-        adj_pred = (adj_pred + adj_pred.transpose(1, 2)) / 2     # enforce symmetry
 
         if node_mask is not None:
             adj_pred = adj_pred * node_mask[:, :, None] * node_mask[:, None, :]

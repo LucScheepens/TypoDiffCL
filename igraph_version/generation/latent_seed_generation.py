@@ -461,7 +461,7 @@ def guided_generate_structurally_novel(
             else:
                 adj_t = (ap > adj_threshold).float()
 
-            adj_t = (adj_t + adj_t.transpose(-1, -2)) / 2 * mask[:, :, None] * mask[:, None, :]
+            adj_t = adj_t * mask[:, :, None] * mask[:, None, :]
 
             # Per-step edge thinning: randomly drop edges with probability that
             # grows as we approach t=0, but never leave a node with degree < 1.
@@ -469,14 +469,12 @@ def guided_generate_structurally_novel(
                 drop_prob = 0.05 * (1.0 - t_curr / t_start)
                 keep_mask = (torch.rand_like(adj_t) > drop_prob).float()
                 adj_thin  = adj_t * keep_mask
-                adj_thin  = (adj_thin + adj_thin.transpose(-1, -2)).clamp(max=1)
-                # Restore edges for any node that would drop to degree 0
-                deg_thin = adj_thin.sum(dim=-1)  # [B, N]
-                isolated = (deg_thin < 1).float() * mask  # nodes that lost all edges
+                # Restore edges for any node that would drop to in-degree 0
+                deg_thin = adj_thin.sum(dim=-2)  # [B, N] in-degree
+                isolated = (deg_thin < 1).float() * mask  # nodes that lost all incoming edges
                 if isolated.any():
-                    # For isolated nodes, restore their original adj_t row/col
-                    restore = isolated.unsqueeze(-1) * adj_t  # [B, N, N]
-                    restore = (restore + restore.transpose(-1, -2)).clamp(max=1)
+                    # For isolated nodes, restore their original adj_t column
+                    restore = isolated.unsqueeze(-2) * adj_t  # [B, N, N]
                     adj_thin = (adj_thin + restore).clamp(max=1)
                 adj_t = adj_thin
 
