@@ -13,7 +13,7 @@ _GEN_DIR  = Path(__file__).resolve().parent   # igraph_version/generation/
 ROOT_DIR  = _GEN_DIR.parent                   # igraph_version/
 DIFF_DIR  = ROOT_DIR / "diffusion"
 CKPT_DIR  = ROOT_DIR / "checkpoints"
-MAX_NODES = 300
+MAX_NODES = 64
 
 for _p in (str(ROOT_DIR), str(DIFF_DIR), str(ROOT_DIR / "simclr")):
     if _p not in sys.path:
@@ -98,7 +98,7 @@ def load_simclr_encoder(device):
 
 
 def load_diffusion_model(device):
-    """Load diffusion model and normalisation stats. Returns (model, diffusion, x_mean, x_std)."""
+    """Load diffusion model and normalisation stats. Returns (model, diffusion, x_mean, x_std, max_nodes)."""
     from diffusion.model import DiffusionGNN
     from diffusion.diff_util import create_diffusion
     ckpt            = torch.load(CKPT_DIR / "diffusion_ibm" / "model.pt", map_location=device, weights_only=False)
@@ -111,8 +111,9 @@ def load_diffusion_model(device):
     diffusion  = create_diffusion(T=500)
     x_mean     = ckpt["x_mean"].to(device)
     x_std      = ckpt["x_std"].to(device)
-    print("Diffusion model loaded.")
-    return diff_model, diffusion, x_mean, x_std
+    max_nodes  = ckpt.get("max_nodes", MAX_NODES)
+    print(f"Diffusion model loaded  (max_nodes={max_nodes}).")
+    return diff_model, diffusion, x_mean, x_std, max_nodes
 
 
 def encode_all_networks(networks, encoder, device):
@@ -201,13 +202,13 @@ def guided_generate(
     else:
         x, adj = network_to_dense(seed_network)
         x, adj = x.to(device), adj.to(device)
-    n = x.shape[0]
+    n = min(x.shape[0], _max)
 
     x_pad   = torch.zeros(1, _max, x.shape[1], device=device)
     adj_pad = torch.zeros(1, _max, _max,    device=device)
     mask    = torch.zeros(1, _max,           device=device)
-    x_pad[0, :n]       = x
-    adj_pad[0, :n, :n] = adj
+    x_pad[0, :n]       = x[:n]
+    adj_pad[0, :n, :n] = adj[:n, :n]
     mask[0, :n]        = 1.0
 
     x_norm = x_pad.clone()
@@ -760,6 +761,7 @@ def load_diffusion_model_elliptic(device):
     """
     Like load_diffusion_model() but loads diffusion/model_elliptic.pt.
     Run elliptic_diffusion_train.py first to produce the checkpoint.
+    Returns (model, diffusion, x_mean, x_std, max_nodes).
     """
     from diffusion.model    import DiffusionGNN
     from diffusion.diff_util import create_diffusion
@@ -777,8 +779,9 @@ def load_diffusion_model_elliptic(device):
     diffusion  = create_diffusion(T=500)
     x_mean     = ckpt["x_mean"].to(device)
     x_std      = ckpt["x_std"].to(device)
-    print(f"Elliptic diffusion model loaded from {model_path}.")
-    return diff_model, diffusion, x_mean, x_std
+    max_nodes  = ckpt.get("max_nodes", MAX_NODES)
+    print(f"Elliptic diffusion model loaded from {model_path}  (max_nodes={max_nodes}).")
+    return diff_model, diffusion, x_mean, x_std, max_nodes
 
 
 def encode_all_pyg_graphs(graphs, encoder, device, batch_size=128):

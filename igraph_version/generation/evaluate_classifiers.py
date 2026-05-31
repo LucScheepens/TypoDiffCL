@@ -1411,6 +1411,8 @@ def main():
         sss_ld = StratifiedShuffleSplit(n_splits=1, train_size=n_keep, random_state=42)
         idx_ld, _ = next(sss_ld.split(np.arange(len(data_train)), train_labels_np))
         data_train = [data_train[i] for i in idx_ld]
+        # Keep idx_tr in sync so ExSTraQt / FraudGT train on the same subset.
+        idx_tr = idx_tr[idx_ld]
         print(f"Low-data mode: keeping {len(data_train)} / {n_train_before_ld} "
               f"training graphs ({args.low_data:.0%})")
         print()
@@ -1468,7 +1470,7 @@ def main():
             else:
                 encoder_e = load_simclr_encoder_elliptic(device)
 
-            diff_model_e, diffusion_e, x_mean_e, x_std_e = load_diffusion_model_elliptic(device)
+            diff_model_e, diffusion_e, x_mean_e, x_std_e, _max_n_e = load_diffusion_model_elliptic(device)
             # Only encode training-fold graphs to avoid test leakage in the probe.
             # data_train has already been split off from the temporal train pool.
             H_all_e, y_all_e = encode_all_pyg_graphs(data_train, encoder_e, device)
@@ -1574,10 +1576,13 @@ def main():
             args.augment = False
 
         else:
-            # ── IBM augmentation path (original) ──────────────────────────
+            # ── IBM augmentation path ──────────────────────────────────────
             _ld_tag  = f"_ld{int(args.low_data * 100)}" if args.low_data < 1.0 else ""
             _t_start = args.t_start if args.t_start is not None else 150
-            GEN_CACHE_PATH = DATA_DIR / f"gen_cache_{csv_stem}_n{args.n_gen}_t{_t_start}{_ld_tag}.pkl"
+            # Include ablation label in cache path so different ablation encoders
+            # don't share stale cached generation from a different encoder.
+            _enc_tag = f"_enc{args.ablation_label}" if args.ablation_label else ""
+            GEN_CACHE_PATH = DATA_DIR / f"gen_cache_{csv_stem}_n{args.n_gen}_t{_t_start}{_ld_tag}{_enc_tag}.pkl"
 
             _cache_valid = False
             if GEN_CACHE_PATH.exists():
@@ -1603,8 +1608,41 @@ def main():
                     encode_all_networks, train_mlp_probe, run_guided_generation,
                     tune_guidance_params,
                 )
-                encoder = load_simclr_encoder(device)
-                diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
+                from simclr import GraphEncoder as _GE_ibm
+                if args.encoder_dir is not None:
+                    # Use the ablation encoder for guided generation (same convention as
+                    # Elliptic path), so each pattern/encoder condition generates
+                    # distinct augmentation data rather than always using the default.
+                    _ckpt_dir_ibm = Path(args.encoder_dir)
+                    _cands_ibm    = list(_ckpt_dir_ibm.glob("*.pt"))
+                    _best_ibm, _best_ibm_loss = None, float("inf")
+                    for _p in _cands_ibm:
+                        try:
+                            _c = torch.load(_p, map_location="cpu", weights_only=False)
+                            if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _best_ibm_loss:
+                                _best_ibm_loss, _best_ibm = _c["loss"], _p
+                        except Exception:
+                            pass
+                    if _best_ibm is None:
+                        raise FileNotFoundError(
+                            f"No valid encoder checkpoint in {args.encoder_dir}. "
+                            "Run the IBM SimCLR training script first."
+                        )
+                    print(f"Ablation IBM encoder: {_best_ibm.name}  (loss={_best_ibm_loss:.4f})")
+                    _ckpt_ibm = torch.load(_best_ibm, map_location=device, weights_only=False)
+                    _sd_ibm   = _ckpt_ibm["encoder_state_dict"]
+                    _in_dim_ibm  = _sd_ibm["conv1.lin.weight"].shape[1]
+                    _hid_ibm     = _sd_ibm["conv1.lin.weight"].shape[0]
+                    _n_lay_ibm   = 3 if "conv3.lin.weight" in _sd_ibm else 2
+                    _bn_ibm      = "bn1.weight" in _sd_ibm
+                    encoder = _GE_ibm(in_dim=_in_dim_ibm, hidden_dim=_hid_ibm, out_dim=128,
+                                      n_layers=_n_lay_ibm, use_bn=_bn_ibm).to(device)
+                    encoder.load_state_dict(_sd_ibm)
+                    encoder.eval()
+                    print(f"  in_dim={_in_dim_ibm}  hidden={_hid_ibm}  layers={_n_lay_ibm}")
+                else:
+                    encoder = load_simclr_encoder(device)
+                diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device)
 
                 # Only encode networks that ended up in the TRAINING fold.
                 # Using all networks (including test) would leak test-set embeddings

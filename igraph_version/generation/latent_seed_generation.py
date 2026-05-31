@@ -111,7 +111,7 @@ GUIDE_EVERY     = 1
 GUIDE_FROM      = 0.25
 EXTRAP_GAMMA    = 0.5     # how far past the laundering cluster to push the target
 N_CALIB         = 5
-MAX_NODES       = 300
+MAX_NODES       = 64
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -938,7 +938,7 @@ def main():
         print("Extracting networks (no cache found) …")
         networks = extract_networks_igraph(
             df_full, max_depth=4, max_networks=4000,
-            collapse_threshold=10, max_nodes=300,
+            collapse_threshold=10, max_nodes=MAX_NODES,
         )
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
@@ -954,7 +954,7 @@ def main():
     # ── 2. Load models ────────────────────────────────────────────────────────
     print("Loading models …")
     encoder = load_simclr_encoder(device)
-    diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
+    diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device)
 
     # ── 3. Encode + probe ─────────────────────────────────────────────────────
     print("\nEncoding training networks …")

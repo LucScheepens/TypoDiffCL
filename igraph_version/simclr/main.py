@@ -29,7 +29,7 @@ from util import preprocess_df, extract_networks_igraph
 
 # Separate cache from the diffusion (x,adj)-tuple cache — stores full network dicts with igraph graphs
 SIMCLR_CACHE = DATA_DIR / "simclr_networks_cache.pt"
-MAX_NODES = 300
+MAX_NODES = 64
 
 def load_or_build_networks(df_full):
     """
@@ -82,24 +82,28 @@ def load_or_build_networks(df_full):
 
 
 def load_diffusion(device):
-    """Load the trained diffusion model from the sibling diffusion directory."""
+    """Load the trained diffusion model from the sibling diffusion directory.
+    Returns (model, diffusion, x_mean, x_std, max_nodes).
+    """
     ckpt_path = BASE_DIR.parent / "checkpoints" / "diffusion_ibm" / "model.pt"
     if not ckpt_path.exists():
         print(f"[diffusion] No checkpoint at {ckpt_path} — diffusion augmentation disabled.")
-        return None, None, None, None
+        return None, None, None, None, MAX_NODES
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    diff_model = DiffusionGNN(node_dim=6, hidden_dim=128, num_layers=4).to(device)
+    node_dim   = ckpt["model"]["input_proj.weight"].shape[1]
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
 
-    diffusion = create_diffusion(T=500)
-    x_mean   = ckpt["x_mean"].to(device)
-    x_std    = ckpt["x_std"].to(device)
+    diffusion  = create_diffusion(T=500)
+    x_mean     = ckpt["x_mean"].to(device)
+    x_std      = ckpt["x_std"].to(device)
+    max_nodes  = ckpt.get("max_nodes", MAX_NODES)
 
-    print(f"[diffusion] Loaded checkpoint from {ckpt_path}")
-    return diff_model, diffusion, x_mean, x_std
+    print(f"[diffusion] Loaded checkpoint from {ckpt_path}  (max_nodes={max_nodes})")
+    return diff_model, diffusion, x_mean, x_std, max_nodes
 
 
 if __name__ == "__main__":
@@ -111,7 +115,7 @@ if __name__ == "__main__":
     networks = load_or_build_networks(df_full)
 
     # Load the trained diffusion model (optional — falls back gracefully if absent)
-    diff_model, diffusion, x_mean, x_std = load_diffusion(device)
+    diff_model, diffusion, x_mean, x_std, _diff_max_nodes = load_diffusion(device)
 
     # IBM: 11 node features, strip col 0 (laundering flag) → in_dim=10.
     # 3-layer GCN, BatchNorm, mean+max pooling for class-separation capacity.
@@ -154,7 +158,7 @@ if __name__ == "__main__":
         x_mean=x_mean,
         x_std=x_std,
         p_diffusion=0.3,
-        max_nodes=300,
+        max_nodes=_diff_max_nodes,
         # LR schedule: warmup + cosine decay
         warmup_epochs=10,
         use_cosine_schedule=True,

@@ -439,6 +439,108 @@ def _diffusion_view_multistep(
     return _dense_to_pyg(x_t, adj_t, n, x_mean_d, x_std_d, label=None)
 
 
+def _diffusion_view_multistep_batch(
+    networks_or_data, diff_model, diffusion, x_mean, x_std, device,
+    t_start_frac=0.5, n_steps=15, max_nodes=300, is_pyg=False,
+):
+    """
+    Batched version of _diffusion_view_multistep.
+
+    Runs all graphs in one DDIM loop instead of one loop per graph.
+    Graphs are padded to the largest n in the batch; node_mask zeroes
+    out padding.  Cross-graph independence is preserved because
+    MaskedGraphConv never mixes node features across graphs.
+
+    Returns a list[PyG Data] aligned with networks_or_data.
+    Graphs that exceed max_nodes or fail preparation are returned as None.
+    """
+    # Prepare each graph individually (handles different sizes)
+    prepared = []
+    for item in networks_or_data:
+        prep = _prepare_dense_input(item, max_nodes, x_mean, x_std, device, is_pyg)
+        prepared.append(prep)   # None if too large
+
+    valid_idx = [i for i, p in enumerate(prepared) if p is not None]
+    if not valid_idx:
+        return [None] * len(networks_or_data)
+
+    valid_preps = [prepared[i] for i in valid_idx]
+    B       = len(valid_preps)
+    max_n   = max(p[3] for p in valid_preps)
+    node_dim = valid_preps[0][0].shape[2]
+    x_mean_d = valid_preps[0][4]
+    x_std_d  = valid_preps[0][5]
+
+    # Stack into a padded batch tensor
+    x_batch   = torch.zeros(B, max_n, node_dim, device=device)
+    adj_batch = torch.zeros(B, max_n, max_n,    device=device)
+    mask_batch = torch.zeros(B, max_n,          device=device)
+    ns = []
+    for bi, (x_norm, adj_pad, _, n, _, _) in enumerate(valid_preps):
+        x_batch[bi,  :n]    = x_norm[0, :n]
+        adj_batch[bi, :n, :n] = adj_pad[0, :n, :n]
+        mask_batch[bi, :n]  = 1.0
+        ns.append(n)
+
+    t_start  = max(n_steps, int(t_start_frac * diffusion.num_timesteps))
+    t_vec    = torch.full((B,), t_start, dtype=torch.long, device=device)
+    x_t, adj_t = diffusion.q_sample(x_batch, t_vec, node_mask=mask_batch,
+                                     adj_start=adj_batch)
+
+    step     = max(1, t_start // n_steps)
+    schedule = list(range(t_start, -1, -step))
+    if schedule[-1] != 0:
+        schedule.append(0)
+
+    was_training = diff_model.training
+    diff_model.eval()
+
+    with torch.no_grad():
+        for si, t_curr in enumerate(schedule):
+            t_next = schedule[si + 1] if si + 1 < len(schedule) else -1
+            t_c    = torch.full((B,), t_curr, dtype=torch.long, device=device)
+            t_sc   = diffusion._scale_timesteps(t_c)
+
+            eps_pred, adj_pred, _ = diff_model(x_t, t_sc, adj=adj_t,
+                                               node_mask=mask_batch)
+
+            ab_t      = float(diffusion.alphas_cumprod[t_curr])
+            sqrt_ab_t = math.sqrt(ab_t + 1e-8)
+            sqrt_1m_t = math.sqrt(max(1.0 - ab_t, 1e-8))
+
+            x0_cont = (x_t[..., 1:] - sqrt_1m_t * eps_pred[..., 1:]) / sqrt_ab_t
+            x0_bin  = eps_pred[..., 0:1].clamp(0, 1)
+            x0_pred = torch.cat([x0_bin, x0_cont], dim=-1) * mask_batch.unsqueeze(-1)
+
+            if t_next < 0:
+                x_t   = x0_pred
+                adj_t = (adj_pred.clamp(0, 1) > 0.5).float()
+            else:
+                ab_s       = float(diffusion.alphas_cumprod[t_next])
+                sqrt_ab_s  = math.sqrt(ab_s + 1e-8)
+                sqrt_1m_s  = math.sqrt(max(1.0 - ab_s, 1e-8))
+                noise_cont = (x_t[..., 1:] - sqrt_ab_t * x0_pred[..., 1:]) / sqrt_1m_t
+                x_t   = torch.cat([x0_bin,
+                                   sqrt_ab_s * x0_pred[..., 1:] + sqrt_1m_s * noise_cont],
+                                  dim=-1) * mask_batch.unsqueeze(-1)
+                adj_t = (torch.bernoulli(adj_pred.clamp(0, 1))
+                         * mask_batch[:, :, None] * mask_batch[:, None, :])
+
+    if was_training:
+        diff_model.train()
+
+    # Unpack per-graph results and re-insert None slots for skipped graphs
+    valid_out = [
+        _dense_to_pyg(x_t[bi:bi+1], adj_t[bi:bi+1], ns[bi],
+                      x_mean_d, x_std_d, label=None)
+        for bi in range(B)
+    ]
+    results = [None] * len(networks_or_data)
+    for bi, orig_i in enumerate(valid_idx):
+        results[orig_i] = valid_out[bi]
+    return results
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Guided multi-step DDIM view
 # ─────────────────────────────────────────────────────────────────────────────
@@ -635,15 +737,16 @@ def _fit_probe(encoder, networks_or_graphs, device, n_epochs=300, is_pyg=False):
     return probe
 
 
-def compute_node_saliency(encoder, probe_head, networks, device, max_nets=300):
+def compute_node_saliency(encoder, probe_head, networks, device, max_nets=300,
+                          chunk_size=32):
     """
     Compute per-node importance from probe-gradient magnitude.
 
-    For each (sampled) network, runs a single forward+backward pass through the
-    frozen encoder and probe.  The gradient of the probe loss w.r.t. the node
-    feature matrix  ∂L/∂x  measures how much each node's features influence the
-    prediction — high-magnitude gradients identify discriminatively important
-    nodes that should be protected during augmentation.
+    Processes graphs in batches of `chunk_size` rather than one at a time,
+    reducing 300 individual backward passes to ~10 batched ones.
+    Cross-graph gradients are zero because GNN message passing never crosses
+    graph boundaries inside a PyG Batch, so the batched result is identical
+    to the serial version.
 
     Returns a list aligned with `networks`, where each entry is either:
       - dict {account_name (int) -> importance_score [0,1]}, or
@@ -654,14 +757,12 @@ def compute_node_saliency(encoder, probe_head, networks, device, max_nets=300):
 
     importances = [None] * len(networks)
 
-    # Subsample for efficiency — full set would be too slow every 20 epochs
     indices = list(range(len(networks)))
     random.shuffle(indices)
     indices = indices[:max_nets]
 
-    with torch.no_grad():
-        pass  # ensure params are unfrozen below (we only backprop through x)
-
+    # Collect valid graphs up-front
+    all_items = []
     for idx in indices:
         net = networks[idx]
         try:
@@ -669,36 +770,51 @@ def compute_node_saliency(encoder, probe_head, networks, device, max_nets=300):
             n    = data.x.shape[0]
             if n == 0:
                 continue
-
             _in_dim = encoder.conv1.lin.weight.shape[1]
             x_feat  = data.x[:, :_in_dim] if data.x.shape[1] != _in_dim else data.x
-            x     = x_feat.detach().clone().requires_grad_(True)
-            batch = torch.zeros(n, dtype=torch.long, device=device)
-            tmp   = Data(x=x, edge_index=data.edge_index, batch=batch)
-
-            # Forward through encoder (BN uses running stats in eval mode)
-            h = encoder(tmp)
-            score = torch.sigmoid(probe_head(F.normalize(h, dim=-1))).squeeze()
-            label = float(len(net["laundering_nodes"]) > 0)
-            loss  = (-torch.log(score + 1e-8) if label == 1.0
-                     else -torch.log(1.0 - score + 1e-8))
-            loss.backward()
-
-            imp = x.grad.detach().abs().sum(dim=-1).cpu()  # [n_nodes]
-            if imp.max() > 0:
-                imp = imp / imp.max()
-
-            # Key by node name so importance survives subgraph cropping
-            has_names = "name" in net["graph"].vs.attributes()
-            name_imp  = {}
-            for vid in range(n):
-                name = (int(net["graph"].vs[vid]["name"]) if has_names
-                        else vid)
-                name_imp[name] = float(imp[vid])
-
-            importances[idx] = name_imp
+            all_items.append((idx, net, x_feat, data.edge_index))
         except Exception:
             pass
+
+    if not all_items:
+        if was_training:
+            encoder.train()
+        return importances
+
+    # One batched forward+backward per chunk
+    for chunk_start in range(0, len(all_items), chunk_size):
+        chunk = all_items[chunk_start:chunk_start + chunk_size]
+
+        # Leaf tensors with grad so we can read per-node gradients after backward
+        x_grads   = [item[2].detach().clone().requires_grad_(True) for item in chunk]
+        data_list = [Data(x=xg, edge_index=item[3])
+                     for xg, item in zip(x_grads, chunk)]
+        batch_d = Batch.from_data_list(data_list)
+
+        labels = torch.tensor(
+            [float(len(item[1]["laundering_nodes"]) > 0) for item in chunk],
+            dtype=torch.float32, device=device,
+        )
+
+        h      = encoder(batch_d)
+        scores = torch.sigmoid(probe_head(F.normalize(h, dim=-1))).squeeze(-1)
+        if scores.dim() == 0:
+            scores = scores.unsqueeze(0)
+        loss = F.binary_cross_entropy(scores.clamp(1e-8, 1.0 - 1e-8), labels)
+        loss.backward()
+
+        for i, (idx, net, _, _) in enumerate(chunk):
+            if x_grads[i].grad is None:
+                continue
+            imp = x_grads[i].grad.abs().sum(dim=-1).cpu()
+            if imp.max() > 0:
+                imp = imp / imp.max()
+            n         = imp.shape[0]
+            has_names = "name" in net["graph"].vs.attributes()
+            importances[idx] = {
+                (int(net["graph"].vs[vid]["name"]) if has_names else vid): float(imp[vid])
+                for vid in range(n)
+            }
 
     if was_training:
         encoder.train()
@@ -889,6 +1005,9 @@ def train_simclr_fast(
     start_time = time.time()
     total_batches = 0
 
+    # One pool for the whole training run — avoids per-batch creation overhead.
+    _executor = ThreadPoolExecutor(max_workers=min(batch_size, 4))
+
     for epoch in range(epochs):
         epoch_start = time.time()
         encoder.train(); projector.train()
@@ -930,64 +1049,73 @@ def train_simclr_fast(
             batch_nets  = networks[i:i + batch_size]
             batch_idxs  = list(range(i, min(i + batch_size, len(networks))))
 
-            # Build view1 augmentations in parallel (igraph releases GIL)
-            # Capture loop-local state via default args to avoid late-binding.
-            def _make_view1(args,
-                            _cf=curriculum_factor,
-                            _ni=_node_importances,
-                            _mp=use_motif_preserving):
+            # Capture epoch-level state in default args (thread-safe snapshot).
+            def _make_struct(args,
+                             _cf=curriculum_factor,
+                             _ni=_node_importances,
+                             _mp=use_motif_preserving):
                 idx, net = args
-                ni  = _ni[idx] if _ni is not None else None
+                ni = _ni[idx] if _ni is not None else None
                 aug = augment_network_view_smart(
                     net, aug_strength=_cf, node_importance=ni,
                     use_motif_preserving=_mp,
                 )
                 return network_to_pyg_data_fast(aug)
 
-            n_workers = min(len(batch_nets), 4)
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                views1 = list(pool.map(_make_view1, zip(batch_idxs, batch_nets)))
+            _ba = list(zip(batch_idxs, batch_nets))
 
+            # Submit view1 AND structural-fallback view2 together — both are
+            # CPU-bound igraph operations that release the GIL.
+            v1_futs = [_executor.submit(_make_struct, a) for a in _ba]
+            v2_futs = [_executor.submit(_make_struct, a) for a in _ba]
+
+            # Decide which view2 slots receive a diffusion view
+            use_diff_k   = [use_diffusion and random.random() < p_diffusion
+                            for _ in batch_nets]
+            diff_indices = [k for k, m in enumerate(use_diff_k) if m]
+
+            # ── Batch all diffusion views in one GPU pass ─────────────────────
+            diff_results: dict = {}
+            if diff_indices:
+                _diff_nets = [batch_nets[k] for k in diff_indices]
+                if guided_this_epoch and probe is not None:
+                    # Guided views need per-sample gradients — keep serial
+                    _raw = [_diffusion_view_guided(
+                        net, diffusion_model, diffusion, x_mean, x_std,
+                        encoder, probe, device,
+                        t_start_frac=diff_t_start_frac, n_steps=diff_n_steps,
+                        guidance_scale=diff_guidance_scale, max_nodes=max_nodes,
+                    ) for net in _diff_nets]
+                elif _use_multistep:
+                    _raw = _diffusion_view_multistep_batch(
+                        _diff_nets, diffusion_model, diffusion, x_mean, x_std, device,
+                        t_start_frac=diff_t_start_frac, n_steps=diff_n_steps,
+                        max_nodes=max_nodes,
+                    )
+                else:
+                    _raw = [_diffusion_view(
+                        net, diffusion_model, diffusion,
+                        x_mean, x_std, max_nodes, diffusion_t_frac, device,
+                    ) for net in _diff_nets]
+                for k, dv in zip(diff_indices, _raw):
+                    diff_results[k] = dv
+
+            # Collect CPU results (overlapped with GPU diffusion pass above)
+            views1        = [f.result() for f in v1_futs]
+            views2_struct = [f.result() for f in v2_futs]
+
+            # Assemble final views2: prefer diffusion, fall back to structural
             views2 = []
-            for k, net in enumerate(batch_nets):
-                global_idx = batch_idxs[k]
-                ni = _node_importances[global_idx] if _node_importances is not None else None
-
-                # View 2: select diffusion strategy (GPU — serial)
-                if use_diffusion and random.random() < p_diffusion:
-                    if guided_this_epoch and probe is not None:
-                        diff_view = _diffusion_view_guided(
-                            net, diffusion_model, diffusion, x_mean, x_std,
-                            encoder, probe, device,
-                            t_start_frac=diff_t_start_frac, n_steps=diff_n_steps,
-                            guidance_scale=diff_guidance_scale, max_nodes=max_nodes,
-                        )
-                    elif _use_multistep:
-                        diff_view = _diffusion_view_multistep(
-                            net, diffusion_model, diffusion, x_mean, x_std, device,
-                            t_start_frac=diff_t_start_frac, n_steps=diff_n_steps,
-                            max_nodes=max_nodes,
-                        )
-                    else:
-                        diff_view = _diffusion_view(
-                            net, diffusion_model, diffusion,
-                            x_mean, x_std, max_nodes, diffusion_t_frac, device,
-                        )
-                    # Reject disconnected diffusion views; fall back to structural
-                    # augmentation so the encoder never learns from disconnected graphs.
-                    if (diff_view is not None
-                            and _is_connected_ei(diff_view.edge_index,
-                                                 diff_view.x.shape[0])):
-                        views2.append(diff_view)
+            for k in range(len(batch_nets)):
+                if k in diff_results:
+                    dv = diff_results[k]
+                    if (dv is not None
+                            and _is_connected_ei(dv.edge_index, dv.x.shape[0])):
+                        views2.append(dv)
                         epoch_n_diff += 1
                         continue
                     epoch_n_rejected += 1
-                # Fallback: smart structural augmentation
-                v2 = augment_network_view_smart(
-                    net, aug_strength=curriculum_factor, node_importance=ni,
-                    use_motif_preserving=use_motif_preserving,
-                )
-                views2.append(network_to_pyg_data_fast(v2))
+                views2.append(views2_struct[k])
                 epoch_n_fallback += 1
 
             # Binary labels for the batch (1 = laundering present, 0 = clean)
@@ -1095,6 +1223,8 @@ def train_simclr_fast(
             best_probe_state     = online_probe.state_dict() if online_probe is not None else None
             best_epoch = epoch + 1
             print(f"New best model at epoch {epoch + 1} with loss {best_loss:.4f}")
+
+    _executor.shutdown(wait=False)
 
     # 🔥 Save best model at the end
     best_model_path = os.path.join(checkpoint_dir, "best_model.pt")

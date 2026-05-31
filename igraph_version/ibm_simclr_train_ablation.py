@@ -53,7 +53,7 @@ from util import preprocess_df, extract_networks_igraph
 CKPT_ROOT    = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
 DATA_DIR     = BASE_DIR / "data"
 DEFAULT_CSV  = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"
-MAX_NODES    = 300
+MAX_NODES    = 64
 MAX_NETWORKS = 2000   # laundering networks; same count of clean extracted
 
 
@@ -100,32 +100,34 @@ def _load_networks(ibm_csv):
 
 def _load_diffusion(device):
     """
-    Load the IBM diffusion model.  Returns (diff_model, diffusion, x_mean, x_std, node_dim).
-    All four model values are None if the checkpoint is missing or fails to load.
+    Load the IBM diffusion model.
+    Returns (diff_model, diffusion, x_mean, x_std, node_dim, max_nodes).
+    All model values are None if the checkpoint is missing or fails to load.
     """
     model_path = BASE_DIR / "checkpoints" / "diffusion_ibm" / "model.pt"
     if not model_path.exists():
         print(f"[diffusion] Checkpoint not found at {model_path} — diffusion views disabled.")
-        return None, None, None, None, 19
+        return None, None, None, None, 19, MAX_NODES
 
     try:
         from diffusion.model     import DiffusionGNN
         from diffusion.diff_util import create_diffusion
 
-        ckpt      = torch.load(model_path, map_location=device, weights_only=False)
-        node_dim  = ckpt["model"]["input_proj.weight"].shape[1]
+        ckpt       = torch.load(model_path, map_location=device, weights_only=False)
+        node_dim   = ckpt["model"]["input_proj.weight"].shape[1]
         diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4).to(device)
         diff_model.load_state_dict(ckpt["model"])
         diff_model.eval()
-        diffusion = create_diffusion(T=500)
-        x_mean    = ckpt["x_mean"].to(device)
-        x_std     = ckpt["x_std"].to(device)
-        print(f"[diffusion] Loaded {model_path}  (node_dim={node_dim})")
-        return diff_model, diffusion, x_mean, x_std, node_dim
+        diffusion  = create_diffusion(T=500)
+        x_mean     = ckpt["x_mean"].to(device)
+        x_std      = ckpt["x_std"].to(device)
+        max_nodes  = ckpt.get("max_nodes", MAX_NODES)
+        print(f"[diffusion] Loaded {model_path}  (node_dim={node_dim}, max_nodes={max_nodes})")
+        return diff_model, diffusion, x_mean, x_std, node_dim, max_nodes
 
     except Exception as e:
         print(f"[diffusion] Load failed ({e}) — diffusion views disabled.")
-        return None, None, None, None, 19
+        return None, None, None, None, 19, MAX_NODES
 
 
 # ── pattern feature masking ────────────────────────────────────────────────────
@@ -194,7 +196,7 @@ def train(args, device):
         _apply_pattern_masking(networks, list(set(cols_to_zero)))
 
     # ── diffusion model ────────────────────────────────────────────────────────
-    diff_model, diffusion, x_mean, x_std, node_dim = _load_diffusion(device)
+    diff_model, diffusion, x_mean, x_std, node_dim, _diff_max_nodes = _load_diffusion(device)
 
     # Honour p_diffusion=0 even if a checkpoint was found
     if args.p_diffusion == 0.0:
@@ -234,7 +236,7 @@ def train(args, device):
         x_std               = x_std,
         p_diffusion         = args.p_diffusion,
         diffusion_t_frac    = 0.3,
-        max_nodes           = MAX_NODES,
+        max_nodes           = _diff_max_nodes,
         supcon_weight       = args.supcon_weight,
         supcon_temperature  = args.supcon_temp,
         # view-type control

@@ -36,7 +36,12 @@ DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 NODE_DIM      = 6
 HIDDEN        = 128
 TIMESTEPS     = 500
-MAX_NODES     = 300
+# MAX_NODES controls the padding size for every [B, N, N] adjacency tensor.
+# The bmm in MaskedGraphConv is O(N²), so this is the dominant cost driver.
+# IBM ego-nets are capped at 50 nodes in extract_transaction_ego_networks;
+# reducing to 64 gives ~20× speedup on that bmm with no quality loss.
+# NOTE: changing this requires deleting the cache and retraining from scratch.
+MAX_NODES     = 64
 ADJ_LOSS_W          = 0.3
 DENSITY_LOSS_W      = 3.0   # penalise predicted density != true density (symmetric)
 NODE_EXIST_LOSS_W   = 1.0   # reconstruct node mask from corrupted input
@@ -57,9 +62,17 @@ CACHE_PATH    = str(DATA_DIR / "cached_dataset.pt")
 def _needs_rebuild():
     if not os.path.exists(CACHE_PATH):
         return True
-    sample = torch.load(CACHE_PATH)
-    if len(sample) == 0 or sample[0][0].shape[1] != NODE_DIM:
-        print(f"Cache feature dim {sample[0][0].shape[1]} != NODE_DIM={NODE_DIM}. Rebuilding...")
+    sample = torch.load(CACHE_PATH, weights_only=False)
+    if len(sample) == 0:
+        os.remove(CACHE_PATH)
+        return True
+    x0, adj0 = sample[0]
+    if x0.shape[1] != NODE_DIM:
+        print(f"Cache feature dim {x0.shape[1]} != NODE_DIM={NODE_DIM}. Rebuilding...")
+        os.remove(CACHE_PATH)
+        return True
+    if adj0.shape[0] != MAX_NODES:
+        print(f"Cache max_nodes {adj0.shape[0]} != MAX_NODES={MAX_NODES}. Rebuilding...")
         os.remove(CACHE_PATH)
         return True
     return False
@@ -212,9 +225,10 @@ if __name__ == "__main__":
 
         if (epoch + 1) % 10 == 0 or (epoch + 1) == EPOCHS:
             torch.save({
-                "model": model.state_dict(),
-                "x_mean": x_mean.cpu(),
-                "x_std":  x_std.cpu(),
+                "model":     model.state_dict(),
+                "x_mean":    x_mean.cpu(),
+                "x_std":     x_std.cpu(),
+                "max_nodes": MAX_NODES,
             }, BASE_DIR.parent / "checkpoints" / "diffusion_ibm" / "model.pt")
 
         if (epoch + 1) % VIZ_INTERVAL == 0 or (epoch + 1) == EPOCHS:

@@ -346,6 +346,118 @@ def _fit_training_distribution_pyg(graphs):
     return mu, cov_inv, realism_scale
 
 
+# ── Augmented file helpers ────────────────────────────────────────────────────
+
+def _gen_network_to_transactions(x_denorm, adj_out, n_out, target_label, net_idx,
+                                 adj_threshold=0.5):
+    """Build synthetic CSV-format transaction rows for one generated network.
+
+    Each directed edge in adj_out becomes one transaction row.
+    Node IDs are namespaced by net_idx to avoid collisions with the originals.
+    """
+    import random as _rand
+    from datetime import datetime, timedelta
+
+    _rand.seed(net_idx * 137 + 42)
+
+    CURRENCIES = ["US Dollar", "Euro", "Australian Dollar", "Bitcoin", "Swiss Franc"]
+    FORMATS    = ["ACH", "Wire", "Cheque", "Credit Card", "Bitcoin"]
+    WINDOW_START = datetime(2022, 9, 1)
+    WINDOW_END   = datetime(2022, 9, 6, 11, 31)
+    window_mins  = int((WINDOW_END - WINDOW_START).total_seconds() // 60)
+
+    deg_norm = x_denorm[:, 0].numpy()
+    max_deg  = float(deg_norm.max()) if float(deg_norm.max()) > 0 else 1.0
+
+    banks    = [f"{net_idx * 100 + i:06d}" for i in range(n_out)]
+    accounts = [f"F{net_idx * 10000 + i:09X}0" for i in range(n_out)]
+
+    edge_list = (adj_out > adj_threshold).nonzero(as_tuple=False).tolist()
+    edge_list = [(s, d) for s, d in edge_list if s != d]
+
+    rows = []
+    for edge_count, (src, dst) in enumerate(edge_list):
+        ts = WINDOW_START + timedelta(minutes=_rand.randint(0, window_mins))
+        amount   = round(_rand.uniform(1000, 50000) * (0.5 + deg_norm[src] / max_deg), 2)
+        currency = _rand.choice(CURRENCIES)
+        fmt      = _rand.choice(FORMATS)
+        rows.append({
+            "Timestamp":          ts.strftime("%Y/%m/%d %H:%M"),
+            "From Bank":          banks[src],
+            "Account":            accounts[src],
+            "To Bank":            banks[dst],
+            "To Account":         accounts[dst],
+            "Amount Received":    f"{amount:.2f}",
+            "Receiving Currency": currency,
+            "Amount Paid":        f"{amount:.2f}",
+            "Payment Currency":   currency,
+            "Payment Format":     fmt,
+            "Is Laundering":      target_label,
+        })
+    return rows
+
+
+def _save_augmented_files(gen_outputs, ibm_csv):
+    """Copy LI-Small_Trans.csv and LI-Small_Patterns.txt, then append
+    synthetic transactions and pattern blocks from gen_outputs.
+
+    Output files:
+        <data_dir>/LI-Small_Trans_augmented.csv
+        <data_dir>/LI-Small_Patterns_augmented.txt
+    """
+    import shutil
+    import csv as _csv
+
+    csv_path      = Path(ibm_csv)
+    patterns_path = csv_path.parent / (
+        csv_path.stem.replace("Trans", "Patterns") + ".txt"
+    )
+    csv_aug = csv_path.parent / (csv_path.stem + "_augmented.csv")
+    pat_aug = patterns_path.parent / (patterns_path.stem + "_augmented.txt")
+
+    shutil.copy2(csv_path,      csv_aug)
+    shutil.copy2(patterns_path, pat_aug)
+    print(f"  Copied originals → {csv_aug.name}, {pat_aug.name}")
+
+    with open(csv_aug, "a", newline="", encoding="utf-8") as csv_f, \
+         open(pat_aug,  "a",             encoding="utf-8") as pat_f:
+
+        writer = _csv.writer(csv_f)
+
+        for net_idx, (x_denorm, adj_out, n_out, target_label) in enumerate(gen_outputs):
+            rows = _gen_network_to_transactions(
+                x_denorm, adj_out, n_out, target_label, net_idx)
+            if not rows:
+                continue
+
+            for r in rows:
+                writer.writerow([
+                    r["Timestamp"], r["From Bank"], r["Account"],
+                    r["To Bank"],   r["To Account"],
+                    r["Amount Received"],   r["Receiving Currency"],
+                    r["Amount Paid"],       r["Payment Currency"],
+                    r["Payment Format"],    r["Is Laundering"],
+                ])
+
+            if target_label == 1:
+                pat_f.write(
+                    f"\nBEGIN LAUNDERING ATTEMPT - AUGMENTED: "
+                    f"Generated network {net_idx + 1}\n"
+                )
+                for r in rows:
+                    pat_f.write(
+                        f"{r['Timestamp']},{r['From Bank']},{r['Account']},"
+                        f"{r['To Bank']},{r['To Account']},"
+                        f"{r['Amount Received']},{r['Receiving Currency']},"
+                        f"{r['Amount Paid']},{r['Payment Currency']},"
+                        f"{r['Payment Format']},{r['Is Laundering']}\n"
+                    )
+                pat_f.write("END LAUNDERING ATTEMPT - AUGMENTED\n")
+
+    print(f"  Saved → {csv_aug}")
+    print(f"  Saved → {pat_aug}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # IBM path
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,7 +482,7 @@ def run_ibm(args, device, results_dir):
         print("Extracting networks from CSV …")
         networks = extract_networks_igraph(
             df_full, max_depth=4, max_networks=4000,
-            collapse_threshold=10, max_nodes=300,
+            collapse_threshold=10, max_nodes=64,
         )
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
@@ -387,7 +499,7 @@ def run_ibm(args, device, results_dir):
     # -- 2. Load models -------------------------------------------------------
     print("Loading models …")
     encoder = load_simclr_encoder(device)
-    diff_model, diffusion, x_mean, x_std = load_diffusion_model(device)
+    diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device)
 
     # -- 3. SimCLR latent space plot -----------------------------------------
     print("Plotting SimCLR latent space …")
@@ -488,6 +600,10 @@ def run_ibm(args, device, results_dir):
         guide_from=GUIDE_FROM,
     )
 
+    # -- 7b. Save augmented CSV and patterns files ----------------------------
+    print("\nSaving augmented transaction files …")
+    _save_augmented_files(gen_outputs, ibm_csv)
+
     # -- 8. UMAP plot ---------------------------------------------------------
     print("\nPlotting UMAP …")
     _plot_umap(
@@ -581,7 +697,7 @@ def run_elliptic(args, device, results_dir):
                            results_dir / "simclr_latent_space.png")
 
     print("\nLoading Elliptic diffusion model …")
-    diff_model, diffusion, x_mean, x_std = load_diffusion_model_elliptic(device)
+    diff_model, diffusion, x_mean, x_std, _max_n_e = load_diffusion_model_elliptic(device)
 
     # -- 3. Encode + train probe ---------------------------------------------
     print("\nEncoding graphs …")

@@ -229,7 +229,7 @@ def extract_networks_igraph(
     max_networks=4000,
     collapse_threshold=10,
     min_size=5,
-    max_nodes=300,
+    max_nodes=64,
     random_seed=42,
 ):
     """
