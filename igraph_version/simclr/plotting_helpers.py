@@ -144,7 +144,8 @@ def plot_simclr_latent_space_laundering_vs_clean(
     if encoder is None:
         checkpoint = torch.load(_CHECKPOINT_DIR / "best_model.pt", map_location=device)
         # Infer in_dim from the checkpoint weights — robust across feature-dim changes.
-        _in_dim = checkpoint["encoder_state_dict"]["conv1.lin.weight"].shape[1]
+        from simclr import encoder_dims_from_state_dict as _edfs_plot
+        _in_dim, _, _, _ = _edfs_plot(checkpoint["encoder_state_dict"])
         encoder = GraphEncoder(in_dim=_in_dim, hidden_dim=64, out_dim=128).to(device)
         encoder.load_state_dict(checkpoint["encoder_state_dict"])
         encoder.eval()

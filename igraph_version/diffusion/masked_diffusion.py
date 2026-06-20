@@ -660,6 +660,7 @@ class GaussianDiffusion:
         mask_dropout_rate=0.4,
         laund_loss_weight=1.0,
         ghost_node_rate=0.3,
+        degree_seq_loss_weight=0.5,
         # ── Direction 1: feature-topology consistency ──────────────────────
         # Penalises divergence between structural features implied by adj_pred
         # (degree, clustering) and the ground-truth structural features in x_start.
@@ -674,6 +675,12 @@ class GaussianDiffusion:
         # Raising this cap from 2.0 lets the model upweight rare edges more
         # aggressively in very sparse graphs without switching to focal loss.
         adj_pos_weight_max=2.0,        # set to e.g. 10.0 for sparser datasets
+        # ── Edge dropout ───────────────────────────────────────────────────
+        # Randomly zero a fraction of adj_t edges before the model forward pass.
+        # This prevents oversmoothing: when adj_t is always fully observed the GNN
+        # aggregates over all neighbours, collapsing embeddings and causing adj_pred
+        # to be uniformly high for all pairs.
+        edge_drop_rate=0.0,            # set to e.g. 0.15 to enable
     ):
 
         if model_kwargs is None:
@@ -746,7 +753,11 @@ class GaussianDiffusion:
         # Forward pass with the corrupted mask
         training_kwargs = {**model_kwargs, "node_mask": node_mask_t}
         if adj_t is not None:
-            training_kwargs["adj"] = adj_t
+            adj_t_in = adj_t
+            if edge_drop_rate > 0.0 and model.training:
+                drop = th.bernoulli(th.full_like(adj_t, 1.0 - edge_drop_rate))
+                adj_t_in = adj_t * drop
+            training_kwargs["adj"] = adj_t_in
 
         model_output_x, adj_pred, node_logits = model(
             x_t,
@@ -855,6 +866,33 @@ class GaussianDiffusion:
             density_loss = (pred_density - true_density) ** 2
 
             loss = loss + density_loss_weight * density_loss
+
+            # ── Degree sequence adherence loss ────────────────────────────────
+            # When degree_seq conditioning is active, explicitly penalise adj_pred
+            # for producing per-node degrees that deviate from the target sequence.
+            # This ensures the model learns to USE the degree_seq signal rather than
+            # ignoring it (which would happen if only the adj BCE provided supervision).
+            #
+            # degree_seq: [B, N, 1] with values in [0, 1] = degree / n_active.
+            # We normalise adj_pred's degree by the same denominator so both sides
+            # live on the same scale regardless of graph size.
+            if degree_seq_loss_weight > 0.0 and "degree_seq" in model_kwargs:
+                deg_seq = model_kwargs["degree_seq"]          # [B, N, 1]
+                deg_pred_raw = adj_pred.sum(dim=-1, keepdim=True)   # [B, N, 1]
+                if node_mask is not None:
+                    n_act = node_mask.sum(dim=-1, keepdim=True).unsqueeze(-1).clamp(min=1.0)  # [B,1,1]
+                else:
+                    n_act = float(adj_pred.shape[-1])
+                deg_pred_norm = deg_pred_raw / n_act          # [B, N, 1] in same scale as deg_seq
+
+                sq = (deg_pred_norm - deg_seq) ** 2           # [B, N, 1]
+                if node_mask is not None:
+                    nm = node_mask.unsqueeze(-1)               # [B, N, 1]
+                    deg_seq_loss = (sq * nm).sum(dim=[1, 2]) / nm.sum(dim=[1, 2]).clamp(min=1.0)
+                else:
+                    deg_seq_loss = sq.mean(dim=[1, 2])
+
+                loss = loss + degree_seq_loss_weight * deg_seq_loss
 
             # ── Direction 1: feature-topology consistency regulariser ─────────
             # Forces adj_pred to produce structural statistics (degree, clustering)

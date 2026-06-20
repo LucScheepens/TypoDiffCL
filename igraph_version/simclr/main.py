@@ -150,8 +150,8 @@ if __name__ == "__main__":
         probe_weight=0.5,
         # Classifier-guided diffusion views (n_steps=5 keeps overhead manageable)
         view_type="guided",
-        diff_n_steps=5,
-        diff_t_start_frac=0.4,
+        diff_n_steps=15,
+        diff_t_start_frac=0.25,
         diff_guidance_scale=1.5,
         diffusion_model=diff_model,
         diffusion=diffusion,

@@ -49,9 +49,11 @@ DIFF_IBM_WARMUP      = 15
 DIFF_IBM_HIDDEN      = 128
 DIFF_IBM_TIMESTEPS   = 500
 DIFF_IBM_ADJ_W       = 0.3
-DIFF_IBM_DENSITY_W   = 3.0
+DIFF_IBM_DENSITY_W   = 8.0   # was 3.0 — raised to dominate connectivity pressure
 DIFF_IBM_LAUND_W     = 2.0
 DIFF_IBM_GRAD_CLIP   = 1.0
+DIFF_IBM_LAYERS      = 3     # was 4 — fewer layers → less oversmoothing on dense adj input
+DIFF_IBM_EDGE_DROP   = 0.15  # fraction of adj_t edges zeroed before each forward pass
 
 # ── Diffusion hyperparameters (Elliptic) ──────────────────────────────────────
 DIFF_ELL_EPOCHS      = 200
@@ -61,9 +63,11 @@ DIFF_ELL_WARMUP      = 10
 DIFF_ELL_HIDDEN      = 128
 DIFF_ELL_TIMESTEPS   = 500
 DIFF_ELL_ADJ_W       = 0.3
-DIFF_ELL_DENSITY_W   = 3.0
+DIFF_ELL_DENSITY_W   = 8.0   # was 3.0
 DIFF_ELL_LAUND_W     = 2.0
 DIFF_ELL_GRAD_CLIP   = 1.0
+DIFF_ELL_LAYERS      = 3     # was 4
+DIFF_ELL_EDGE_DROP   = 0.15
 
 # ── SimCLR hyperparameters (IBM) ──────────────────────────────────────────────
 SIMCLR_IBM_EPOCHS      = 100
@@ -101,11 +105,17 @@ DIFF_ELL_LABEL_DROP  = 0.10
 SIMCLR_IBM_PROBE_W   = 0.20
 SIMCLR_ELL_PROBE_W   = 0.20
 
+# ── NT-Xent temperature ───────────────────────────────────────────────────────
+# Lower temperature → harder negatives → sharper loss gradients → better
+# separation.  Default was 0.5; 0.15 is a well-validated setting for SimCLR.
+SIMCLR_IBM_NTXENT_T  = 0.15
+SIMCLR_ELL_NTXENT_T  = 0.15
+
 # ── Connectivity penalty in diffusion (IBM + Elliptic) ───────────────────────
 # Penalises any real node whose predicted soft-degree is below 1, directly
 # discouraging the model from generating graphs with isolated sub-components.
-DIFF_IBM_CONN_W      = 1.50
-DIFF_ELL_CONN_W      = 1.50
+DIFF_IBM_CONN_W      = 0.50   # was 1.50 — high weight was pushing all nodes to over-connect
+DIFF_ELL_CONN_W      = 0.50   # was 1.50
 
 # ── Option 3: SimCLR alignment loss in diffusion (IBM) ───────────────────────
 # Uses a frozen SimCLR encoder to align diffusion's predicted x0 with real
@@ -140,6 +150,10 @@ SIMCLR_DIR = ROOT_DIR / "simclr"
 DATA_DIR   = ROOT_DIR / "data"
 CKPT_DIR   = ROOT_DIR / "checkpoints"
 
+# Per-dataset checkpoint dirs — overridden by --ckpt-dir at runtime
+IBM_DIFF_CKPT_DIR   = CKPT_DIR / "diffusion_ibm"
+IBM_SIMCLR_CKPT_DIR = CKPT_DIR / "simclr_ibm"
+
 for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -158,9 +172,10 @@ def train_diffusion_ibm(device):
     from augmentation        import build_igraph_from_transactions
     from util import (preprocess_df, extract_networks_igraph)
 
-    cache_path = DATA_DIR / "cached_dataset_ibm.pt"
+    csv_stem   = Path(IBM_CSV_PATH).stem
+    cache_path = DATA_DIR / f"cached_dataset_{csv_stem}.pt"
     graphs_dir = str(DIFF_DIR / "graphs")
-    out_path   = CKPT_DIR / "diffusion_ibm" / "model.pt"
+    out_path   = IBM_DIFF_CKPT_DIR / "model.pt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
@@ -180,7 +195,7 @@ def train_diffusion_ibm(device):
             return True
         return False
 
-    simclr_cache = DATA_DIR / "simclr_networks_cache.pt"
+    simclr_cache = DATA_DIR / f"simclr_networks_cache_{csv_stem}.pt"
 
     if _needs_rebuild():
         print("Extracting IBM networks …")
@@ -212,8 +227,10 @@ def train_diffusion_ibm(device):
     x_mean, x_std = x_mean.to(device), x_std.to(device)
     print(f"Dataset: {len(dataset)} graphs")
 
-    model     = DiffusionGNN(node_dim=NODE_DIM, hidden_dim=DIFF_IBM_HIDDEN, num_layers=4,
-                             class_conditional=DIFF_IBM_CLASS_COND).to(device)
+    model     = DiffusionGNN(node_dim=NODE_DIM, hidden_dim=DIFF_IBM_HIDDEN,
+                             num_layers=DIFF_IBM_LAYERS,
+                             class_conditional=DIFF_IBM_CLASS_COND,
+                             degree_conditioning=True).to(device)
     diffusion = create_diffusion(T=DIFF_IBM_TIMESTEPS)
     resampler = LossSecondMomentResampler(diffusion)
     optimizer = torch.optim.Adam(model.parameters(), lr=DIFF_IBM_LR)
@@ -221,16 +238,14 @@ def train_diffusion_ibm(device):
     # Option 3: load frozen SimCLR encoder for embedding-space alignment loss.
     # Only activated when a SimCLR checkpoint from a previous run already exists.
     frozen_enc_ibm = None
-    simclr_ckpt_ibm = CKPT_DIR / "simclr_ibm" / "best_model.pt"
+    simclr_ckpt_ibm = IBM_SIMCLR_CKPT_DIR / "best_model.pt"
     if DIFF_IBM_ALIGN_W > 0 and simclr_ckpt_ibm.exists():
         from simclr import GraphEncoder
         from torch_geometric.data import Data as _PygData, Batch as _PygBatch
         _sc = torch.load(str(simclr_ckpt_ibm), map_location=device, weights_only=False)
         _sd = _sc["encoder_state_dict"]
-        _in  = _sd["conv1.lin.weight"].shape[1]
-        _hid = _sd["conv1.lin.weight"].shape[0]
-        _nl  = 3 if "conv3.lin.weight" in _sd else 2
-        _bn  = "bn1.weight" in _sd
+        from simclr import encoder_dims_from_state_dict as _edfs
+        _in, _hid, _nl, _bn = _edfs(_sd)
         frozen_enc_ibm = GraphEncoder(in_dim=_in, hidden_dim=_hid, out_dim=128,
                                        n_layers=_nl, use_bn=_bn).to(device)
         frozen_enc_ibm.load_state_dict(_sc["encoder_state_dict"])
@@ -279,9 +294,20 @@ def train_diffusion_ibm(device):
             t, weights = resampler.sample(x_batch.shape[0], device)
             with torch.autocast("cuda", enabled=use_amp):
                 x_t, adj_t = diffusion.q_sample(x_norm, t, node_mask=mask, adj_start=adj_batch)
+                # Edge dropout: randomly zero some edges in the input adjacency so the
+                # model cannot rely on a dense adj at every step.  This reduces
+                # oversmoothing (all embeddings collapse → uniform adj_pred) and teaches
+                # the model to predict reasonable adjacency even from sparser inputs.
+                if DIFF_IBM_EDGE_DROP > 0:
+                    drop = torch.bernoulli(
+                        torch.full_like(adj_t, 1.0 - DIFF_IBM_EDGE_DROP)
+                    )
+                    adj_t_in = adj_t * drop
+                else:
+                    adj_t_in = adj_t
                 eps_pred, adj_pred, node_pred = model(
                     x_t, diffusion._scale_timesteps(t),
-                    adj=adj_t, node_mask=mask,
+                    adj=adj_t_in, node_mask=mask,
                     class_labels=class_labels,        # Option 1
                 )
                 # noise-pred loss on continuous features
@@ -326,7 +352,7 @@ def train_diffusion_ibm(device):
                 x0_cont = (x_t[..., 1:].float().detach() - sqrt_1m * eps_pred_f[..., 1:]) / sqrt_ab
                 x0_cont = x0_cont * x_std[1:] + x_mean[1:]      # denormalise
                 pyg_pred_list, pyg_real_list = [], []
-                _enc_in = frozen_enc_ibm.conv1.lin.weight.shape[1]
+                _enc_in = frozen_enc_ibm.in_dim
                 for bi in range(x_batch.shape[0]):
                     n_bi = int(mask[bi].sum().item())
                     if n_bi < 2:
@@ -364,7 +390,9 @@ def train_diffusion_ibm(device):
 
         torch.save({"model": model.state_dict(),
                     "x_mean": x_mean.cpu(), "x_std": x_std.cpu(),
-                    "class_conditional": DIFF_IBM_CLASS_COND}, out_path)
+                    "class_conditional": DIFF_IBM_CLASS_COND,
+                    "num_layers": DIFF_IBM_LAYERS,
+                    "degree_conditioning": True}, out_path)
 
     print(f"\nIBM diffusion checkpoint saved → {out_path}")
 
@@ -380,9 +408,10 @@ def train_simclr_ibm(device):
     from diffusion.model     import DiffusionGNN
     from diffusion.diff_util import create_diffusion
 
-    ckpt_dir  = CKPT_DIR / "simclr_ibm"
-    diff_ckpt = CKPT_DIR / "diffusion_ibm" / "model.pt"
-    cache_pt  = DATA_DIR / "simclr_networks_cache.pt"
+    ckpt_dir  = IBM_SIMCLR_CKPT_DIR
+    diff_ckpt = IBM_DIFF_CKPT_DIR / "model.pt"
+    csv_stem  = Path(IBM_CSV_PATH).stem
+    cache_pt  = DATA_DIR / f"simclr_networks_cache_{csv_stem}.pt"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
@@ -429,8 +458,13 @@ def train_simclr_ibm(device):
         ckpt            = torch.load(str(diff_ckpt), map_location=device, weights_only=False)
         node_dim_ckpt   = ckpt["model"]["input_proj.weight"].shape[1]
         class_cond_ckpt = ckpt.get("class_conditional", False)
-        diff_model = DiffusionGNN(node_dim=node_dim_ckpt, hidden_dim=DIFF_IBM_HIDDEN, num_layers=4,
-                                  class_conditional=class_cond_ckpt).to(device)
+        num_layers_ckpt = ckpt.get("num_layers", 4)   # fallback for old checkpoints
+        deg_cond_ckpt   = ckpt.get("degree_conditioning",
+                                    "degree_proj.weight" in ckpt["model"])
+        diff_model = DiffusionGNN(node_dim=node_dim_ckpt, hidden_dim=DIFF_IBM_HIDDEN,
+                                  num_layers=num_layers_ckpt,
+                                  class_conditional=class_cond_ckpt,
+                                  degree_conditioning=deg_cond_ckpt).to(device)
         diff_model.load_state_dict(ckpt["model"])
         diff_model.eval()
         diffusion = create_diffusion(T=DIFF_IBM_TIMESTEPS)
@@ -476,17 +510,22 @@ def train_simclr_ibm(device):
         diffusion_t_frac=SIMCLR_IBM_T_FRAC,
         max_nodes=IBM_MAX_NODES,
         probe_weight=SIMCLR_IBM_PROBE_W,
+        ntxent_temperature=SIMCLR_IBM_NTXENT_T,
+        supcon_weight=SIMCLR_IBM_SUPCON_W,
+        supcon_temperature=SIMCLR_IBM_SUPCON_T,
         # Task-aware augmentation
         use_curriculum=True,
         curriculum_epochs=max(1, SIMCLR_IBM_EPOCHS // 2),
         use_motif_preserving=True,
         use_saliency=SIMCLR_IBM_PROBE_W > 0,
         saliency_update_interval=20,
-        # Classifier-guided diffusion views (requires probe_weight > 0)
-        view_type="guided" if (diff_model is not None and SIMCLR_IBM_PROBE_W > 0) else "single_step",
+        # Start with multi-step DDIM views so the encoder warms up before the
+        # probe is fit; switch to guided views after probe_warmup_epochs.
+        view_type="multistep_to_guided" if (diff_model is not None and SIMCLR_IBM_PROBE_W > 0) else "single_step",
         diff_n_steps=5,
         diff_t_start_frac=0.4,
         diff_guidance_scale=1.5,
+        probe_warmup_epochs=max(20, SIMCLR_IBM_EPOCHS // 3),
     )
     print(f"\nIBM SimCLR checkpoints saved → {ckpt_dir}")
 
@@ -556,8 +595,10 @@ def train_diffusion_elliptic(device):
     x_mean[1:] = all_x[:, 1:].mean(0); x_std[1:] = all_x[:, 1:].std(0).clamp(min=1e-6)
     x_mean, x_std = x_mean.to(device), x_std.to(device)
 
-    model     = DiffusionGNN(node_dim=NODE_DIM, hidden_dim=DIFF_ELL_HIDDEN, num_layers=4,
-                             class_conditional=DIFF_ELL_CLASS_COND).to(device)
+    model     = DiffusionGNN(node_dim=NODE_DIM, hidden_dim=DIFF_ELL_HIDDEN,
+                             num_layers=DIFF_ELL_LAYERS,
+                             class_conditional=DIFF_ELL_CLASS_COND,
+                             degree_conditioning=True).to(device)
     diffusion = create_diffusion(T=DIFF_ELL_TIMESTEPS)
     resampler = LossSecondMomentResampler(diffusion)
     optimizer = torch.optim.Adam(model.parameters(), lr=DIFF_ELL_LR)
@@ -570,10 +611,8 @@ def train_diffusion_elliptic(device):
         from torch_geometric.data import Data as _PygData, Batch as _PygBatch
         _sc = torch.load(str(simclr_ckpt_ell), map_location=device, weights_only=False)
         _sd = _sc["encoder_state_dict"]
-        _in  = _sd["conv1.lin.weight"].shape[1]
-        _hid = _sd["conv1.lin.weight"].shape[0]
-        _nl  = 3 if "conv3.lin.weight" in _sd else 2
-        _bn  = "bn1.weight" in _sd
+        from simclr import encoder_dims_from_state_dict as _edfs_ell
+        _in, _hid, _nl, _bn = _edfs_ell(_sd)
         frozen_enc_ell = GraphEncoder(in_dim=_in, hidden_dim=_hid, out_dim=128,
                                        n_layers=_nl, use_bn=_bn).to(device)
         frozen_enc_ell.load_state_dict(_sc["encoder_state_dict"])
@@ -622,9 +661,16 @@ def train_diffusion_elliptic(device):
             t, _ = resampler.sample(x_batch.shape[0], device)
             with torch.autocast("cuda", enabled=use_amp):
                 x_t, adj_t = diffusion.q_sample(x_norm, t, node_mask=mask, adj_start=adj_batch)
+                if DIFF_ELL_EDGE_DROP > 0:
+                    drop = torch.bernoulli(
+                        torch.full_like(adj_t, 1.0 - DIFF_ELL_EDGE_DROP)
+                    )
+                    adj_t_in = adj_t * drop
+                else:
+                    adj_t_in = adj_t
                 eps_pred, adj_pred, _ = model(
                     x_t, diffusion._scale_timesteps(t),
-                    adj=adj_t, node_mask=mask,
+                    adj=adj_t_in, node_mask=mask,
                     class_labels=class_labels,        # Option 1
                 )
                 noise_true = x_t[:, :, 1:] - x_norm[:, :, 1:]
@@ -699,7 +745,9 @@ def train_diffusion_elliptic(device):
 
         torch.save({"model": model.state_dict(),
                     "x_mean": x_mean.cpu(), "x_std": x_std.cpu(),
-                    "class_conditional": DIFF_ELL_CLASS_COND}, out_path)
+                    "class_conditional": DIFF_ELL_CLASS_COND,
+                    "num_layers": DIFF_ELL_LAYERS,
+                    "degree_conditioning": True}, out_path)
 
     print(f"\nElliptic diffusion checkpoint saved → {out_path}")
 
@@ -746,8 +794,13 @@ def train_simclr_elliptic(device):
     if diff_ckpt.exists():
         ckpt            = torch.load(str(diff_ckpt), map_location=device, weights_only=False)
         class_cond_ckpt = ckpt.get("class_conditional", False)
-        diff_model = DiffusionGNN(node_dim=6, hidden_dim=DIFF_ELL_HIDDEN, num_layers=4,
-                                  class_conditional=class_cond_ckpt).to(device)
+        num_layers_ckpt = ckpt.get("num_layers", 4)
+        deg_cond_ckpt   = ckpt.get("degree_conditioning",
+                                    "degree_proj.weight" in ckpt["model"])
+        diff_model = DiffusionGNN(node_dim=6, hidden_dim=DIFF_ELL_HIDDEN,
+                                  num_layers=num_layers_ckpt,
+                                  class_conditional=class_cond_ckpt,
+                                  degree_conditioning=deg_cond_ckpt).to(device)
         diff_model.load_state_dict(ckpt["model"])
         diff_model.eval()
         diffusion = create_diffusion(T=DIFF_ELL_TIMESTEPS)
@@ -852,7 +905,7 @@ def train_simclr_elliptic(device):
             optimizer.zero_grad()
             h1 = encoder(b1); h2 = encoder(b2)
             z1 = projector(h1); z2 = projector(h2)
-            ntxent  = nt_xent_loss(z1, z2)
+            ntxent  = nt_xent_loss(z1, z2, temperature=SIMCLR_ELL_NTXENT_T)
             z_all   = torch.cat([z1, z2]); lbl_all = torch.cat([labels, labels])
             sc      = sup_con_loss(z_all, lbl_all, temperature=SIMCLR_ELL_SUPCON_T)
 
@@ -907,11 +960,20 @@ def main():
                         help="Which phase to run (default: all)")
     parser.add_argument("--ibm-csv", type=str, default=None,
                         help="Override IBM CSV path (overrides IBM_CSV_PATH in CONFIG)")
+    parser.add_argument("--ckpt-dir", type=str, default=None,
+                        help="Root checkpoint directory; diffusion saved to <dir>/diffusion/, "
+                             "simclr to <dir>/simclr/ (default: checkpoints/diffusion_ibm + "
+                             "checkpoints/simclr_ibm)")
     args = parser.parse_args()
 
     if args.ibm_csv:
         global IBM_CSV_PATH
         IBM_CSV_PATH = args.ibm_csv
+
+    if args.ckpt_dir:
+        global IBM_DIFF_CKPT_DIR, IBM_SIMCLR_CKPT_DIR
+        IBM_DIFF_CKPT_DIR   = Path(args.ckpt_dir) / "diffusion"
+        IBM_SIMCLR_CKPT_DIR = Path(args.ckpt_dir) / "simclr"
 
     dataset = args.dataset
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")

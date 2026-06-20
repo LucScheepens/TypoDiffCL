@@ -6,6 +6,58 @@ import time
 import copy
 
 
+def precompute_augmentation_cache(networks):
+    """
+    Precompute expensive graph features for all original networks and store
+    them in each network dict so augmentation calls can skip recomputation.
+
+    Sets three keys on every network dict:
+      _bridge_name_pairs : set of (min_name, max_name) tuples that are bridges
+      _eb_by_name_pair   : {(min_name, max_name) -> normalised edge betweenness}
+      _ap_names          : set of node names that are articulation points
+
+    These are automatically inherited by augmented copies via dict unpacking
+    ({**network, ...}), so crop / edge-delete / node-delete functions can use
+    them on subgraphs without recomputation.
+    """
+    for net in networks:
+        g = net.get("graph")
+        if g is None or g.vcount() < 2 or g.ecount() == 0:
+            net["_bridge_name_pairs"] = set()
+            net["_eb_by_name_pair"]   = {}
+            net["_ap_names"]          = set()
+            continue
+
+        has_names = "name" in g.vs.attributes()
+        g_undir   = g.as_undirected(combine_edges="first")
+
+        # ── bridges ──────────────────────────────────────────────────────────
+        bridge_name_pairs: set = set()
+        for eid in g_undir.bridges():
+            e  = g_undir.es[eid]
+            n1 = g_undir.vs[e.source]["name"] if has_names else e.source
+            n2 = g_undir.vs[e.target]["name"] if has_names else e.target
+            bridge_name_pairs.add((min(n1, n2), max(n1, n2)))
+        net["_bridge_name_pairs"] = bridge_name_pairs
+
+        # ── edge betweenness ──────────────────────────────────────────────────
+        eb     = g_undir.edge_betweenness(directed=False)
+        max_eb = max(eb) if eb and max(eb) > 0 else 1.0
+        eb_by_name_pair: dict = {}
+        for eid, e in enumerate(g_undir.es):
+            n1   = g_undir.vs[e.source]["name"] if has_names else e.source
+            n2   = g_undir.vs[e.target]["name"] if has_names else e.target
+            pair = (min(n1, n2), max(n1, n2))
+            eb_by_name_pair[pair] = eb[eid] / max_eb
+        net["_eb_by_name_pair"] = eb_by_name_pair
+
+        # ── articulation points ───────────────────────────────────────────────
+        net["_ap_names"] = {
+            (g_undir.vs[vid]["name"] if has_names else vid)
+            for vid in g_undir.articulation_points()
+        }
+
+
 def build_igraph_from_transactions(tx_df):
     """
     Build a directed igraph graph from transactions dataframe.
@@ -98,18 +150,30 @@ def delete_random_edges(network, delete_frac=0.15, random_seed=None):
     if g.ecount() < 2:
         return {**network, "graph": g}
 
-    # Bridges on the undirected view — O(V+E), fast
-    g_undir = g.as_undirected(combine_edges="first")
-    bridge_pairs = set()
-    for eid in g_undir.bridges():
-        e = g_undir.es[eid]
-        bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+    has_names     = "name" in g.vs.attributes()
+    _bridge_cache = network.get("_bridge_name_pairs")
 
-    # Any directed edge whose undirected pair is a bridge is excluded
-    non_bridges = [
-        e.index for e in g.es
-        if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
-    ]
+    if _bridge_cache is not None:
+        # Fast path: use precomputed bridge pairs keyed by node names.
+        # Works for subgraphs (after crop) because node names are preserved.
+        non_bridges = []
+        for e in g.es:
+            n1 = g.vs[e.source]["name"] if has_names else e.source
+            n2 = g.vs[e.target]["name"] if has_names else e.target
+            if (min(n1, n2), max(n1, n2)) not in _bridge_cache:
+                non_bridges.append(e.index)
+    else:
+        # Slow path: compute bridges on-the-fly
+        g_undir     = g.as_undirected(combine_edges="first")
+        bridge_pairs = set()
+        for eid in g_undir.bridges():
+            e = g_undir.es[eid]
+            bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+        non_bridges = [
+            e.index for e in g.es
+            if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
+        ]
+
     if not non_bridges:
         return {**network, "graph": g}
 
@@ -133,29 +197,36 @@ def delete_nodes(network, delete_frac=0.15, random_seed=None):
     if g.vcount() < 3:
         return {**network, "graph": g}
 
-    # Find articulation points on the undirected version
-    g_undir = g.as_undirected(combine_edges="first")
-    art_point_vids = set(g_undir.articulation_points())
-
+    has_names        = "name" in g.vs.attributes()
     laundering_names = network["laundering_nodes"]
+    _ap_cache        = network.get("_ap_names")
 
-    # Eligible: not an articulation point and not a laundering node
-    deletable_vids = [
-        v.index for v in g.vs
-        if v.index not in art_point_vids
-        and v["name"] not in laundering_names
-    ]
+    if _ap_cache is not None:
+        # Fast path: use precomputed AP names (conservative approximation for subgraphs)
+        deletable_vids = [
+            v.index for v in g.vs
+            if (g.vs[v.index]["name"] if has_names else v.index) not in _ap_cache
+            and (g.vs[v.index]["name"] if has_names else v.index) not in laundering_names
+        ]
+    else:
+        # Slow path: find articulation points on-the-fly
+        g_undir        = g.as_undirected(combine_edges="first")
+        art_point_vids = set(g_undir.articulation_points())
+        deletable_vids = [
+            v.index for v in g.vs
+            if v.index not in art_point_vids
+            and (g.vs[v.index]["name"] if has_names else v.index) not in laundering_names
+        ]
 
     if not deletable_vids:
         return {**network, "graph": g}
 
-    target = max(1, int(len(deletable_vids) * delete_frac))
+    target    = max(1, int(len(deletable_vids) * delete_frac))
     random.shuffle(deletable_vids)
     to_delete = deletable_vids[:target]
 
-    deleted_names = {g.vs[vid]["name"] for vid in to_delete}
+    deleted_names = {(g.vs[vid]["name"] if has_names else vid) for vid in to_delete}
     g.delete_vertices(to_delete)
-
     remaining = network["nodes"] - deleted_names
 
     return {
@@ -276,10 +347,13 @@ def delete_edges_motif_preserving(network, delete_frac=0.15, random_seed=None):
     """
     Delete edges biased toward structurally unimportant ones.
 
-    Uses edge betweenness centrality (computed on the undirected view via
-    igraph's C implementation) as an importance proxy.  High-betweenness edges
-    sit on many shortest paths and are likely structurally critical; they are
-    given a low deletion probability.  Bridges are never deleted.
+    Uses edge betweenness centrality as an importance proxy.  High-betweenness
+    edges sit on many shortest paths; they are given a low deletion probability.
+    Bridges are never deleted.
+
+    Uses precomputed caches (_bridge_name_pairs, _eb_by_name_pair) when
+    available (set by precompute_augmentation_cache), avoiding expensive
+    O(VE) betweenness recomputation on every augmented view.
     """
     if random_seed is not None:
         random.seed(random_seed)
@@ -288,42 +362,62 @@ def delete_edges_motif_preserving(network, delete_frac=0.15, random_seed=None):
     if g.ecount() < 2:
         return {**network, "graph": g}
 
-    g_undir = g.as_undirected(combine_edges="first")
+    has_names     = "name" in g.vs.attributes()
+    _bridge_cache = network.get("_bridge_name_pairs")
+    _eb_cache     = network.get("_eb_by_name_pair")
+    g_undir       = None  # built lazily — only if caches are missing
 
-    bridge_pairs = set()
-    for eid in g_undir.bridges():
-        e = g_undir.es[eid]
-        bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+    # ── identify non-bridge edges ─────────────────────────────────────────────
+    if _bridge_cache is not None:
+        non_bridges = []
+        for e in g.es:
+            n1 = g.vs[e.source]["name"] if has_names else e.source
+            n2 = g.vs[e.target]["name"] if has_names else e.target
+            if (min(n1, n2), max(n1, n2)) not in _bridge_cache:
+                non_bridges.append(e.index)
+    else:
+        g_undir      = g.as_undirected(combine_edges="first")
+        bridge_pairs = set()
+        for eid in g_undir.bridges():
+            e = g_undir.es[eid]
+            bridge_pairs.add((min(e.source, e.target), max(e.source, e.target)))
+        non_bridges = [
+            e.index for e in g.es
+            if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
+        ]
 
-    non_bridges = [
-        e.index for e in g.es
-        if (min(e.source, e.target), max(e.source, e.target)) not in bridge_pairs
-    ]
     if not non_bridges:
         return {**network, "graph": g}
 
-    # Edge betweenness on undirected graph, normalised to [0,1]
-    eb     = g_undir.edge_betweenness(directed=False)
-    max_eb = max(eb) if max(eb) > 0 else 1.0
+    # ── build importance weights ──────────────────────────────────────────────
+    if _eb_cache is not None:
+        # Fast path: look up betweenness by node name — works for subgraphs
+        weights = []
+        for eid in non_bridges:
+            e  = g.es[eid]
+            n1 = g.vs[e.source]["name"] if has_names else e.source
+            n2 = g.vs[e.target]["name"] if has_names else e.target
+            importance = _eb_cache.get((min(n1, n2), max(n1, n2)), 0.5)
+            weights.append(1.0 - importance + 0.01)
+    else:
+        # Slow path: compute edge betweenness on-the-fly
+        if g_undir is None:
+            g_undir = g.as_undirected(combine_edges="first")
+        eb     = g_undir.edge_betweenness(directed=False)
+        max_eb = max(eb) if max(eb) > 0 else 1.0
+        eb_by_pair = {
+            (min(e.source, e.target), max(e.source, e.target)): eb[eid] / max_eb
+            for eid, e in enumerate(g_undir.es)
+        }
+        weights = []
+        for eid in non_bridges:
+            e    = g.es[eid]
+            pair = (min(e.source, e.target), max(e.source, e.target))
+            weights.append(1.0 - eb_by_pair.get(pair, 0.5) + 0.01)
 
-    # Build (min_vid, max_vid) → normalised betweenness lookup
-    eb_by_pair = {}
-    for eid, e in enumerate(g_undir.es):
-        pair = (min(e.source, e.target), max(e.source, e.target))
-        eb_by_pair[pair] = eb[eid] / max_eb
-
-    # Invert: low importance = high deletion probability
-    weights = []
-    for eid in non_bridges:
-        e = g.es[eid]
-        pair = (min(e.source, e.target), max(e.source, e.target))
-        importance = eb_by_pair.get(pair, 0.5)
-        weights.append(1.0 - importance + 0.01)
-
-    probs = np.array(weights) / sum(weights)
+    probs  = np.array(weights) / sum(weights)
     target = max(1, int(len(non_bridges) * delete_frac))
-    chosen = list(np.random.choice(non_bridges,
-                                   size=min(target, len(non_bridges)),
+    chosen = list(np.random.choice(non_bridges, size=min(target, len(non_bridges)),
                                    replace=False, p=probs))
     g.delete_edges(chosen)
     return {**network, "graph": g}
@@ -341,6 +435,9 @@ def delete_nodes_saliency_guided(network, delete_frac=0.15,
     node_importance: dict {account_name (int) -> importance_score in [0,1]}.
       High scores → keep.  Falls back to uniform random deletion when None.
     Laundering nodes and articulation points are never deleted.
+
+    Uses precomputed _ap_names cache when available to avoid O(V+E)
+    articulation-point recomputation on every augmented view.
     """
     if random_seed is not None:
         random.seed(random_seed)
@@ -349,16 +446,26 @@ def delete_nodes_saliency_guided(network, delete_frac=0.15,
     if g.vcount() < 3:
         return {**network, "graph": g}
 
-    g_undir       = g.as_undirected(combine_edges="first")
-    art_vids      = set(g_undir.articulation_points())
-    laundering    = network["laundering_nodes"]
-    has_names     = "name" in g.vs.attributes()
+    has_names  = "name" in g.vs.attributes()
+    laundering = network["laundering_nodes"]
+    _ap_cache  = network.get("_ap_names")
 
-    deletable_vids = [
-        v.index for v in g.vs
-        if v.index not in art_vids
-        and (g.vs[v.index]["name"] if has_names else v.index) not in laundering
-    ]
+    if _ap_cache is not None:
+        # Fast path: use precomputed AP names (conservative approximation)
+        deletable_vids = [
+            v.index for v in g.vs
+            if (g.vs[v.index]["name"] if has_names else v.index) not in _ap_cache
+            and (g.vs[v.index]["name"] if has_names else v.index) not in laundering
+        ]
+    else:
+        # Slow path: compute articulation points on-the-fly
+        g_undir   = g.as_undirected(combine_edges="first")
+        art_vids  = set(g_undir.articulation_points())
+        deletable_vids = [
+            v.index for v in g.vs
+            if v.index not in art_vids
+            and (g.vs[v.index]["name"] if has_names else v.index) not in laundering
+        ]
 
     if not deletable_vids:
         return {**network, "graph": g}

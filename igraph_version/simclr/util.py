@@ -1,9 +1,10 @@
 import igraph as ig
 import math
 import os
+import random
 import numpy as np
 import pandas as pd
-from collections import deque
+from collections import deque, defaultdict
 
 def preprocess_df(CSV_PATH):
     """
@@ -86,12 +87,47 @@ def _build_tx_index(df):
     return idx
 
 
-def _extract_transactions(df, tx_index, component_nodes):
+def _build_laundering_adj(df):
+    """
+    Build an undirected adjacency mapping for laundering-only transactions.
+    Used to trace the full connected laundering component from a focal transaction.
+    """
+    adj = defaultdict(set)
+    laund = df[df["Is Laundering"] == 1]
+    senders   = laund["From_Account_int"].to_numpy()
+    receivers = laund["To_Account_int"].to_numpy()
+    for s, r in zip(senders, receivers):
+        s, r = int(s), int(r)
+        adj[s].add(r)
+        adj[r].add(s)
+    return adj
+
+
+def _trace_laundering_component(sender, receiver, laundering_adj, max_nodes):
+    """
+    BFS through the laundering-only graph from both endpoints of the focal
+    transaction.  Returns the full set of accounts reachable via laundering
+    edges, capped at max_nodes.
+    """
+    visited = set()
+    queue = deque([sender, receiver])
+    while queue and (max_nodes is None or len(visited) < max_nodes):
+        node = queue.popleft()
+        if node in visited:
+            continue
+        visited.add(node)
+        for nbr in laundering_adj.get(node, ()):
+            if nbr not in visited:
+                queue.append(nbr)
+    return visited
+
+
+def _extract_transactions(df, tx_index, component_nodes, cutoff_time=None):
     """
     Return the subset of df whose From_Account_int AND To_Account_int are
     both in component_nodes, using the pre-built tx_index for speed.
+    If cutoff_time is given, only transactions at or before that time are included.
     """
-    # Candidate rows: any row whose sender is in the component
     candidate_rows = set()
     for node in component_nodes:
         candidate_rows.update(tx_index.get(node, ()))
@@ -100,11 +136,11 @@ def _extract_transactions(df, tx_index, component_nodes):
         return df.iloc[:0].copy()
 
     sub = df.loc[list(candidate_rows)]
+    if cutoff_time is not None:
+        sub = sub[sub["Timestamp"] <= cutoff_time]
     mask = sub["To_Account_int"].isin(component_nodes)
     return sub[mask].copy()
 
-
-import random
 
 def extract_transaction_ego_networks(
     df,
@@ -112,32 +148,39 @@ def extract_transaction_ego_networks(
     max_nodes=50,
     n_pos=2000,
     neg_pos_ratio=10,
+    collapse_threshold=50,
+    bfs_mode="all",
     random_seed=42,
 ):
     """
-    Transaction-centric graph extraction for fair comparison with
-    transaction-level AML benchmarks (GFP, MultiGNN, FraudGT, etc.).
+    Training-mode subgraph extraction anchored on individual transactions.
 
-    For each sampled transaction we extract the 2-hop ego network of
-    BOTH the sender and receiver accounts, merged into one subgraph.
-    The graph label = that transaction's Is Laundering flag.
+    Positive examples (tx_label=1):
+        Trace the full connected component of laundering transactions reachable
+        from the focal transaction's sender and receiver via laundering-only
+        edges.  This gives structurally complete laundering patterns rather than
+        arbitrary BFS slices through the middle of a chain.  Up to max_nodes,
+        the laundering core is then padded with 1-hop clean context so the model
+        also sees the boundary between laundering and legitimate activity.
+        node_depths: 0 = laundering core, 1 = clean context.
 
-    Why this is more comparable to the paper:
-      - Label is per-transaction, not per-subgraph (same as the benchmark)
-      - Positive rate in the extracted set matches n_pos / (n_pos + n_neg),
-        and the TEST set can be kept at the natural dataset ratio
-      - The temporal ordering is preserved via net["timestamp"], enabling a
-        temporal train/test split identical to the paper's protocol
+    Negative examples (tx_label=0):
+        Standard BFS ego network from both endpoints up to max_depth hops,
+        identical to before.  No laundering component to trace.
+
+    Use extract_networks_igraph for evaluation: it samples at the natural class
+    ratio and places laundering nodes at random structural positions, mirroring
+    real-world inference conditions.
 
     Args:
-        df            : preprocessed DataFrame (must have Timestamp column,
-                        sorted ascending)
-        max_depth     : BFS depth from sender+receiver (default 2)
-        max_nodes     : max nodes per subgraph
-        n_pos         : number of laundering transactions to sample
-        neg_pos_ratio : how many clean transactions per laundering one for
-                        training; test set uses the natural ratio
-        random_seed   : reproducibility seed
+        df                 : preprocessed DataFrame (Timestamp column, sorted ascending)
+        max_depth          : BFS depth for negative ego networks (default 2)
+        max_nodes          : max nodes per subgraph
+        n_pos              : number of laundering transactions to sample
+        neg_pos_ratio      : clean transactions per laundering one
+        collapse_threshold : hub degree above which a node is collapsed
+        bfs_mode           : igraph neighbor mode ("all", "out", "in")
+        random_seed        : reproducibility seed
 
     Returns list of network dicts with keys:
         transactions, nodes, laundering_nodes, collapsed_nodes,
@@ -153,6 +196,11 @@ def extract_transaction_ego_networks(
     tx_index = _build_tx_index(df)
 
     pos_idx = df.index[df["Is Laundering"] == 1].tolist()
+    # Deduplicate by (sender, receiver) so near-identical ego networks
+    # don't inflate the training set and collapse the contrastive loss.
+    pos_rows = df.loc[pos_idx, ["From_Account_int", "To_Account_int"]]
+    pos_idx = pos_rows.drop_duplicates().index.tolist()
+
     neg_idx = df.index[df["Is Laundering"] == 0].tolist()
 
     n_pos   = min(n_pos, len(pos_idx))
@@ -163,54 +211,85 @@ def extract_transaction_ego_networks(
     sampled     = [(i, 1) for i in sampled_pos] + [(i, 0) for i in sampled_neg]
     rng.shuffle(sampled)
 
+    # Pre-compute once — scanning df twice per iteration for 22k+ samples is expensive.
+    all_laundering_accounts = set(
+        df.loc[df["Is Laundering"] == 1, "From_Account_int"]
+    ).union(df.loc[df["Is Laundering"] == 1, "To_Account_int"])
+
+    laundering_adj = _build_laundering_adj(df)
+
     networks = []
 
     for row_idx, tx_label in sampled:
-        row           = df.loc[row_idx]
-        sender        = int(row["From_Account_int"])
-        receiver      = int(row["To_Account_int"])
-        tx_timestamp  = row["Timestamp"]
+        row          = df.loc[row_idx]
+        sender       = int(row["From_Account_int"])
+        receiver     = int(row["To_Account_int"])
+        tx_timestamp = row["Timestamp"]
 
-        # BFS from both endpoints simultaneously
-        visited        = {}
-        collapsed_nodes = set()
-        queue          = deque([(sender, 0), (receiver, 0)])
+        if tx_label == 1:
+            # Trace the full connected laundering component from both endpoints,
+            # then pad with 1-hop clean context up to max_nodes.
+            core = _trace_laundering_component(
+                sender, receiver, laundering_adj, max_nodes
+            )
+            component_nodes = set(core)
+            collapsed_nodes = set()
 
-        while queue and (max_nodes is None or len(visited) < max_nodes):
-            node, depth = queue.popleft()
-            if node in visited:
-                continue
-            visited[node] = depth
-            neighbors = set(g.neighbors(node, mode="all"))
-            if len(neighbors) > 50:          # collapse hubs
-                collapsed_nodes.add(node)
-                continue
-            if depth >= max_depth:
-                continue
-            for nbr in neighbors:
-                if nbr not in visited:
-                    queue.append((nbr, depth + 1))
+            for node in list(core):
+                if max_nodes is not None and len(component_nodes) >= max_nodes:
+                    break
+                nbrs = g.neighbors(node, mode=bfs_mode)
+                if len(nbrs) > collapse_threshold:
+                    collapsed_nodes.add(node)
+                    continue
+                for nbr in nbrs:
+                    if nbr not in component_nodes:
+                        if max_nodes is not None and len(component_nodes) >= max_nodes:
+                            break
+                        component_nodes.add(nbr)
 
-        component_nodes = set(visited.keys())
+            # depth 0 = laundering core, depth 1 = clean context
+            node_depths = {n: 0 for n in core}
+            node_depths.update({n: 1 for n in component_nodes - core})
+        else:
+            # Standard BFS ego network for negatives.
+            visited = {}
+            collapsed_nodes = set()
+            queue = deque([(sender, 0), (receiver, 0)])
+
+            while queue and (max_nodes is None or len(visited) < max_nodes):
+                node, depth = queue.popleft()
+                if node in visited:
+                    continue
+                visited[node] = depth
+                neighbors = set(g.neighbors(node, mode=bfs_mode))
+                if len(neighbors) > collapse_threshold:
+                    collapsed_nodes.add(node)
+                    continue
+                if depth >= max_depth:
+                    continue
+                for nbr in neighbors:
+                    if nbr not in visited:
+                        queue.append((nbr, depth + 1))
+
+            component_nodes = set(visited.keys())
+            node_depths = visited
+
         if len(component_nodes) < 3:
             continue
 
-        transactions         = _extract_transactions(df, tx_index, component_nodes)
-        laundering_in_comp   = component_nodes & set(
-            df.loc[df["Is Laundering"] == 1, "From_Account_int"].tolist() +
-            df.loc[df["Is Laundering"] == 1, "To_Account_int"].tolist()
+        # Restrict to transactions at or before the focal tx to prevent future leakage.
+        transactions = _extract_transactions(
+            df, tx_index, component_nodes, cutoff_time=tx_timestamp
         )
+        laundering_in_comp = component_nodes & all_laundering_accounts
 
         networks.append({
             "start_node":      sender,
             "nodes":           component_nodes,
-            # laundering_nodes drives the x[:,0] feature in network_to_dense;
-            # use the actual laundering accounts in this subgraph so the
-            # node features are still informative for the diffusion model,
-            # but the GRAPH label comes from tx_label (the focal transaction)
-            "laundering_nodes": laundering_in_comp if tx_label == 1 else set(),
+            "laundering_nodes": laundering_in_comp,
             "collapsed_nodes": collapsed_nodes,
-            "node_depths":     visited,
+            "node_depths":     node_depths,
             "transactions":    transactions,
             "timestamp":       tx_timestamp,
             "tx_label":        tx_label,
@@ -230,20 +309,27 @@ def extract_networks_igraph(
     collapse_threshold=10,
     min_size=5,
     max_nodes=64,
+    bfs_mode="all",
+    sim_threshold=0.5,
     random_seed=42,
 ):
     """
-    Extract subgraphs by BFS from random starting nodes and label each
-    subgraph by whether it contains any laundering transactions.
+    Evaluation-mode subgraph extraction at the natural class ratio.
 
-    This avoids the structural leakage of the old approach (which always
-    started BFS from laundering nodes, making them artificially central).
-    Here laundering nodes appear at random structural positions — just as
-    they do in the real graph — so the classifier must learn genuine
-    laundering patterns rather than "is there a hub in the center?".
+    BFS starts from random nodes so laundering accounts appear at arbitrary
+    structural positions — exactly as at inference time, where you have no
+    prior knowledge of which transactions are laundering.  The natural class
+    imbalance is preserved, giving a realistic measure of detector performance.
+
+    Do NOT use this for training.  The laundering signal in positive subgraphs
+    can range from a complete laundering chain to a single laundering account
+    whose connections fall outside the subgraph boundary, making many positive
+    labels structurally ambiguous.  For training, use extract_transaction_ego_networks,
+    which anchors each positive on a known laundering transaction and traces the
+    full laundering component so the model sees complete patterns.
 
     Label assignment:
-        1  — subgraph contains at least one laundering transaction
+        1  — subgraph contains at least one laundering transaction (edge-based)
         0  — subgraph contains no laundering transactions
 
     Returns a list of network dicts compatible with network_to_dense().
@@ -286,7 +372,7 @@ def extract_networks_igraph(
 
             visited[node] = depth
 
-            neighbors = set(g.neighbors(node, mode="all"))
+            neighbors = set(g.neighbors(node, mode=bfs_mode))
 
             if len(neighbors) > collapse_threshold:
                 collapsed_nodes.add(node)
@@ -296,7 +382,7 @@ def extract_networks_igraph(
                 continue
 
             for nbr in neighbors:
-                if nbr not in visited and nbr not in used_nodes:
+                if nbr not in visited:
                     queue.append((nbr, depth + 1))
 
         component_nodes = set(visited.keys())
@@ -304,24 +390,28 @@ def extract_networks_igraph(
         if len(component_nodes) < min_size:
             continue
 
+        # Reject subgraphs too similar to recently extracted ones.
+        # Checking only the last 50 keeps this O(1) amortised per subgraph.
+        if any(
+            len(component_nodes & n["nodes"]) / len(component_nodes | n["nodes"])
+            > sim_threshold
+            for n in networks[-50:]
+        ):
+            continue
+
         transactions = _extract_transactions(df, tx_index, component_nodes)
 
-        # Label: does this subgraph contain any laundering transaction?
         laundering_in_component = component_nodes & laundering_nodes
-        has_laundering = len(
-            transactions[transactions["Is Laundering"] == 1]
-        ) > 0
+        has_laundering = len(transactions[transactions["Is Laundering"] == 1]) > 0
 
         network = {
             "start_node":      start_node,
             "nodes":           component_nodes,
-            # Use transaction-based label so isolated laundering nodes that
-            # happen to be in the subgraph but have no laundering edges don't
-            # produce false positives.
             "laundering_nodes": laundering_in_component if has_laundering else set(),
             "collapsed_nodes": collapsed_nodes,
             "node_depths":     visited,
             "transactions":    transactions,
+            "tx_label":        1 if has_laundering else 0,
         }
 
         networks.append(network)
@@ -330,7 +420,7 @@ def extract_networks_igraph(
         if len(networks) >= max_networks:
             break
 
-    pos = sum(1 for n in networks if len(n["laundering_nodes"]) > 0)
+    pos = sum(1 for n in networks if n["tx_label"] == 1)
     print(f"  Extracted {len(networks)} subgraphs: {pos} laundering, "
           f"{len(networks) - pos} clean  "
           f"(natural ratio {pos/max(len(networks),1)*100:.1f}% positive)")

@@ -55,7 +55,7 @@ def create_diffusion(T=1000, schedule="cosine"):
 
     return diffusion
 
-def network_to_dense(net, skip_patterns=False):
+def network_to_dense(net, skip_patterns=False, skip_topology=False):
     """
     Convert a single network dict to (x [n, 19], adj [n,n]) dense tensors.
 
@@ -85,6 +85,11 @@ def network_to_dense(net, skip_patterns=False):
     Cols 6-10 default to 0 for networks without transaction data.
     Cols 11-17 default to 0 for networks without directed transaction data.
     Col 18 is always computed from the undirected graph.
+
+    skip_topology : if True, skip O(VE) topology features (betweenness, pagerank,
+                    clustering, assortativity) and leave cols 2-5 as zero.  Use for
+                    augmented views where the original network's cached x_dense
+                    already provides these features for the full graph.
     """
     graph      = net["graph"]
     n          = graph.vcount()
@@ -93,14 +98,21 @@ def network_to_dense(net, skip_patterns=False):
     x = torch.zeros(n, 19)
 
     # ── Topology features (cols 0-5) ─────────────────────────────────────────
-    degrees_raw     = graph.degree()
-    max_deg         = max(max(degrees_raw), 1) if degrees_raw else 1
-    betweenness_raw = graph.betweenness(directed=graph.is_directed())
-    betw_denom      = max(1.0, (n - 1) * (n - 2) / 2)
-    clustering_raw  = graph.transitivity_local_undirected(mode="zero")
-    pagerank_raw    = graph.pagerank()
-    _assort         = graph.assortativity_degree(directed=False)
-    assortativity   = 0.0 if (_assort is None or math.isnan(_assort)) else _assort
+    degrees_raw = graph.degree()
+    max_deg     = max(max(degrees_raw), 1) if degrees_raw else 1
+    betw_denom  = max(1.0, (n - 1) * (n - 2) / 2)
+
+    if skip_topology:
+        betweenness_raw = [0.0] * n
+        clustering_raw  = [0.0] * n
+        pagerank_raw    = [0.0] * n
+        assortativity   = 0.0
+    else:
+        betweenness_raw = graph.betweenness(directed=graph.is_directed())
+        clustering_raw  = graph.transitivity_local_undirected(mode="zero")
+        pagerank_raw    = graph.pagerank()
+        _assort         = graph.assortativity_degree(directed=False)
+        assortativity   = 0.0 if (_assort is None or math.isnan(_assort)) else _assort
 
     # ── Transaction features per node (cols 6-10) ────────────────────────────
     tx_df = net.get("transactions", None)

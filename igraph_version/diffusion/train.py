@@ -43,15 +43,18 @@ TIMESTEPS     = 500
 # NOTE: changing this requires deleting the cache and retraining from scratch.
 MAX_NODES     = 64
 ADJ_LOSS_W          = 0.3
-DENSITY_LOSS_W      = 3.0   # penalise predicted density != true density (symmetric)
+DENSITY_LOSS_W      = 8.0   # was 3.0 — raised to dominate connectivity pressure
 NODE_EXIST_LOSS_W   = 1.0   # reconstruct node mask from corrupted input
 MASK_DROPOUT_RATE   = 0.15  # max fraction of nodes dropped at t=T  (was 0.4 — too noisy)
 GHOST_NODE_RATE     = 0.10  # max fraction of padding slots injected as ghost nodes at t=T (was 0.3)
 LAUND_LOSS_W        = 2.0   # upweight laundering BCE — rare class needs stronger signal
+EDGE_DROP_RATE      = 0.15  # fraction of adj_t edges zeroed before each forward pass
 # Direction 1: feature-topology consistency (adj_pred degree+clustering vs real features)
 CONS_LOSS_W         = 0.2   # set 0.0 to disable; 0.1–0.3 is a safe starting range
-# Direction 2: topology-aware adj BCE — raised cap for sparser real-graph datasets
-ADJ_POS_WEIGHT_MAX  = 10.0  # was hardcoded 2.0; raising lets the model upweight rare edges
+# Direction 2: topology-aware adj BCE — lowered back to 2.0 (10.0 biased model toward over-predicting edges)
+ADJ_POS_WEIGHT_MAX  = 2.0   # was 10.0
+# Direction 3: degree sequence conditioning
+DEG_SEQ_LOSS_W      = 0.5   # weight for per-node degree adherence loss
 MAX_GRAD_NORM = 1.0
 
 VIZ_INTERVAL  = 50
@@ -141,7 +144,8 @@ if __name__ == "__main__":
 
     # -- Model ---------------------------------------------------------------
 
-    model     = DiffusionGNN(node_dim=NODE_DIM, hidden_dim=HIDDEN, num_layers=4).to(DEVICE)
+    model     = DiffusionGNN(node_dim=NODE_DIM, hidden_dim=HIDDEN, num_layers=3,
+                              degree_conditioning=True).to(DEVICE)
     diffusion = create_diffusion(TIMESTEPS)
     print(f"Model on {DEVICE}  |  params: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -174,6 +178,14 @@ if __name__ == "__main__":
 
             adj = adj * node_mask[:, :, None] * node_mask[:, None, :]
 
+            # Per-node target degree sequence: degree / n_active, normalised to [0, 1].
+            # Passed as conditioning signal so the model learns to respect the degree
+            # distribution of real graphs rather than overshooting during generation.
+            n_act = node_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)   # [B, 1]
+            deg_raw = adj.sum(dim=-1)                                      # [B, N]
+            degree_seq = (deg_raw / n_act).unsqueeze(-1)                  # [B, N, 1]
+            degree_seq = degree_seq * node_mask.unsqueeze(-1)             # zero padding
+
             B = x_norm.shape[0]
             t, iw = schedule_sampler.sample(B, DEVICE)   # importance-sampled timesteps
 
@@ -183,7 +195,7 @@ if __name__ == "__main__":
                     x_start=x_norm,
                     t=t,
                     adj_start=adj,
-                    model_kwargs={"node_mask": node_mask},
+                    model_kwargs={"node_mask": node_mask, "degree_seq": degree_seq},
                     adj_loss_weight=ADJ_LOSS_W,
                     density_loss_weight=DENSITY_LOSS_W,
                     node_exist_loss_weight=NODE_EXIST_LOSS_W,
@@ -194,8 +206,11 @@ if __name__ == "__main__":
                     consistency_loss_weight=CONS_LOSS_W,
                     x_mean_feat=x_mean,
                     x_std_feat=x_std,
-                    # Direction 2: raised adj pos_weight cap
+                    # Direction 2: adj pos_weight cap (lowered back to 2.0)
                     adj_pos_weight_max=ADJ_POS_WEIGHT_MAX,
+                    edge_drop_rate=EDGE_DROP_RATE,
+                    # Direction 3: degree sequence adherence
+                    degree_seq_loss_weight=DEG_SEQ_LOSS_W,
                 )
                 # Multiply per-sample losses by importance-correction weights so
                 # the gradient estimate remains unbiased despite non-uniform sampling.
@@ -225,10 +240,11 @@ if __name__ == "__main__":
 
         if (epoch + 1) % 10 == 0 or (epoch + 1) == EPOCHS:
             torch.save({
-                "model":     model.state_dict(),
-                "x_mean":    x_mean.cpu(),
-                "x_std":     x_std.cpu(),
-                "max_nodes": MAX_NODES,
+                "model":              model.state_dict(),
+                "x_mean":             x_mean.cpu(),
+                "x_std":              x_std.cpu(),
+                "max_nodes":          MAX_NODES,
+                "degree_conditioning": True,
             }, BASE_DIR.parent / "checkpoints" / "diffusion_ibm" / "model.pt")
 
         if (epoch + 1) % VIZ_INTERVAL == 0 or (epoch + 1) == EPOCHS:

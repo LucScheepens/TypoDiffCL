@@ -785,11 +785,14 @@ def plot_generated_vs_closest_training(
         adj_np     = adj_out.cpu().numpy()
         laund_prob = x_denorm[:, 0].cpu().numpy()
 
+        # Symmetrise: treat either directed edge as undirected so nodes with
+        # only lower-triangle edges are not drawn as isolated.
+        adj_sym = np.maximum(adj_np, adj_np.T)
         G_gen = nx.Graph()
         G_gen.add_nodes_from(range(n_out))
         for a in range(n_out):
             for b in range(a + 1, n_out):
-                if adj_np[a, b] > 0.5:
+                if adj_sym[a, b] > 0.5:
                     G_gen.add_edge(a, b)
         gen_colors = [
             "#e74c3c" if laund_prob[k] > 0.5 else "#aed6f1"

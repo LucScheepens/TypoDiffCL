@@ -21,14 +21,14 @@ sys.path.insert(0, str(BASE_DIR.parent))
 
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GINConv, global_mean_pool, global_max_pool
 import time
 
 import torch.nn as nn
 import torch.nn.functional as F
 
 from augmentation import (augment_network_view_fast, augment_network_view_smart,
-                          build_igraph_from_transactions)
+                          build_igraph_from_transactions, precompute_augmentation_cache)
 from diffusion.diff_util import network_to_dense
 
 
@@ -76,14 +76,16 @@ def network_to_pyg_data_fast(network):
     else:
         # If the parent network has a cached x_dense but n changed (crop/node-delete
         # augmentation produced a different-size view), skip expensive SCC/BFS pattern
-        # recomputation — pattern cols stay zero for this augmented view only.
+        # recomputation AND expensive O(VE) topology features (betweenness, pagerank,
+        # clustering) — these stay zero for this augmented view only.
         _parent_has_cache = (
             "x_dense" in network and network["x_dense"] is not None
             and network["x_dense"].shape[0] != n
             and network["x_dense"].shape[1] == _TARGET_DIM
         )
         from diffusion.diff_util import network_to_dense as _ntd
-        x, _ = _ntd(network, skip_patterns=_parent_has_cache)
+        x, _ = _ntd(network, skip_patterns=_parent_has_cache,
+                    skip_topology=_parent_has_cache)
         # Refresh laundering flag in case augmentation changed the graph
         degrees = g.degree()
         max_deg = max(max(degrees), 1)
@@ -101,21 +103,50 @@ def network_to_pyg_data_fast(network):
     return Data(x=x[:, 1:], edge_index=edge_index)
 
 
-class GraphEncoder(nn.Module):
-    """3-layer GCN with BatchNorm and concatenated mean+max graph pooling.
+def encoder_dims_from_state_dict(sd):
+    """Return (in_dim, hidden_dim, n_layers, use_bn) from a GraphEncoder state dict.
 
-    n_layers / use_bn / hidden_dim are stored so load_simclr_encoder can
-    reconstruct the exact architecture from the checkpoint's state_dict keys.
+    Handles both the current GINConv encoder (conv1.nn.0.weight) and legacy
+    GCNConv checkpoints (conv1.lin.weight) so old checkpoints load cleanly.
+    """
+    if "conv1.nn.0.weight" in sd:          # GINConv (current)
+        in_dim     = sd["conv1.nn.0.weight"].shape[1]
+        hidden_dim = sd["conv1.nn.0.weight"].shape[0]
+        n_layers   = 3 if "conv3.nn.0.weight" in sd else 2
+    else:                                   # GCNConv (legacy)
+        in_dim     = sd["conv1.lin.weight"].shape[1]
+        hidden_dim = sd["conv1.lin.weight"].shape[0]
+        n_layers   = 3 if "conv3.lin.weight" in sd else 2
+    use_bn = "bn1.weight" in sd
+    return in_dim, hidden_dim, n_layers, use_bn
+
+
+class GraphEncoder(nn.Module):
+    """3-layer GIN with BatchNorm and concatenated mean+max graph pooling.
+
+    GINConv uses SUM aggregation, which is strictly more expressive than
+    GCNConv's degree-normalised mean.  SUM directly counts structural
+    features (fan-out edges, fan-in hubs) that are the core AML signals.
+
+    n_layers / use_bn / hidden_dim are stored so encoder_dims_from_state_dict
+    can reconstruct the exact architecture from a checkpoint's state_dict keys.
     """
     def __init__(self, in_dim, hidden_dim=128, out_dim=128, n_layers=3, use_bn=True):
         super().__init__()
         self.n_layers = n_layers
         self.use_bn   = use_bn
 
-        self.conv1 = GCNConv(in_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        def _mlp(in_d, out_d):
+            return nn.Sequential(
+                nn.Linear(in_d, out_d),
+                nn.ReLU(),
+                nn.Linear(out_d, out_d),
+            )
+
+        self.conv1 = GINConv(_mlp(in_dim,    hidden_dim), train_eps=True)
+        self.conv2 = GINConv(_mlp(hidden_dim, hidden_dim), train_eps=True)
         if n_layers >= 3:
-            self.conv3 = GCNConv(hidden_dim, hidden_dim)
+            self.conv3 = GINConv(_mlp(hidden_dim, hidden_dim), train_eps=True)
 
         if use_bn:
             self.bn1 = nn.BatchNorm1d(hidden_dim)
@@ -126,6 +157,13 @@ class GraphEncoder(nn.Module):
         # Mean + max pooling concatenated → 2× hidden_dim input to the linear
         pool_in = hidden_dim * 2 if n_layers >= 3 else hidden_dim
         self.lin = nn.Linear(pool_in, out_dim)
+
+    @property
+    def in_dim(self):
+        """Input feature dimension — compatible with both GIN and legacy GCN."""
+        if hasattr(self.conv1, "nn"):          # GINConv
+            return self.conv1.nn[0].weight.shape[1]
+        return self.conv1.lin.weight.shape[1]  # GCNConv (legacy)
 
     def forward(self, data):
         x, edge_index, batch = data.x, data.edge_index, data.batch
@@ -421,7 +459,7 @@ def _diffusion_view_multistep(
 
             if t_next < 0:                               # final step → take x0
                 x_t   = x0_pred
-                adj_t = (adj_pred.clamp(0, 1) > 0.5).float()
+                adj_t = (adj_pred.clamp(0, 1) > 0.3).float()
             else:
                 ab_s       = float(diffusion.alphas_cumprod[t_next])
                 sqrt_ab_s  = math.sqrt(ab_s + 1e-8)
@@ -430,7 +468,9 @@ def _diffusion_view_multistep(
                 noise_cont = (x_t[..., 1:] - sqrt_ab_t * x0_pred[..., 1:]) / sqrt_1m_t
                 x_next_cont = sqrt_ab_s * x0_pred[..., 1:] + sqrt_1m_s * noise_cont
                 x_t   = torch.cat([x0_bin, x_next_cont], dim=-1) * mask.unsqueeze(-1)
-                adj_t = torch.bernoulli(adj_pred.clamp(0, 1)) * mask[:, :, None] * mask[:, None, :]
+                # Deterministic threshold instead of Bernoulli to avoid stochastic
+                # disconnections that propagate through subsequent denoising steps.
+                adj_t = (adj_pred.clamp(0, 1) > 0.3).float() * mask[:, :, None] * mask[:, None, :]
 
     if was_training:
         diff_model.train()
@@ -514,7 +554,7 @@ def _diffusion_view_multistep_batch(
 
             if t_next < 0:
                 x_t   = x0_pred
-                adj_t = (adj_pred.clamp(0, 1) > 0.5).float()
+                adj_t = (adj_pred.clamp(0, 1) > 0.3).float()
             else:
                 ab_s       = float(diffusion.alphas_cumprod[t_next])
                 sqrt_ab_s  = math.sqrt(ab_s + 1e-8)
@@ -523,7 +563,7 @@ def _diffusion_view_multistep_batch(
                 x_t   = torch.cat([x0_bin,
                                    sqrt_ab_s * x0_pred[..., 1:] + sqrt_1m_s * noise_cont],
                                   dim=-1) * mask_batch.unsqueeze(-1)
-                adj_t = (torch.bernoulli(adj_pred.clamp(0, 1))
+                adj_t = ((adj_pred.clamp(0, 1) > 0.3).float()
                          * mask_batch[:, :, None] * mask_batch[:, None, :])
 
     if was_training:
@@ -620,7 +660,7 @@ def _diffusion_view_guided(
                     ei_g = torch.zeros(2, 0, dtype=torch.long, device=device)
                 # Strip col 0 before passing to encoder, then trim to encoder's in_dim
                 # (handles old checkpoints trained before pattern features were added).
-                _in_dim = encoder.conv1.lin.weight.shape[1]
+                _in_dim = encoder.in_dim
                 x_enc   = x_feat[:, 1:1 + _in_dim]
                 pyg_tmp = Data(x=x_enc, edge_index=ei_g,
                                batch=torch.zeros(n, dtype=torch.long, device=device))
@@ -657,7 +697,7 @@ def _diffusion_view_guided(
 
             if t_next < 0:
                 x_t   = x0_pred
-                adj_t = (adj_pred.clamp(0, 1) > 0.5).float()
+                adj_t = (adj_pred.clamp(0, 1) > 0.3).float()
             else:
                 ab_s       = float(diffusion.alphas_cumprod[t_next])
                 sqrt_ab_s  = math.sqrt(ab_s + 1e-8)
@@ -665,7 +705,7 @@ def _diffusion_view_guided(
                 noise_cont = (x_t[..., 1:] - sqrt_ab_t * x0_pred[..., 1:]) / sqrt_1m_t
                 x_next_cont = sqrt_ab_s * x0_pred[..., 1:] + sqrt_1m_s * noise_cont
                 x_t   = torch.cat([x0_bin, x_next_cont], dim=-1) * mask.unsqueeze(-1)
-                adj_t = torch.bernoulli(adj_pred.clamp(0, 1)) * mask[:, :, None] * mask[:, None, :]
+                adj_t = (adj_pred.clamp(0, 1) > 0.3).float() * mask[:, :, None] * mask[:, None, :]
 
     if was_diff_training:
         diff_model.train()
@@ -705,7 +745,7 @@ def _fit_probe(encoder, networks_or_graphs, device, n_epochs=300, is_pyg=False):
             else:
                 v = augment_network_view_fast(item)
                 g = network_to_pyg_data_fast(v)
-                _in_dim = encoder.conv1.lin.weight.shape[1]
+                _in_dim = encoder.in_dim
                 if g.x.shape[1] != _in_dim:
                     g = Data(x=g.x[:, :_in_dim], edge_index=g.edge_index)
                 all_graphs.append(g)
@@ -893,7 +933,7 @@ def _diffusion_view(network, diffusion_model, diffusion, x_mean, x_std,
     x_feat[:, 1] = deg / max_d
 
     # Build edge_index from thresholded adjacency (no self-loops)
-    edge_index = (adj_node > 0.5).nonzero(as_tuple=False).T.contiguous()  # [2, E]
+    edge_index = (adj_node > 0.3).nonzero(as_tuple=False).T.contiguous()  # [2, E]
     if edge_index.shape[1] > 0:
         edge_index = edge_index[:, edge_index[0] != edge_index[1]]
 
@@ -937,6 +977,8 @@ def train_simclr_fast(
     use_motif_preserving=True,   # betweenness-biased edge dropping
     use_saliency=True,           # probe-gradient node importance
     saliency_update_interval=20, # recompute saliency every N epochs
+    # ── contrastive loss temperatures ────────────────────────────────────────
+    ntxent_temperature=0.15,     # NT-Xent temperature (lower → harder negatives)
 ):
     encoder.train()
     projector.train()
@@ -959,6 +1001,13 @@ def train_simclr_fast(
     best_projector_state = None
     best_probe_state     = None
     best_epoch = None
+
+    # Precompute bridges, edge betweenness, and articulation points for all original
+    # networks so augmentation functions can skip O(VE) recomputation each call.
+    print("[simclr] Precomputing augmentation cache (bridges, betweenness, APs)…")
+    t0 = time.time()
+    precompute_augmentation_cache(networks)
+    print(f"[simclr] Cache ready in {time.time() - t0:.1f}s")
 
     if use_cosine_schedule:
         def _lr_lambda(ep):
@@ -1006,7 +1055,9 @@ def train_simclr_fast(
     total_batches = 0
 
     # One pool for the whole training run — avoids per-batch creation overhead.
-    _executor = ThreadPoolExecutor(max_workers=min(batch_size, 4))
+    # Use all available CPU cores; igraph releases the GIL so true parallelism applies.
+    _n_workers = min(batch_size, os.cpu_count() or 4)
+    _executor  = ThreadPoolExecutor(max_workers=_n_workers)
 
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -1044,10 +1095,16 @@ def train_simclr_fast(
         total_loss = total_ntxent = total_supcon = total_probe = 0.0
         epoch_n_diff = epoch_n_rejected = epoch_n_fallback = 0
 
+        # Shuffle iteration order each epoch so every batch has a mix of
+        # laundering and clean networks — critical for SupCon positive pairs.
+        # Use an index list so _node_importances[idx] still maps correctly.
+        epoch_order = list(range(len(networks)))
+        random.shuffle(epoch_order)
+
         for i in range(0, len(networks), batch_size):
             total_batches += 1
-            batch_nets  = networks[i:i + batch_size]
-            batch_idxs  = list(range(i, min(i + batch_size, len(networks))))
+            batch_idxs  = epoch_order[i:i + batch_size]
+            batch_nets  = [networks[idx] for idx in batch_idxs]
 
             # Capture epoch-level state in default args (thread-safe snapshot).
             def _make_struct(args,
@@ -1142,7 +1199,7 @@ def train_simclr_fast(
             z1 = z1.float()
             z2 = z2.float()
 
-            ntxent = nt_xent_loss(z1, z2)
+            ntxent = nt_xent_loss(z1, z2, temperature=ntxent_temperature)
 
             # Supervised contrastive term: both views share the same label.
             # Concatenating them doubles the effective batch so every

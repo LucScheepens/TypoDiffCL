@@ -1211,7 +1211,15 @@ def main():
                              "--models GIN ExSTraQt. "
                              "Valid names: GIN, GraphTransformer, GraphSAGE, DeepSets, "
                              "FraudGT, ExSTraQt. Default: all.")
+    parser.add_argument("--ckpt-dir", type=str, default=None, metavar="PATH",
+                        help="Root checkpoint directory produced by train.py --ckpt-dir; "
+                             "expects <path>/simclr/ (encoder) and <path>/diffusion/model.pt. "
+                             "Sets --encoder-dir automatically if not already specified.")
     args = parser.parse_args()
+
+    # Derive encoder-dir and diffusion path from ckpt-dir when not set explicitly
+    if args.ckpt_dir and args.encoder_dir is None:
+        args.encoder_dir = str(Path(args.ckpt_dir) / "simclr")
 
     if args.augment_select:
         args.augment = True
@@ -1631,10 +1639,8 @@ def main():
                     print(f"Ablation IBM encoder: {_best_ibm.name}  (loss={_best_ibm_loss:.4f})")
                     _ckpt_ibm = torch.load(_best_ibm, map_location=device, weights_only=False)
                     _sd_ibm   = _ckpt_ibm["encoder_state_dict"]
-                    _in_dim_ibm  = _sd_ibm["conv1.lin.weight"].shape[1]
-                    _hid_ibm     = _sd_ibm["conv1.lin.weight"].shape[0]
-                    _n_lay_ibm   = 3 if "conv3.lin.weight" in _sd_ibm else 2
-                    _bn_ibm      = "bn1.weight" in _sd_ibm
+                    from simclr import encoder_dims_from_state_dict as _edfs_ibm
+                    _in_dim_ibm, _hid_ibm, _n_lay_ibm, _bn_ibm = _edfs_ibm(_sd_ibm)
                     encoder = _GE_ibm(in_dim=_in_dim_ibm, hidden_dim=_hid_ibm, out_dim=128,
                                       n_layers=_n_lay_ibm, use_bn=_bn_ibm).to(device)
                     encoder.load_state_dict(_sd_ibm)
@@ -1642,7 +1648,8 @@ def main():
                     print(f"  in_dim={_in_dim_ibm}  hidden={_hid_ibm}  layers={_n_lay_ibm}")
                 else:
                     encoder = load_simclr_encoder(device)
-                diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device)
+                _diff_ckpt = (Path(args.ckpt_dir) / "diffusion" / "model.pt") if args.ckpt_dir else None
+                diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device, ckpt_path=_diff_ckpt)
 
                 # Only encode networks that ended up in the TRAINING fold.
                 # Using all networks (including test) would leak test-set embeddings

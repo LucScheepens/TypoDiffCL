@@ -20,35 +20,21 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(ROOT_DIR / "simclr")):
         sys.path.insert(0, _p)
 
 
-def _enforce_connectivity(adj_bin):
+def _largest_component_indices(adj_bin):
     """
-    Connect every isolated component to the main (largest) component via hub
-    attachment: each disconnected component is joined by a single edge from its
-    highest-degree node to the highest-degree node in the main component.
+    Return the sorted node indices that belong to the largest weakly-connected
+    component of the directed adjacency matrix, and the number of nodes dropped.
 
-    Hub attachment is more realistic for transaction graphs than sequential
-    chaining (which produces a visual chain/trace in spring-layout plots because
-    every isolated node ends up with exactly one edge, causing spring-layout to
-    pull them into a long line).
-
-    Returns (connected adjacency, number of edges added).
+    Treats directed edges as undirected for connectivity (weakly connected).
+    Returns (keep_indices, n_dropped).
     """
     G = nx.from_numpy_array(adj_bin.numpy())
     components = sorted(nx.connected_components(G), key=len, reverse=True)
     if len(components) == 1:
-        return adj_bin, 0
-    adj_conn = adj_bin.clone()
-    degrees   = dict(G.degree())
-    main_comp = components[0]
-    # Highest-degree node in the main component acts as the attachment hub
-    hub = max(main_comp, key=lambda u: degrees[u])
-    edges_added = 0
-    for comp in components[1:]:
-        # Best node in the isolated component (highest existing degree, or any if all zero)
-        anchor = max(comp, key=lambda u: degrees[u])
-        adj_conn[anchor, hub] = 1.0   # anchor → hub (directed)
-        edges_added += 1
-    return adj_conn, edges_added
+        return list(range(adj_bin.shape[0])), 0
+    keep = sorted(components[0])
+    n_dropped = adj_bin.shape[0] - len(keep)
+    return keep, n_dropped
 
 
 def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
@@ -70,10 +56,10 @@ def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
                 batch=torch.zeros(n, dtype=torch.long, device=device))
 
 
-def load_simclr_encoder(device):
+def load_simclr_encoder(device, ckpt_dir=None):
     """Find and load the best SimCLR checkpoint. Returns encoder in eval mode."""
     from simclr import GraphEncoder
-    ckpt_dir = CKPT_DIR / "simclr_ibm"
+    ckpt_dir = Path(ckpt_dir) if ckpt_dir else CKPT_DIR / "simclr_ibm"
     candidates = list(ckpt_dir.glob("*.pt"))
     best_ckpt_path, best_loss = None, float("inf")
     for p in candidates:
@@ -86,10 +72,8 @@ def load_simclr_encoder(device):
     print(f"Best SimCLR checkpoint: {best_ckpt_path.name}  (loss={best_loss:.4f})")
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
     sd         = ckpt["encoder_state_dict"]
-    in_dim     = sd["conv1.lin.weight"].shape[1]
-    hidden_dim = sd["conv1.lin.weight"].shape[0]
-    n_layers   = 3 if "conv3.lin.weight" in sd else 2
-    use_bn     = "bn1.weight" in sd
+    from simclr import encoder_dims_from_state_dict as _edfs
+    in_dim, hidden_dim, n_layers, use_bn = _edfs(sd)
     encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
                            n_layers=n_layers, use_bn=use_bn).to(device)
     encoder.load_state_dict(sd)
@@ -97,15 +81,21 @@ def load_simclr_encoder(device):
     return encoder
 
 
-def load_diffusion_model(device):
+def load_diffusion_model(device, ckpt_path=None):
     """Load diffusion model and normalisation stats. Returns (model, diffusion, x_mean, x_std, max_nodes)."""
     from diffusion.model import DiffusionGNN
     from diffusion.diff_util import create_diffusion
-    ckpt            = torch.load(CKPT_DIR / "diffusion_ibm" / "model.pt", map_location=device, weights_only=False)
+    _path = Path(ckpt_path) if ckpt_path else CKPT_DIR / "diffusion_ibm" / "model.pt"
+    ckpt            = torch.load(_path, map_location=device, weights_only=False)
     node_dim        = ckpt["model"]["input_proj.weight"].shape[1]
     class_cond_ckpt = ckpt.get("class_conditional", False)
-    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4,
-                              class_conditional=class_cond_ckpt).to(device)
+    num_layers_ckpt = ckpt.get("num_layers", 4)   # fallback for old checkpoints
+    deg_cond_ckpt   = ckpt.get("degree_conditioning",
+                                "degree_proj.weight" in ckpt["model"])
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128,
+                              num_layers=num_layers_ckpt,
+                              class_conditional=class_cond_ckpt,
+                              degree_conditioning=deg_cond_ckpt).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
     diffusion  = create_diffusion(T=500)
@@ -125,7 +115,7 @@ def encode_all_networks(networks, encoder, device):
     from simclr import network_to_pyg_data_fast
     # Infer expected feature dim from checkpoint weights — forward-compatible with
     # both old (in_dim=10) and new (in_dim=18) encoders.
-    _in_dim = encoder.conv1.lin.weight.shape[1]
+    _in_dim = encoder.in_dim
     all_graphs, all_labels = [], []
     for net in networks:
         v = augment_network_view_fast(net)
@@ -179,11 +169,12 @@ def guided_generate(
     guide_from=0.25,
     degree_penalty=0.5,
     target_mean_degree=None,
-    adj_threshold=0.5,
-    adj_gamma=1.5,
+    adj_threshold=0.35,
+    adj_gamma=1.0,
     target_density=None,
     max_nodes=None,
     pbar=None,
+    degree_seq=None,
 ):
     """
     Generate one network via diffusion guided by:
@@ -235,7 +226,8 @@ def guided_generate(
                 x_t_g   = x_t.detach().requires_grad_(True)
                 adj_t_g = adj_t.detach().requires_grad_(True)
                 eps_pred, adj_pred, _ = diff_model(x_t_g, t_scaled,
-                                                   adj=adj_t_g, node_mask=mask)
+                                                   adj=adj_t_g, node_mask=mask,
+                                                   degree_seq=degree_seq)
                 x0_cont = diffusion._predict_xstart_from_eps(
                               x_t_g[..., 1:], t_vec, eps_pred[..., 1:])
                 x0_bin  = eps_pred[..., 0:1].clamp(0, 1)
@@ -279,7 +271,8 @@ def guided_generate(
         else:
             with torch.no_grad():
                 eps_pred, adj_pred, _ = diff_model(x_t, t_scaled,
-                                                   adj=adj_t, node_mask=mask)
+                                                   adj=adj_t, node_mask=mask,
+                                                   degree_seq=degree_seq)
                 x0_cont = diffusion._predict_xstart_from_eps(
                               x_t[..., 1:], t_vec, eps_pred[..., 1:])
                 x0_bin  = eps_pred[..., 0:1].clamp(0, 1)
@@ -325,18 +318,18 @@ def guided_generate(
                 ap = torch.sigmoid(ap_logit)
 
             if t_curr > 0:
-                # Intermediate steps: sample binary adjacency without gamma
-                # compression.  Applying gamma at every step squashes mid-range
-                # probabilities repeatedly, producing too many isolated nodes that
-                # then get chained by _enforce_connectivity.  The model was trained
-                # on binary {0,1} adjacency, so stochastic bernoulli sampling here
-                # stays in-distribution.
-                adj_t = torch.bernoulli(ap)
+                # Intermediate steps: hard 0.5 threshold (model median).
+                # Using adj_threshold (0.35) here would keep ~65% of all edges at
+                # high-noise timesteps where adj_pred is near-uniform, producing
+                # unrealistically dense intermediate states that the model cannot
+                # recover from.  0.5 is the natural decision boundary matching the
+                # model's training-time Bernoulli interpretation.
+                adj_t = (ap > 0.5).float()
             else:
                 # Final step only: apply gamma compression to select high-confidence
-                # edges before thresholding.  Concentrating it here avoids the
-                # feedback loop where the model over-predicts to compensate for
-                # artificially sparse intermediate adjacency.
+                # edges before thresholding.  With the default adj_gamma=1.0 this is
+                # a no-op; set adj_gamma>1 to push borderline probabilities down
+                # (higher values → sparser output).
                 ap = ap ** adj_gamma
                 if target_density is not None:
                     # Density-calibrated threshold: keep only enough edges to match
@@ -354,35 +347,22 @@ def guided_generate(
 
             adj_t = adj_t * mask[:, :, None] * mask[:, None, :]
 
-            # Final step: connect any 0-degree active nodes to their most
-            # confident neighbour according to ap, before the state is locked in.
-            # This uses the model's own predictions rather than hub-attachment,
-            # producing more realistic local topology.
-            if t_curr == 0 and n > 1:
-                # Use total degree (out + in) so directed sink nodes (zero out-degree
-                # but positive in-degree) are not falsely treated as isolated.
-                _out_deg = adj_t[0, :n, :n].sum(dim=-1)         # [n]
-                _in_deg  = adj_t[0, :n, :n].sum(dim=-2)         # [n]
-                _deg_f   = _out_deg + _in_deg
-                _iso   = (_deg_f < 0.5) & (mask[0, :n] > 0.5)  # truly isolated active nodes
-                if _iso.any():
-                    _probs = ap[0, :n, :n].clone()
-                    _arange = torch.arange(n, device=_probs.device)
-                    _probs[_arange, _arange] = -1.0             # no self-loops
-                    _best  = _probs.argmax(dim=-1)              # [n]
-                    _i_idx = _iso.nonzero(as_tuple=True)[0]
-                    _j_idx = _best[_i_idx]
-                    adj_t[0, _i_idx, _j_idx] = 1.0             # add i→j only
 
         if pbar is not None:
             pbar.update(1)
 
-    # Guarantee a single connected component before returning
+    # Drop nodes not in the largest connected component
     adj_out = adj_t[0, :n, :n].cpu()
-    adj_out.fill_diagonal_(0.0)   # remove self-loops before connectivity check
-    adj_out, n_patches = _enforce_connectivity(adj_out)
-    # Return patch count so callers can log/filter graphs that needed heavy repair
-    return x_t[0, :n].cpu(), adj_out, n, n_patches
+    adj_out.fill_diagonal_(0.0)
+    keep, n_dropped = _largest_component_indices(adj_out)
+    if n_dropped > 0:
+        idx = torch.tensor(keep, dtype=torch.long)
+        adj_out = adj_out[idx][:, idx]
+        x_out   = x_t[0, :n].cpu()[idx]
+        n       = len(keep)
+    else:
+        x_out = x_t[0, :n].cpu()
+    return x_out, adj_out, n, n_dropped
 
 
 def run_guided_generation(
@@ -403,8 +383,8 @@ def run_guided_generation(
     guide_every=5,
     guide_from=0.25,
     degree_penalty=0.5,
-    adj_threshold=0.5,
-    adj_gamma=1.5,
+    adj_threshold=0.35,
+    adj_gamma=1.0,
 ):
     """
     Generate n_gen networks using guided diffusion.
@@ -418,8 +398,12 @@ def run_guided_generation(
     import random as _random
     from diffusion.diff_util import network_to_dense as _ntd
 
-    # Compute training mean degree and edge density for calibrated generation
+    # Compute training mean degree and edge density for calibrated generation.
+    # Also collect per-node normalised degrees from LAUNDERING graphs only so we
+    # can sample a realistic target degree sequence for each generated graph.
     mean_degs, densities = [], []
+    laund_node_deg_fracs: list[float] = []   # flattened pool of deg/n_active values
+
     for net in networks:
         adj = net["adj_dense"] if "adj_dense" in net else _ntd(net)[1]
         n = adj.shape[0]
@@ -427,11 +411,23 @@ def run_guided_generation(
         mean_degs.append(float(adj.sum(dim=-1).mean()))
         if n > 1:
             densities.append(n_edges / (n * (n - 1) / 2))
-    target_mean_degree = float(np.mean(mean_degs)) if mean_degs else None
-    target_density     = float(np.mean(densities)) if densities else None
 
     laund_nets = [n for n in networks if     len(n["laundering_nodes"]) > 0]
     clean_nets = [n for n in networks if not len(n["laundering_nodes"]) > 0]
+
+    for net in laund_nets:
+        adj = net["adj_dense"] if "adj_dense" in net else _ntd(net)[1]
+        n = int(adj.shape[0])
+        if n < 2:
+            continue
+        per_node = adj.sum(dim=-1).tolist()   # raw degree per node
+        for d in per_node:
+            laund_node_deg_fracs.append(float(d) / n)  # normalised by graph size
+
+    target_mean_degree = float(np.mean(mean_degs)) if mean_degs else None
+    target_density     = float(np.mean(densities)) if densities else None
+
+    _rng_deg = np.random.default_rng(seed=0)
 
     # Seed from the same class as target_label so guidance starts from a
     # realistic example of the desired class rather than fighting from the
@@ -453,6 +449,23 @@ def run_guided_generation(
     ]
     size_5th = float(np.percentile(train_sizes, 5)) if train_sizes else 3.0
 
+    _max_nodes = MAX_NODES
+
+    def _sample_degree_seq(n_active: int) -> torch.Tensor | None:
+        """
+        Sample a target per-node degree sequence from the real laundering
+        degree distribution and pack it into a [1, MAX_NODES, 1] tensor.
+
+        Each value is deg/n_active (∈ [0, 1]), consistent with how degree_seq
+        is computed during training.  Padding positions are zero.
+        """
+        if not laund_node_deg_fracs or not diff_model.degree_conditioning:
+            return None
+        fracs = _rng_deg.choice(laund_node_deg_fracs, size=n_active, replace=True)
+        deg_seq = torch.zeros(_max_nodes, 1, dtype=torch.float32)
+        deg_seq[:n_active, 0] = torch.tensor(fracs, dtype=torch.float32)
+        return deg_seq.unsqueeze(0)   # [1, MAX_NODES, 1]
+
     gen_outputs, gen_embeddings = [], []
     n_discarded = 0
 
@@ -461,6 +474,15 @@ def run_guided_generation(
               unit="step", dynamic_ncols=True) as pbar:
         for i, seed in enumerate(seeds):
             pbar.set_postfix(network=f"{i+1}/{len(seeds)}")
+
+            # Determine how many active nodes this seed has so we can draw the
+            # right number of per-node degree targets from the laundering pool.
+            seed_adj  = seed["adj_dense"] if "adj_dense" in seed else _ntd(seed)[1]
+            n_seed    = min(int(seed_adj.shape[0]), _max_nodes)
+            degree_seq_t = _sample_degree_seq(n_seed)
+            if degree_seq_t is not None:
+                degree_seq_t = degree_seq_t.to(device)
+
             x_out, adj_out, n_out, n_patches = guided_generate(
                 seed, encoder, probe, diff_model, diffusion,
                 x_mean, x_std, H_all_n, device,
@@ -473,11 +495,12 @@ def run_guided_generation(
                 adj_threshold=adj_threshold,
                 adj_gamma=adj_gamma,
                 target_density=target_density,
+                degree_seq=degree_seq_t,
                 pbar=pbar,
             )
 
             if n_patches > 0:
-                print(f"  [validity] graph {i+1}: connectivity repair added {n_patches} edge(s)")
+                print(f"  [validity] graph {i+1}: removed {n_patches} disconnected node(s)")
 
             # ── Structural validity checks ─────────────────────────────────
             if n_out < size_5th:
@@ -746,10 +769,8 @@ def load_simclr_encoder_elliptic(device):
     print(f"Best Elliptic SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
     ckpt       = torch.load(best_path, map_location=device, weights_only=False)
     sd         = ckpt["encoder_state_dict"]
-    in_dim     = sd["conv1.lin.weight"].shape[1]
-    hidden_dim = sd["conv1.lin.weight"].shape[0]
-    n_layers   = 3 if "conv3.lin.weight" in sd else 2
-    use_bn     = "bn1.weight" in sd
+    from simclr import encoder_dims_from_state_dict as _edfs_ell
+    in_dim, hidden_dim, n_layers, use_bn = _edfs_ell(sd)
     encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
                            n_layers=n_layers, use_bn=use_bn).to(device)
     encoder.load_state_dict(sd)
@@ -841,7 +862,8 @@ def run_guided_generation_elliptic(
     guide_every=5,
     guide_from=0.25,
     degree_penalty=0.5,
-    adj_threshold=0.5,
+    adj_threshold=0.35,
+    adj_gamma=1.0,
     max_nodes=100,
 ):
     """
@@ -878,8 +900,14 @@ def run_guided_generation_elliptic(
 
         return {"x_dense": x6, "adj_dense": adj}
 
-    # Compute training mean degree and density for calibrated generation
+    # Compute training mean degree and density for calibrated generation.
+    # Also collect per-node normalised degrees from illicit graphs only.
     mean_degs, densities = [], []
+    laund_node_deg_fracs_ell: list[float] = []
+
+    illicit = [g for g in graphs if g.y.item() == 1]
+    licit   = [g for g in graphs if g.y.item() == 0]
+
     for g in graphs:
         n       = g.x.shape[0]
         ei      = g.edge_index
@@ -890,11 +918,22 @@ def run_guided_generation_elliptic(
         mean_degs.append(float(deg.mean()))
         if n > 1:
             densities.append(n_edges / (n * (n - 1) / 2))
+
+    for g in illicit:
+        n  = g.x.shape[0]
+        ei = g.edge_index
+        if n < 2:
+            continue
+        deg = torch.zeros(n)
+        if ei.shape[1] > 0:
+            deg.scatter_add_(0, ei[0], torch.ones(ei.shape[1]))
+        for d in deg.tolist():
+            laund_node_deg_fracs_ell.append(float(d) / n)
+
     target_mean_degree = float(np.mean(mean_degs)) if mean_degs else None
     target_density     = float(np.mean(densities)) if densities else None
 
-    illicit = [g for g in graphs if g.y.item() == 1]
-    licit   = [g for g in graphs if g.y.item() == 0]
+    _rng_deg_ell = np.random.default_rng(seed=0)
     seeds   = (
         _random.sample(illicit, min(n_gen // 2, len(illicit)))
       + _random.sample(licit,   min(n_gen // 2, len(licit)))
@@ -904,6 +943,14 @@ def run_guided_generation_elliptic(
     train_sizes = [g.x.shape[0] for g in graphs]
     size_5th    = float(np.percentile(train_sizes, 5)) if train_sizes else 3.0
     density_ceil = 2.0 * target_density if target_density is not None else None
+
+    def _sample_degree_seq_ell(n_active: int) -> torch.Tensor | None:
+        if not laund_node_deg_fracs_ell or not diff_model.degree_conditioning:
+            return None
+        fracs = _rng_deg_ell.choice(laund_node_deg_fracs_ell, size=n_active, replace=True)
+        deg_seq = torch.zeros(max_nodes, 1, dtype=torch.float32)
+        deg_seq[:n_active, 0] = torch.tensor(fracs, dtype=torch.float32)
+        return deg_seq.unsqueeze(0)   # [1, max_nodes, 1]
 
     gen_outputs, gen_embeddings = [], []
     n_discarded = 0
@@ -918,6 +965,11 @@ def run_guided_generation_elliptic(
             # It checks for "x_dense"/"adj_dense" first (fast path).
             seed_dict = _pyg_to_seed_dict(seed_g)
 
+            n_seed       = min(seed_g.x.shape[0], max_nodes)
+            degree_seq_t = _sample_degree_seq_ell(n_seed)
+            if degree_seq_t is not None:
+                degree_seq_t = degree_seq_t.to(device)
+
             x_out, adj_out, n_out, n_patches = guided_generate(
                 seed_dict, encoder, probe, diff_model, diffusion,
                 x_mean, x_std, H_all_n, device,
@@ -928,13 +980,15 @@ def run_guided_generation_elliptic(
                 degree_penalty=degree_penalty,
                 target_mean_degree=target_mean_degree,
                 adj_threshold=adj_threshold,
+                adj_gamma=adj_gamma,
                 target_density=target_density,
                 max_nodes=max_nodes,
+                degree_seq=degree_seq_t,
                 pbar=pbar,
             )
 
             if n_patches > 0:
-                print(f"  [validity] graph {i+1}: connectivity repair added {n_patches} edge(s)")
+                print(f"  [validity] graph {i+1}: removed {n_patches} disconnected node(s)")
 
             # ── Structural validity checks ─────────────────────────────────
             gen_density = float(adj_out.sum()) / max(n_out * (n_out - 1), 1)

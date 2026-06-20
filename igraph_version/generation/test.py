@@ -246,11 +246,14 @@ def _plot_comparison_pyg(gen_outputs, gen_embeddings, H_all_n, graphs, results_d
         laund_prob = x_denorm[:, 0].cpu().numpy() if isinstance(x_denorm, torch.Tensor) \
                      else x_denorm[:, 0]
 
+        # Symmetrise: treat either directed edge as an undirected connection so
+        # nodes with only lower-triangle edges are not drawn as isolated.
+        adj_sym = np.maximum(adj_np, adj_np.T)
         G_gen = nx.Graph()
         G_gen.add_nodes_from(range(n_out))
         for a in range(n_out):
             for b in range(a + 1, n_out):
-                if adj_np[a, b] > 0.5:
+                if adj_sym[a, b] > 0.5:
                     G_gen.add_edge(a, b)
         gen_colors  = ["#e74c3c" if laund_prob[k] > 0.5 else "#aed6f1" for k in range(n_out)]
         pct_illicit = 100.0 * float((laund_prob > 0.5).mean())
@@ -497,9 +500,47 @@ def run_ibm(args, device, results_dir):
           f"{len(networks) - n_laund} clean)\n")
 
     # -- 2. Load models -------------------------------------------------------
+    _simclr_ckpt_dir = (Path(args.ckpt_dir) / "simclr") if args.ckpt_dir else None
+    _diff_ckpt_path  = (Path(args.ckpt_dir) / "diffusion" / "model.pt") if args.ckpt_dir else None
+
+    # Resolve the SimCLR checkpoint file that will be selected (best loss)
+    _sc_search_dir = _simclr_ckpt_dir if _simclr_ckpt_dir else CKPT_DIR / "simclr_ibm"
+    _sc_candidates = sorted(Path(_sc_search_dir).glob("*.pt")) if Path(_sc_search_dir).exists() else []
+    _sc_best = None; _sc_best_loss = float("inf")
+    for _p in _sc_candidates:
+        try:
+            _c = torch.load(_p, map_location="cpu", weights_only=False)
+            if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _sc_best_loss:
+                _sc_best_loss = _c["loss"]; _sc_best = _p
+        except Exception:
+            pass
+
+    # Resolve the diffusion checkpoint path
+    _df_path = Path(_diff_ckpt_path) if _diff_ckpt_path else CKPT_DIR / "diffusion_ibm" / "model.pt"
+
+    print("=" * 62)
+    print("  MODEL CHECKPOINT SUMMARY")
+    print("=" * 62)
+    print(f"  SimCLR search dir : {_sc_search_dir}")
+    if _sc_best:
+        _sc_meta = torch.load(_sc_best, map_location="cpu", weights_only=False)
+        _sc_epoch = _sc_meta.get("epoch", "?")
+        print(f"  SimCLR checkpoint : {_sc_best}  (epoch={_sc_epoch}, loss={_sc_best_loss:.4f})")
+    else:
+        print(f"  SimCLR checkpoint : NOT FOUND in {_sc_search_dir}")
+    if _df_path.exists():
+        _df_meta = torch.load(_df_path, map_location="cpu", weights_only=False)
+        _df_nd   = _df_meta["model"]["input_proj.weight"].shape[1]
+        _df_cc   = _df_meta.get("class_conditional", False)
+        print(f"  Diffusion ckpt    : {_df_path}")
+        print(f"                      node_dim={_df_nd}, class_conditional={_df_cc}")
+    else:
+        print(f"  Diffusion ckpt    : NOT FOUND at {_df_path}")
+    print("=" * 62 + "\n")
+
     print("Loading models …")
-    encoder = load_simclr_encoder(device)
-    diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device)
+    encoder = load_simclr_encoder(device, ckpt_dir=_simclr_ckpt_dir)
+    diff_model, diffusion, x_mean, x_std, _max_n = load_diffusion_model(device, ckpt_path=_diff_ckpt_path)
 
     # -- 3. SimCLR latent space plot -----------------------------------------
     print("Plotting SimCLR latent space …")
@@ -525,8 +566,8 @@ def run_ibm(args, device, results_dir):
                          if ("x_dense" in net and "adj_dense" in net) else _ntd(net)
                 n   = xd.shape[0]
                 ei  = (ad > 0.5).nonzero(as_tuple=False).T.contiguous()
-                x5  = xd[:, 1:6].float()   # cols 1-5: structural features
-                _pyg_nets.append(_D(x=x5, edge_index=ei,
+                x18 = xd[:, 1:].float()   # cols 1-18: all features (strip laundering flag)
+                _pyg_nets.append(_D(x=x18, edge_index=ei,
                                     y=torch.tensor([1 if len(net["laundering_nodes"]) > 0 else 0])))
             except Exception:
                 continue
@@ -563,8 +604,8 @@ def run_ibm(args, device, results_dir):
                          if ("x_dense" in net and "adj_dense" in net) else _ntd2(net)
                 n   = xd.shape[0]
                 ei  = (ad > 0.5).nonzero(as_tuple=False).T.contiguous()
-                x5  = xd[:, 1:6].float()
-                train_laund_pyg.append(_D2(x=x5, edge_index=ei,
+                x18 = xd[:, 1:].float()
+                train_laund_pyg.append(_D2(x=x18, edge_index=ei,
                                            y=torch.tensor([1])))
             except Exception:
                 continue
@@ -657,8 +698,8 @@ def run_ibm(args, device, results_dir):
                          if ("x_dense" in net and "adj_dense" in net) else _ntd_q(net)
                 n   = xd.shape[0]
                 ei  = (ad > 0.5).nonzero(as_tuple=False).T.contiguous()
-                x5  = xd[:, 1:6].float()
-                train_laund_pyg_q.append(_Dq(x=x5, edge_index=ei, y=torch.tensor([1])))
+                x18 = xd[:, 1:].float()
+                train_laund_pyg_q.append(_Dq(x=x18, edge_index=ei, y=torch.tensor([1])))
             except Exception:
                 continue
 
@@ -690,6 +731,38 @@ def run_elliptic(args, device, results_dir):
     print(f"Loaded {len(graphs)} graphs ({n_ill} illicit, {len(graphs)-n_ill} licit)\n")
 
     # -- 2. Load models -------------------------------------------------------
+    _ell_sc_dir  = CKPT_DIR / "simclr_elliptic"
+    _ell_df_path = CKPT_DIR / "diffusion_elliptic" / "model.pt"
+
+    _ell_sc_best = None; _ell_sc_best_loss = float("inf")
+    for _p in sorted(_ell_sc_dir.glob("*.pt")) if _ell_sc_dir.exists() else []:
+        try:
+            _c = torch.load(_p, map_location="cpu", weights_only=False)
+            if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _ell_sc_best_loss:
+                _ell_sc_best_loss = _c["loss"]; _ell_sc_best = _p
+        except Exception:
+            pass
+
+    print("=" * 62)
+    print("  MODEL CHECKPOINT SUMMARY  (Elliptic)")
+    print("=" * 62)
+    if _ell_sc_best:
+        _ell_sc_meta  = torch.load(_ell_sc_best, map_location="cpu", weights_only=False)
+        _ell_sc_epoch = _ell_sc_meta.get("epoch", "?")
+        print(f"  SimCLR checkpoint : {_ell_sc_best}  "
+              f"(epoch={_ell_sc_epoch}, loss={_ell_sc_best_loss:.4f})")
+    else:
+        print(f"  SimCLR checkpoint : NOT FOUND in {_ell_sc_dir}")
+    if _ell_df_path.exists():
+        _ell_df_meta = torch.load(_ell_df_path, map_location="cpu", weights_only=False)
+        _ell_df_nd   = _ell_df_meta["model"]["input_proj.weight"].shape[1]
+        _ell_df_cc   = _ell_df_meta.get("class_conditional", False)
+        print(f"  Diffusion ckpt    : {_ell_df_path}")
+        print(f"                      node_dim={_ell_df_nd}, class_conditional={_ell_df_cc}")
+    else:
+        print(f"  Diffusion ckpt    : NOT FOUND at {_ell_df_path}")
+    print("=" * 62 + "\n")
+
     print("Loading Elliptic SimCLR encoder …")
     encoder = load_simclr_encoder_elliptic(device)
     print("Plotting SimCLR latent space …")
@@ -852,11 +925,20 @@ def main():
                         help="Number of hyperparameter candidates (default 15)")
     parser.add_argument("--tune-gen-per-trial", type=int, default=6, metavar="K",
                         help="Graphs per tuning trial for Q-score estimation (default 6)")
+    parser.add_argument("--results-dir", type=str, default=None, metavar="PATH",
+                        help="Override the output directory (default: results/<dataset>/)")
+    parser.add_argument("--ckpt-dir", type=str, default=None, metavar="PATH",
+                        help="Root checkpoint directory; expects <path>/simclr/ and "
+                             "<path>/diffusion/model.pt (default: checkpoints/simclr_ibm + "
+                             "checkpoints/diffusion_ibm)")
     args = parser.parse_args()
 
     device      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    suffix      = args.dataset
-    results_dir = ROOT_DIR / "results" / suffix
+    if args.results_dir:
+        results_dir = Path(args.results_dir)
+    else:
+        suffix      = args.dataset
+        results_dir = ROOT_DIR / "results" / suffix
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
     print(f"Results will be saved to {results_dir}\n")

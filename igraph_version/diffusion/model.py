@@ -142,12 +142,14 @@ class DiffusionGNN(nn.Module):
         time_dim=128,
         num_layers=4,
         class_conditional=False,
+        degree_conditioning=False,
     ):
 
         super().__init__()
 
         self.time_dim = time_dim
         self.class_conditional = class_conditional
+        self.degree_conditioning = degree_conditioning
 
         # Time embedding MLP
         self.time_mlp = nn.Sequential(
@@ -164,6 +166,13 @@ class DiffusionGNN(nn.Module):
 
         # Input projection
         self.input_proj = nn.Linear(node_dim, hidden_dim)
+
+        # Degree sequence conditioning: per-node target degree → hidden_dim additive bias.
+        # Initialised near-zero so it starts as a no-op and the model must learn to use it.
+        if degree_conditioning:
+            self.degree_proj = nn.Linear(1, hidden_dim)
+            nn.init.normal_(self.degree_proj.weight, std=0.01)
+            nn.init.zeros_(self.degree_proj.bias)
 
 
         # GNN Blocks
@@ -198,7 +207,7 @@ class DiffusionGNN(nn.Module):
         self.node_existence_head = nn.Linear(hidden_dim, 1)
 
 
-    def forward(self, x, t, adj=None, node_mask=None, class_labels=None):
+    def forward(self, x, t, adj=None, node_mask=None, class_labels=None, degree_seq=None):
 
         """
         x         : [B, N, F]
@@ -227,6 +236,10 @@ class DiffusionGNN(nn.Module):
         # Project input
         h = self.input_proj(x)
 
+        # Per-node degree conditioning: additive bias learned from target degree sequence.
+        # degree_seq is [B, N, 1] with values in [0, 1] (degree / n_active), zero for padding.
+        if self.degree_conditioning and degree_seq is not None:
+            h = h + self.degree_proj(degree_seq)
 
         # Message passing
         for block in self.blocks:

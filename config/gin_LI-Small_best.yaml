@@ -1,0 +1,7 @@
+hidden: 64
+n_layers: 3
+dropout: 0.24459259139994435
+lr: 0.0034101279971745987
+weight_decay: 0.00023195365355207478
+batch_size: 256
+epochs: 27
