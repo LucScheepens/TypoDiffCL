@@ -49,7 +49,7 @@ ROOT_DIR     = Path(__file__).resolve().parent.parent
 TRAIN_SCRIPT = ROOT_DIR / "train.py"
 TEST_SCRIPT  = Path(__file__).resolve().parent / "test.py"
 EVAL_SCRIPT  = Path(__file__).resolve().parent / "evaluate_classifiers.py"
-DATA_DIR     = Path(r"C:\Users\lucsc\Thesis\grad\grad\data\IBM")
+DATA_DIR     = Path(__file__).resolve().parent.parent.parent / "data" / "IBM"
 
 DATASETS = [
     ("HI-Small",  DATA_DIR / "HI-Small_Trans.csv"),
@@ -121,18 +121,28 @@ def main():
     parser.add_argument("--models", nargs="+", default=None, metavar="MODEL",
                         help="Restrict classifier evaluation to these models, e.g. "
                              "--models GIN GraphSAGE. Default: all.")
+    parser.add_argument("--elliptic", action="store_true",
+                        help="Also run the Elliptic Bitcoin dataset pipeline "
+                             "(train, generate, classify) after all IBM datasets. "
+                             "Uses checkpoints/diffusion_elliptic/ and checkpoints/simclr_elliptic/.")
+    parser.add_argument("--only-elliptic", action="store_true",
+                        help="Run ONLY the Elliptic Bitcoin pipeline — skip all IBM datasets. "
+                             "Implies --elliptic.")
     args = parser.parse_args()
+
+    if args.only_elliptic:
+        args.elliptic = True
 
     # ── filter datasets ───────────────────────────────────────────────────────
     wanted_sizes    = {SIZE_MAP[s] for s in args.sizes}
     wanted_variants = set(args.variants)
-    selected = [
+    selected = [] if args.only_elliptic else [
         (name, path) for name, path in DATASETS
         if any(name.startswith(v) for v in wanted_variants)
         and any(name.endswith(s) for s in wanted_sizes)
     ]
 
-    if not selected:
+    if not selected and not args.elliptic:
         print("No datasets matched the given --sizes / --variants filters.")
         sys.exit(1)
 
@@ -238,6 +248,54 @@ def main():
             dataset_results["clf"] = f"{'ok' if ok else 'FAILED'}  ({elapsed/60:.1f} min)"
 
         results[name] = dataset_results
+
+    # ── Elliptic dataset ──────────────────────────────────────────────────────
+    if args.elliptic:
+        name = "elliptic"
+        print(f"\n{'='*64}")
+        print(f"  Dataset: {name}  (Elliptic Bitcoin)")
+        print(f"{'='*64}")
+
+        ell_diff_ckpt   = ROOT_DIR / "checkpoints" / "diffusion_elliptic" / "model.pt"
+        ell_simclr_ckpt = ROOT_DIR / "checkpoints" / "simclr_elliptic"    / "best_model.pt"
+        ell_results: dict = {"train": None, "gen": None, "clf": None}
+        ell_ok = True
+
+        # 1. Training
+        if not args.eval_only:
+            ckpts_exist = ell_diff_ckpt.exists() and ell_simclr_ckpt.exists()
+            if args.skip_training and ckpts_exist:
+                print(f"  [skip training] checkpoints found in {ell_diff_ckpt.parent.parent}")
+                ell_results["train"] = "skipped (exists)"
+            else:
+                ok, elapsed = _run(
+                    [TRAIN_SCRIPT, "--dataset", "elliptic", "--phase", args.phase],
+                    f"Train [elliptic]  phase={args.phase}",
+                )
+                ell_results["train"] = f"{'ok' if ok else 'FAILED'}  ({elapsed/60:.1f} min)"
+                if not ok:
+                    ell_ok = False
+
+        # 2. Guided generation / quality evaluation
+        if ell_ok and not args.train_only:
+            ok, elapsed = _run(
+                [TEST_SCRIPT, "--dataset", "elliptic"] + gen_extra,
+                "Generate [elliptic]",
+            )
+            ell_results["gen"] = f"{'ok' if ok else 'FAILED'}  ({elapsed/60:.1f} min)"
+
+        # 3. Classifier evaluation
+        if ell_ok and run_clf:
+            ok, elapsed = _run(
+                [EVAL_SCRIPT,
+                 "--dataset", "elliptic",
+                 "--augment"]
+                + clf_extra,
+                "Classify [elliptic]  (results/classifier_comparison_elliptic.csv)",
+            )
+            ell_results["clf"] = f"{'ok' if ok else 'FAILED'}  ({elapsed/60:.1f} min)"
+
+        results[name] = ell_results
 
     # ── summary ───────────────────────────────────────────────────────────────
     total_elapsed = time.time() - total_start

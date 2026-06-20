@@ -104,7 +104,7 @@ from util import preprocess_df, extract_networks_igraph, extract_transaction_ego
 from augmentation import build_igraph_from_transactions
 
 # ── hyper-parameters ──────────────────────────────────────────────────────────
-CSV_PATH    = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"  # default
+CSV_PATH    = str(Path(__file__).resolve().parent.parent.parent / "data" / "IBM" / "LI-Small_Trans.csv")
 IN_CHANNELS        = 18       # topology (5) + transaction (5) + AML patterns (8)
 FRAUDGT_IN_CHANNELS = IN_CHANNELS + 1   # +1 for ego_id feature
 HIDDEN      = 64

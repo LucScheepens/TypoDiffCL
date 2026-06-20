@@ -358,12 +358,17 @@ def main():
                              "--classifier GIN ExSTraQt. "
                              "Valid: GIN, GraphTransformer, GraphSAGE, DeepSets, "
                              "FraudGT, ExSTraQt. Default: all.")
+    parser.add_argument("--ibm-csv", type=str, default=None,
+                        help="Path to IBM transactions CSV (forwarded to ibm_simclr_train_ablation.py). "
+                             "Defaults to the path hardcoded in that script.")
     args = parser.parse_args()
 
     RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
     # Extra args forwarded to every evaluate_classifiers.py call
     _classifier_args = (["--models"] + args.classifier) if args.classifier else []
+    # Extra args forwarded to ibm_simclr_train_ablation.py calls
+    _ibm_csv_args = (["--ibm-csv", args.ibm_csv] if args.ibm_csv else [])
 
     # ── Select dataset-specific config ───────────────────────────────────────
     if args.dataset == "ibm":
@@ -400,7 +405,7 @@ def main():
                     [train_script,
                      "--condition", condition,
                      "--epochs",    str(args.epochs),
-                     ] + extra_train_args,
+                     ] + extra_train_args + _ibm_csv_args,
                     f"Train encoder [{args.dataset}]: {condition} — {description}",
                 )
                 if not ok:
@@ -447,6 +452,17 @@ def main():
         print("PART B: Generation Ablations  (default encoder)")
         print("="*60)
 
+        # For IBM, Part B uses the "full" encoder trained in Part A as the base encoder.
+        # For Elliptic, the default simclr_elliptic checkpoint is used (no override needed).
+        _gen_encoder_args: list[str] = []
+        if args.dataset in ("ibm", "both"):
+            _ibm_full_ckpt = ckpt_root / "full"
+            if _ibm_full_ckpt.exists():
+                _gen_encoder_args = ["--encoder-dir", str(_ibm_full_ckpt)]
+            else:
+                print(f"  [warn] IBM 'full' encoder not found at {_ibm_full_ckpt}.")
+                print("         Part A must complete before Part B for IBM.")
+
         for condition, description, extra_eval_args in GENERATION_CONDITIONS:
             if args.conditions and condition not in args.conditions:
                 continue
@@ -458,7 +474,7 @@ def main():
                  "--n-gen",          str(args.n_gen),
                  "--ablation-label", condition,
                  "--low-data",       str(args.low_data),
-                 ] + extra_eval_args + _classifier_args,
+                 ] + extra_eval_args + _gen_encoder_args + _classifier_args,
                 f"Evaluate: {condition} — {description}",
             )
             if not ok:
@@ -494,7 +510,7 @@ def main():
                     [IBM_TRAIN_SCRIPT,
                      "--condition", condition,
                      "--epochs",    str(args.epochs),
-                     ] + extra_train_args,
+                     ] + extra_train_args + _ibm_csv_args,
                     f"Train IBM encoder [pattern ablation]: {condition} — {description}",
                 )
                 if not ok:

@@ -59,7 +59,11 @@ def _to_pyg(x0_nodes, adj_soft, n, device, x_mean, x_std):
 def load_simclr_encoder(device, ckpt_dir=None):
     """Find and load the best SimCLR checkpoint. Returns encoder in eval mode."""
     from simclr import GraphEncoder
-    ckpt_dir = Path(ckpt_dir) if ckpt_dir else CKPT_DIR / "simclr_ibm"
+    if ckpt_dir is None:
+        primary = CKPT_DIR / "simclr_ibm"
+        fallback = CKPT_DIR / "simclr_ibm_ablation" / "full"
+        ckpt_dir = primary if primary.exists() and list(primary.glob("*.pt")) else fallback
+    ckpt_dir = Path(ckpt_dir)
     candidates = list(ckpt_dir.glob("*.pt"))
     best_ckpt_path, best_loss = None, float("inf")
     for p in candidates:
@@ -69,6 +73,11 @@ def load_simclr_encoder(device, ckpt_dir=None):
                 best_loss, best_ckpt_path = c["loss"], p
         except Exception:
             pass
+    if best_ckpt_path is None:
+        raise FileNotFoundError(
+            f"No valid SimCLR checkpoint found in {ckpt_dir}. "
+            "Train the IBM SimCLR encoder first (e.g. run Part A of the ablation)."
+        )
     print(f"Best SimCLR checkpoint: {best_ckpt_path.name}  (loss={best_loss:.4f})")
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
     sd         = ckpt["encoder_state_dict"]

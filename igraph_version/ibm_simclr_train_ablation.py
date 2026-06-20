@@ -52,7 +52,7 @@ from util import preprocess_df, extract_networks_igraph
 
 CKPT_ROOT    = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
 DATA_DIR     = BASE_DIR / "data"
-DEFAULT_CSV  = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"
+DEFAULT_CSV  = str(Path(__file__).resolve().parent.parent / "data" / "IBM" / "LI-Small_Trans.csv")
 MAX_NODES    = 64
 MAX_NETWORKS = 2000   # laundering networks; same count of clean extracted
 

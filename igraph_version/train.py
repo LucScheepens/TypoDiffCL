@@ -21,6 +21,8 @@ Outputs
   checkpoints/simclr_elliptic/best_model.pt  Elliptic SimCLR checkpoint
 """
 
+from pathlib import Path   # needed by CONFIG paths below
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONFIG — edit this section
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29,7 +31,7 @@ Outputs
 DATASET = "ibm"           # "ibm"  or  "elliptic"
 
 # ── IBM dataset settings ──────────────────────────────────────────────────────
-IBM_CSV_PATH = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"
+IBM_CSV_PATH = str(Path(__file__).resolve().parent.parent / "data" / "IBM" / "LI-Small_Trans.csv")
 IBM_MAX_NETWORKS   = 2000   # laundering networks extracted; same count of clean
 IBM_MAX_DEPTH      = 4      # BFS depth for subgraph extraction
 IBM_COLLAPSE_THRESH = 10    # hub-collapse threshold

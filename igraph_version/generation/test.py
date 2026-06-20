@@ -85,7 +85,7 @@ from scoring import (
 from generation.latent_seed_generation import plot_generated_vs_closest_training
 
 # ── defaults (overridden by CLI args) ─────────────────────────────────────────
-IBM_CSV_PATH   = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"
+IBM_CSV_PATH   = str(Path(__file__).resolve().parent.parent.parent / "data" / "IBM" / "LI-Small_Trans.csv")
 TARGET         = 1       # 1 = generate illicit/laundering-like, 0 = clean-like
 N_GEN          = 8
 T_START        = 150

@@ -100,7 +100,7 @@ from scoring import (
 )
 
 # ── config ─────────────────────────────────────────────────────────────────────
-CSV_PATH        = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\HI-Small_Trans.csv"
+CSV_PATH        = str(Path(__file__).resolve().parent.parent.parent / "data" / "IBM" / "HI-Small_Trans.csv")
 TARGET          = 1
 N_GEN           = 8
 T_START         = 250     # higher than interpolation version — target is further away

@@ -55,7 +55,7 @@ for _p in (str(ROOT_DIR), str(DIFF_DIR), str(SIMCLR_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-DEFAULT_CSV   = r"C:\Users\lucsc\Thesis\grad\grad\data\IBM\LI-Small_Trans.csv"
+DEFAULT_CSV   = str(Path(__file__).resolve().parent.parent.parent / "data" / "IBM" / "LI-Small_Trans.csv")
 DEFAULT_CACHE = DATA_DIR / "networks_cache_LI-Small_Trans.pkl"
 DEFAULT_OUT   = ROOT_DIR / "results" / "ibm" / "subgraph_gallery.png"
 NCOLS         = 4
