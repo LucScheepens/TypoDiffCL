@@ -1,3 +1,4 @@
+import itertools
 import math
 import sys
 import torch
@@ -82,9 +83,9 @@ def load_simclr_encoder(device, ckpt_dir=None):
     ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
     sd         = ckpt["encoder_state_dict"]
     from simclr import encoder_dims_from_state_dict as _edfs
-    in_dim, hidden_dim, n_layers, use_bn = _edfs(sd)
+    in_dim, hidden_dim, n_layers, use_bn, use_gin = _edfs(sd)
     encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
-                           n_layers=n_layers, use_bn=use_bn).to(device)
+                           n_layers=n_layers, use_bn=use_bn, use_gin=use_gin).to(device)
     encoder.load_state_dict(sd)
     encoder.eval()
     return encoder
@@ -243,6 +244,10 @@ def guided_generate(
                 x0_pred = torch.cat([x0_bin, x0_cont], dim=-1)
 
                 pyg   = _to_pyg(x0_pred[0, :n], adj_pred[0, :n, :n], n, device, x_mean, x_std)
+                if encoder.in_dim != pyg.x.shape[1]:
+                    _lc = torch.full((n, 1), float(target_label), device=device)
+                    pyg = Data(x=torch.cat([_lc, pyg.x], dim=1),
+                               edge_index=pyg.edge_index, batch=pyg.batch)
                 h     = encoder(pyg)
                 h_n   = F.normalize(h, dim=-1)           # [1, 128]
 
@@ -407,6 +412,10 @@ def run_guided_generation(
     import random as _random
     from diffusion.diff_util import network_to_dense as _ntd
 
+    # Drop networks with fewer than 2 nodes — they are degenerate seeds that
+    # cannot yield a valid adjacency matrix for diffusion or statistics.
+    networks = [n for n in networks if n["graph"].vcount() >= 2]
+
     # Compute training mean degree and edge density for calibrated generation.
     # Also collect per-node normalised degrees from LAUNDERING graphs only so we
     # can sample a realistic target degree sequence for each generated graph.
@@ -477,12 +486,18 @@ def run_guided_generation(
 
     gen_outputs, gen_embeddings = [], []
     n_discarded = 0
+    target_count = len(seeds)
+    _seed_cycle  = itertools.cycle(seeds)
+    _n_attempts  = 0
+    _max_attempts = target_count * 10
 
-    with tqdm(total=len(seeds) * (t_start + 1),
-              desc=f"Generating {len(seeds)} networks",
+    with tqdm(total=target_count * (t_start + 1),
+              desc=f"Generating {target_count} networks",
               unit="step", dynamic_ncols=True) as pbar:
-        for i, seed in enumerate(seeds):
-            pbar.set_postfix(network=f"{i+1}/{len(seeds)}")
+        while len(gen_outputs) < target_count and _n_attempts < _max_attempts:
+            seed = next(_seed_cycle)
+            _n_attempts += 1
+            pbar.set_postfix(network=f"{len(gen_outputs)+1}/{target_count}")
 
             # Determine how many active nodes this seed has so we can draw the
             # right number of per-node degree targets from the laundering pool.
@@ -509,13 +524,15 @@ def run_guided_generation(
             )
 
             if n_patches > 0:
-                print(f"  [validity] graph {i+1}: removed {n_patches} disconnected node(s)")
+                print(f"  [validity] attempt {_n_attempts}: removed {n_patches} disconnected node(s)")
 
             # ── Structural validity checks ─────────────────────────────────
             if n_out < size_5th:
-                print(f"  [validity] graph {i+1} discarded: "
-                      f"n_nodes {n_out} < 5th-pct ({size_5th:.0f})")
+                print(f"  [validity] attempt {_n_attempts} discarded: "
+                      f"n_nodes {n_out} < 5th-pct ({size_5th:.0f}), retrying...")
                 n_discarded += 1
+                pbar.total += (t_start + 1)
+                pbar.refresh()
                 continue
 
             # Denormalise node features — col 0 (laundering flag) is excluded
@@ -538,7 +555,8 @@ def run_guided_generation(
             gen_embeddings.append(h_g_n.squeeze(0).numpy())
 
     if n_discarded:
-        print(f"  [validity] {n_discarded}/{len(seeds)} graphs discarded by structural checks")
+        print(f"  [validity] {n_discarded}/{_n_attempts} attempts discarded by structural checks "
+              f"(retried to reach {target_count})")
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
     return gen_outputs, gen_embeddings, seeds
@@ -756,11 +774,93 @@ def tune_guidance_params(
 
 def load_simclr_encoder_elliptic(device):
     """
-    Like load_simclr_encoder() but reads from model_checkpoints_elliptic/.
-    Run elliptic_simclr_train.py first to produce the checkpoint.
+    Like load_simclr_encoder() but reads from simclr_elliptic/ (or the
+    per-dataset fallback checkpoints/elliptic/simclr/).
     """
     from simclr import GraphEncoder
-    ckpt_dir   = CKPT_DIR / "simclr_elliptic"
+    # Primary location; fall back to the per-dataset dir produced by train.py.
+    _search_dirs = [
+        CKPT_DIR / "simclr_elliptic",
+        CKPT_DIR / "elliptic" / "simclr",
+    ]
+    candidates = []
+    for _d in _search_dirs:
+        candidates.extend(_d.glob("*.pt"))
+    best_path, best_loss = None, float("inf")
+    for p in candidates:
+        try:
+            c = torch.load(p, map_location="cpu", weights_only=False)
+            if isinstance(c, dict) and "loss" in c and c["loss"] < best_loss:
+                best_loss, best_path = c["loss"], p
+        except Exception:
+            pass
+    if best_path is None:
+        raise FileNotFoundError(
+            f"No valid checkpoint found in {_search_dirs}. "
+            "Run elliptic_simclr_train.py first."
+        )
+    print(f"Best Elliptic SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
+    ckpt       = torch.load(best_path, map_location=device, weights_only=False)
+    sd         = ckpt["encoder_state_dict"]
+    from simclr import encoder_dims_from_state_dict as _edfs_ell
+    in_dim, hidden_dim, n_layers, use_bn, use_gin = _edfs_ell(sd)
+    encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
+                           n_layers=n_layers, use_bn=use_bn, use_gin=use_gin).to(device)
+    encoder.load_state_dict(sd)
+    encoder.eval()
+    return encoder
+
+
+def load_diffusion_model_elliptic(device, ckpt_path=None):
+    """
+    Like load_diffusion_model() but loads the Elliptic diffusion checkpoint.
+    Searches diffusion_elliptic/model.pt then elliptic/diffusion/ as fallback.
+    Pass ckpt_path to override (e.g. when --ckpt-dir is used).
+    Returns (model, diffusion, x_mean, x_std, max_nodes).
+    """
+    from diffusion.model    import DiffusionGNN
+    from diffusion.diff_util import create_diffusion
+    if ckpt_path is None:
+        _candidates = [
+            CKPT_DIR / "diffusion_elliptic" / "model.pt",
+            CKPT_DIR / "elliptic" / "diffusion" / "model_elliptic.pt",
+            CKPT_DIR / "elliptic" / "diffusion" / "model.pt",
+        ]
+        for _p in _candidates:
+            if _p.exists():
+                ckpt_path = _p
+                break
+    model_path = Path(ckpt_path) if ckpt_path else None
+    if model_path is None or not model_path.exists():
+        raise FileNotFoundError(
+            f"Elliptic diffusion checkpoint not found. Tried: "
+            f"{[CKPT_DIR / 'diffusion_elliptic' / 'model.pt', CKPT_DIR / 'elliptic' / 'diffusion']}. "
+            "Run elliptic_diffusion_train.py first."
+        )
+    ckpt            = torch.load(model_path, map_location=device, weights_only=False)
+    node_dim        = ckpt["model"]["input_proj.weight"].shape[1]
+    num_layers_ckpt = ckpt.get("num_layers", 4)
+    class_cond_ckpt = ckpt.get("class_conditional", False)
+    deg_cond_ckpt   = ckpt.get("degree_conditioning",
+                                "degree_proj.weight" in ckpt["model"])
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128,
+                              num_layers=num_layers_ckpt,
+                              class_conditional=class_cond_ckpt,
+                              degree_conditioning=deg_cond_ckpt).to(device)
+    diff_model.load_state_dict(ckpt["model"])
+    diff_model.eval()
+    diffusion  = create_diffusion(T=500)
+    x_mean     = ckpt["x_mean"].to(device)
+    x_std      = ckpt["x_std"].to(device)
+    max_nodes  = ckpt.get("max_nodes", MAX_NODES)
+    print(f"Elliptic diffusion model loaded from {model_path}  (max_nodes={max_nodes}).")
+    return diff_model, diffusion, x_mean, x_std, max_nodes
+
+
+def load_simclr_encoder_ethereum(device):
+    """Load the best SimCLR checkpoint trained on the Ethereum Phishing dataset."""
+    from simclr import GraphEncoder
+    ckpt_dir   = CKPT_DIR / "simclr_ethereum"
     candidates = list(ckpt_dir.glob("*.pt"))
     best_path, best_loss = None, float("inf")
     for p in candidates:
@@ -773,44 +873,51 @@ def load_simclr_encoder_elliptic(device):
     if best_path is None:
         raise FileNotFoundError(
             f"No valid checkpoint found in {ckpt_dir}. "
-            "Run elliptic_simclr_train.py first."
+            "Train the Ethereum SimCLR encoder first "
+            "(run: python train.py --dataset ethereum --phase simclr)."
         )
-    print(f"Best Elliptic SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
-    ckpt       = torch.load(best_path, map_location=device, weights_only=False)
-    sd         = ckpt["encoder_state_dict"]
-    from simclr import encoder_dims_from_state_dict as _edfs_ell
-    in_dim, hidden_dim, n_layers, use_bn = _edfs_ell(sd)
+    print(f"Best Ethereum SimCLR checkpoint: {best_path.name}  (loss={best_loss:.4f})")
+    ckpt = torch.load(best_path, map_location=device, weights_only=False)
+    sd   = ckpt["encoder_state_dict"]
+    from simclr import encoder_dims_from_state_dict as _edfs_eth
+    in_dim, hidden_dim, n_layers, use_bn, use_gin = _edfs_eth(sd)
     encoder = GraphEncoder(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=128,
-                           n_layers=n_layers, use_bn=use_bn).to(device)
+                           n_layers=n_layers, use_bn=use_bn, use_gin=use_gin).to(device)
     encoder.load_state_dict(sd)
     encoder.eval()
     return encoder
 
 
-def load_diffusion_model_elliptic(device):
+def load_diffusion_model_ethereum(device):
     """
-    Like load_diffusion_model() but loads diffusion/model_elliptic.pt.
-    Run elliptic_diffusion_train.py first to produce the checkpoint.
+    Load the Ethereum diffusion checkpoint.
+    Run: python train.py --dataset ethereum --phase diffusion
     Returns (model, diffusion, x_mean, x_std, max_nodes).
     """
-    from diffusion.model    import DiffusionGNN
+    from diffusion.model     import DiffusionGNN
     from diffusion.diff_util import create_diffusion
-    model_path = CKPT_DIR / "diffusion_elliptic" / "model.pt"
+    model_path = CKPT_DIR / "diffusion_ethereum" / "model.pt"
     if not model_path.exists():
         raise FileNotFoundError(
-            f"Elliptic diffusion checkpoint not found at {model_path}. "
-            "Run elliptic_diffusion_train.py first."
+            f"Ethereum diffusion checkpoint not found at {model_path}. "
+            "Train it first: python train.py --dataset ethereum --phase diffusion"
         )
     ckpt       = torch.load(model_path, map_location=device, weights_only=False)
     node_dim   = ckpt["model"]["input_proj.weight"].shape[1]
-    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128, num_layers=4).to(device)
+    num_layers = ckpt.get("num_layers", 3)
+    class_cond = ckpt.get("class_conditional", True)
+    deg_cond   = ckpt.get("degree_conditioning", True)
+    diff_model = DiffusionGNN(node_dim=node_dim, hidden_dim=128,
+                              num_layers=num_layers,
+                              class_conditional=class_cond,
+                              degree_conditioning=deg_cond).to(device)
     diff_model.load_state_dict(ckpt["model"])
     diff_model.eval()
     diffusion  = create_diffusion(T=500)
     x_mean     = ckpt["x_mean"].to(device)
     x_std      = ckpt["x_std"].to(device)
-    max_nodes  = ckpt.get("max_nodes", MAX_NODES)
-    print(f"Elliptic diffusion model loaded from {model_path}  (max_nodes={max_nodes}).")
+    max_nodes  = ckpt.get("max_nodes", 100)
+    print(f"Ethereum diffusion model loaded from {model_path}  (max_nodes={max_nodes}).")
     return diff_model, diffusion, x_mean, x_std, max_nodes
 
 
@@ -835,10 +942,18 @@ def encode_all_pyg_graphs(graphs, encoder, device, batch_size=128):
     """
     from torch_geometric.data import Data as _Data, Batch as _Batch
 
+    # Legacy checkpoints (in_dim=6) were trained with the graph label prepended
+    # as col 0.  Newer checkpoints (in_dim=5) dropped that column to avoid
+    # label leakage.  Detect which convention applies from the encoder itself.
+    needs_label_col = (encoder.in_dim == 6)
+
     ext_graphs, all_labels = [], []
     for g in graphs:
-        # No label prepending — the encoder now expects features without col 0.
-        ext_graphs.append(_Data(x=g.x.clone(), edge_index=g.edge_index.clone()))
+        x = g.x.clone()
+        if needs_label_col:
+            label_col = torch.full((x.shape[0], 1), float(g.y.item()))
+            x = torch.cat([label_col, x], dim=1)
+        ext_graphs.append(_Data(x=x, edge_index=g.edge_index.clone()))
         all_labels.append(float(g.y.item()))
 
     H_list = []
@@ -874,6 +989,7 @@ def run_guided_generation_elliptic(
     adj_threshold=0.35,
     adj_gamma=1.0,
     max_nodes=100,
+    dataset_name="Elliptic",
 ):
     """
     Like run_guided_generation() but seeds are Elliptic PyG Data objects.
@@ -963,12 +1079,18 @@ def run_guided_generation_elliptic(
 
     gen_outputs, gen_embeddings = [], []
     n_discarded = 0
+    target_count  = len(seeds)
+    _seed_cycle   = itertools.cycle(seeds)
+    _n_attempts   = 0
+    _max_attempts = target_count * 10
 
-    with tqdm(total=len(seeds) * (t_start + 1),
-              desc=f"Generating {len(seeds)} Elliptic graphs",
+    with tqdm(total=target_count * (t_start + 1),
+              desc=f"Generating {target_count} {dataset_name} graphs",
               unit="step", dynamic_ncols=True) as pbar:
-        for i, seed_g in enumerate(seeds):
-            pbar.set_postfix(graph=f"{i+1}/{len(seeds)}")
+        while len(gen_outputs) < target_count and _n_attempts < _max_attempts:
+            seed_g = next(_seed_cycle)
+            _n_attempts += 1
+            pbar.set_postfix(graph=f"{len(gen_outputs)+1}/{target_count}")
 
             # Convert to the dict format that guided_generate() expects.
             # It checks for "x_dense"/"adj_dense" first (fast path).
@@ -997,19 +1119,23 @@ def run_guided_generation_elliptic(
             )
 
             if n_patches > 0:
-                print(f"  [validity] graph {i+1}: removed {n_patches} disconnected node(s)")
+                print(f"  [validity] attempt {_n_attempts}: removed {n_patches} disconnected node(s)")
 
             # ── Structural validity checks ─────────────────────────────────
             gen_density = float(adj_out.sum()) / max(n_out * (n_out - 1), 1)
             if density_ceil is not None and gen_density > density_ceil:
-                print(f"  [validity] graph {i+1} discarded: density {gen_density:.3f} "
-                      f"> 2× target ({target_density:.3f})")
+                print(f"  [validity] attempt {_n_attempts} discarded: density {gen_density:.3f} "
+                      f"> 2× target ({target_density:.3f}), retrying...")
                 n_discarded += 1
+                pbar.total += (t_start + 1)
+                pbar.refresh()
                 continue
             if n_out < size_5th:
-                print(f"  [validity] graph {i+1} discarded: "
-                      f"n_nodes {n_out} < 5th-pct ({size_5th:.0f})")
+                print(f"  [validity] attempt {_n_attempts} discarded: "
+                      f"n_nodes {n_out} < 5th-pct ({size_5th:.0f}), retrying...")
                 n_discarded += 1
+                pbar.total += (t_start + 1)
+                pbar.refresh()
                 continue
 
             # Denormalise node features — col 0 (laundering flag) excluded
@@ -1021,8 +1147,13 @@ def run_guided_generation_elliptic(
 
             ei_g = (adj_out > adj_threshold).nonzero(as_tuple=False).T.contiguous()
             bv_g = torch.zeros(n_out, dtype=torch.long)
+            # Legacy 6-D encoder: prepend the target label column.
+            x_enc = x_denorm
+            if encoder.in_dim == 6:
+                _lc   = torch.full((n_out, 1), float(target_label))
+                x_enc = torch.cat([_lc, x_denorm], dim=1)
             with torch.no_grad():
-                h_g   = encoder(Data(x=x_denorm, edge_index=ei_g,
+                h_g   = encoder(Data(x=x_enc, edge_index=ei_g,
                                      batch=bv_g).to(device)).cpu()
                 h_g_n = F.normalize(h_g, dim=-1)
 
@@ -1032,7 +1163,8 @@ def run_guided_generation_elliptic(
             gen_embeddings.append(h_g_n.squeeze(0).numpy())
 
     if n_discarded:
-        print(f"  [validity] {n_discarded}/{len(seeds)} graphs discarded by structural checks")
+        print(f"  [validity] {n_discarded}/{_n_attempts} attempts discarded by structural checks "
+              f"(retried to reach {target_count})")
 
     gen_embeddings = np.stack(gen_embeddings, axis=0)
     return gen_outputs, gen_embeddings, seeds

@@ -410,11 +410,12 @@ def network_to_pyg(x_dense, adj_dense, label):
         ei = _fallback_edges(x_np.shape[0])
 
     return Data(
-        x             = torch.tensor(x_np, dtype=torch.float),
-        edge_index    = ei,
-        y             = torch.tensor([label], dtype=torch.long),
-        timestep      = torch.tensor([-1], dtype=torch.long),
-        timestamp_val = -1.0,
+        x                = torch.tensor(x_np, dtype=torch.float),
+        edge_index       = ei,
+        y                = torch.tensor([label], dtype=torch.long),
+        timestep         = torch.tensor([-1], dtype=torch.long),
+        timestamp_val    = -1.0,
+        anchor_local_idx = torch.tensor([0], dtype=torch.long),
     )
 
 
@@ -500,11 +501,12 @@ def gen_output_to_pyg(x_denorm, adj_out, n_out, label=1):
         ei = _fallback_edges(n_out)
 
     return Data(
-        x             = torch.tensor(x_np, dtype=torch.float),
-        edge_index    = ei,
-        y             = torch.tensor([label], dtype=torch.long),
-        timestep      = torch.tensor([-1], dtype=torch.long),
-        timestamp_val = -1.0,
+        x                = torch.tensor(x_np, dtype=torch.float),
+        edge_index       = ei,
+        y                = torch.tensor([label], dtype=torch.long),
+        timestep         = torch.tensor([-1], dtype=torch.long),
+        timestamp_val    = -1.0,
+        anchor_local_idx = torch.tensor([0], dtype=torch.long),
     )
 
 
@@ -558,6 +560,23 @@ def _to_fraudgt_format(data):
     n = data.x.shape[0]
     return Data(
         x             = torch.cat([data.x, torch.zeros(n, 1)], dim=1),
+        edge_index    = data.edge_index,
+        y             = data.y,
+        timestep      = getattr(data, "timestep",      torch.tensor([-1])),
+        timestamp_val = getattr(data, "timestamp_val", -1.0),
+    )
+
+
+def _to_fraudgt_format_elliptic(data):
+    """Append ego_id feature for Elliptic graphs using the stored anchor_local_idx."""
+    n      = data.x.shape[0]
+    ego_id = torch.zeros(n, 1)
+    if hasattr(data, "anchor_local_idx"):
+        idx = int(data.anchor_local_idx.item())
+        if 0 <= idx < n:
+            ego_id[idx] = 1.0
+    return Data(
+        x             = torch.cat([data.x, ego_id], dim=1),
         edge_index    = data.edge_index,
         y             = data.y,
         timestep      = getattr(data, "timestep",      torch.tensor([-1])),
@@ -762,10 +781,10 @@ def run_experiment_exstraqt(train_items, val_nets, test_nets, seed=0):
     """
     X_train = np.stack([_exstraqt_features(n) for n in train_items])
     y_train = np.array([_exstraqt_label(n)    for n in train_items])
-    X_val   = np.stack([_extract_exstraqt_features(n) for n in val_nets])
-    y_val   = np.array([_get_net_label(n) for n in val_nets])
-    X_test  = np.stack([_extract_exstraqt_features(n) for n in test_nets])
-    y_test  = np.array([_get_net_label(n) for n in test_nets])
+    X_val   = np.stack([_exstraqt_features(n) for n in val_nets])
+    y_val   = np.array([_exstraqt_label(n)    for n in val_nets])
+    X_test  = np.stack([_exstraqt_features(n) for n in test_nets])
+    y_test  = np.array([_exstraqt_label(n)    for n in test_nets])
 
     n_pos       = int(y_train.sum())
     n_neg       = len(y_train) - n_pos
@@ -1150,13 +1169,20 @@ def main():
                         help="Subsample training set to this fraction before augmenting "
                              "(e.g. 0.2 = 20%%). Useful to show augmentation benefit "
                              "under data scarcity. Default: 1.0 (full training set)")
-    parser.add_argument("--dataset", choices=["ibm", "elliptic", "both"],
+    parser.add_argument("--dataset", choices=["ibm", "elliptic", "both", "ethereum"],
                         default="ibm",
-                        help="Dataset to use: ibm (default), elliptic, or both combined")
+                        help="Dataset to use: ibm (default), elliptic, both combined, "
+                             "or ethereum (Ethereum Phishing Transaction Network)")
     parser.add_argument("--ibm-csv", type=str, default=None, metavar="PATH",
                         help="Override the IBM CSV path. Use this to switch between "
                              "HI-Small_Trans.csv (default) and LI-Large_Trans.csv, e.g. "
                              r"--ibm-csv C:\path\to\LI-Large_Trans.csv")
+    parser.add_argument("--remove-hubs", type=int, default=0, metavar="N",
+                        help="Remove the top N highest-degree nodes before evaluation "
+                             "(default 0 = disabled). For IBM: removes those accounts from "
+                             "the transaction graph before extracting ego networks. For "
+                             "Ethereum: drops subgraphs whose anchor node has the highest "
+                             "degree within its ego subgraph (proxy for global hub degree).")
     # ── Ablation / encoder override ──────────────────────────────────────────
     parser.add_argument("--encoder-dir", type=str, default=None, metavar="DIR",
                         help="Override the SimCLR encoder checkpoint directory. "
@@ -1185,6 +1211,9 @@ def main():
     parser.add_argument("--t-start", type=int, default=None,
                         help="Override t_start (starting diffusion timestep) in guided "
                              "generation (default 150 for Elliptic).")
+    parser.add_argument("--elliptic-depth", type=int, default=4,
+                        help="BFS hop depth for Elliptic subgraph extraction (default 4). "
+                             "Higher values produce larger ego-subgraphs; try 2-6.")
     # ── Direction 3: embedding separation diagnostic ──────────────────────────
     parser.add_argument("--sep-check", action="store_true",
                         help="After loading the SimCLR encoder, compute and print silhouette "
@@ -1251,8 +1280,23 @@ def main():
         # Cache filename is tied to the CSV so switching datasets doesn't silently
         # reuse a stale cache built from a different file.
         csv_stem   = Path(ibm_csv).stem
-        CACHE_PATH = DATA_DIR / f"networks_cache_{csv_stem}_v2.pkl"
+        _hub_sfx   = f"_nohubs{args.remove_hubs}" if args.remove_hubs > 0 else ""
+        CACHE_PATH = DATA_DIR / f"networks_cache_{csv_stem}{_hub_sfx}_v2.pkl"
         df_full    = preprocess_df(ibm_csv)
+
+        if args.remove_hubs > 0:
+            _from_deg  = df_full["From_Account_int"].value_counts()
+            _to_deg    = df_full["To_Account_int"].value_counts()
+            _degree    = _from_deg.add(_to_deg, fill_value=0)
+            _hub_nodes = set(_degree.nlargest(args.remove_hubs).index.tolist())
+            _n_before  = len(df_full)
+            df_full = df_full[
+                ~df_full["From_Account_int"].isin(_hub_nodes) &
+                ~df_full["To_Account_int"].isin(_hub_nodes)
+            ].reset_index(drop=True)
+            print(f"Hub removal (top {args.remove_hubs}): "
+                  f"{_n_before - len(df_full):,} of {_n_before:,} transactions removed "
+                  f"({(_n_before - len(df_full)) / _n_before * 100:.1f}%)")
 
         if CACHE_PATH.exists():
             print(f"Loading IBM networks from cache ({CACHE_PATH.name}) …")
@@ -1309,8 +1353,38 @@ def main():
 
     if args.dataset in ("elliptic", "both"):
         from data.elliptic_adapter import load_elliptic_pyg_graphs
-        elliptic_graphs = load_elliptic_pyg_graphs()
+        elliptic_graphs = load_elliptic_pyg_graphs(depth=args.elliptic_depth)
         all_data.extend(elliptic_graphs)
+        # Build FraudGT variants for Elliptic using anchor_local_idx stored by the adapter
+        fraudgt_all_data.extend([_to_fraudgt_format_elliptic(g) for g in elliptic_graphs])
+
+    if args.dataset == "ethereum":
+        from data.ethereum_adapter import load_ethereum_pyg_graphs
+        ethereum_graphs = load_ethereum_pyg_graphs()
+
+        if args.remove_hubs > 0:
+            # Rank anchors by their degree within the ego subgraph (sum of in + out
+            # edges touching the anchor node) as a proxy for global hub degree.
+            def _anchor_deg(g):
+                idx = int(g.anchor_local_idx.item())
+                ei  = g.edge_index
+                if ei.shape[1] == 0:
+                    return 0
+                return int((ei[0] == idx).sum()) + int((ei[1] == idx).sum())
+
+            ranked   = sorted(range(len(ethereum_graphs)),
+                              key=lambda i: _anchor_deg(ethereum_graphs[i]),
+                              reverse=True)
+            hub_set  = set(ranked[: args.remove_hubs])
+            n_before = len(ethereum_graphs)
+            ethereum_graphs = [g for i, g in enumerate(ethereum_graphs)
+                               if i not in hub_set]
+            print(f"Hub removal (top {args.remove_hubs}): "
+                  f"removed {n_before - len(ethereum_graphs)} Ethereum subgraphs")
+
+        all_data.extend(ethereum_graphs)
+        # FraudGT: use anchor_local_idx stored by the ethereum adapter (same as Elliptic)
+        fraudgt_all_data.extend([_to_fraudgt_format_elliptic(g) for g in ethereum_graphs])
 
     all_labels_np = np.array([d.y.item() for d in all_data])
     n_laund = int(all_labels_np.sum())
@@ -1425,19 +1499,33 @@ def main():
               f"training graphs ({args.low_data:.0%})")
         print()
 
-    # ── 3c. FraudGT and ExSTraQt splits (IBM only) ───────────────────────────
-    # Mirror the main all_data split; idx_tr / idx_val / idx_test_arr are set above.
+    # ── 3c. FraudGT and ExSTraQt splits ─────────────────────────────────────
     n_ibm = len(ibm_data_networks)
-    if fraudgt_all_data:
-        fgt_train = [fraudgt_all_data[i] for i in idx_tr  if i < n_ibm]
-        fgt_val   = [fraudgt_all_data[i] for i in idx_val if i < n_ibm]
+    if args.dataset == "both":
+        # Combined mode: FraudGT only on IBM (5-dim Elliptic and 18-dim IBM are incompatible)
+        fgt_train = [fraudgt_all_data[i] for i in idx_tr      if i < n_ibm]
+        fgt_val   = [fraudgt_all_data[i] for i in idx_val     if i < n_ibm]
         fgt_test  = [fraudgt_all_data[i] for i in idx_test_arr if i < n_ibm]
+    elif args.dataset == "ibm":
+        # IBM: fraudgt_all_data is in lockstep with all_data; idx_tr indexes all_data
+        fgt_train = [fraudgt_all_data[i] for i in idx_tr]
+        fgt_val   = [fraudgt_all_data[i] for i in idx_val]
+        fgt_test  = [fraudgt_all_data[i] for i in idx_test_arr]
     else:
-        fgt_train = fgt_val = fgt_test = []
+        # Elliptic / Ethereum: build directly from the already-split pools.
+        # The Elliptic temporal split sets idx_tr/idx_val as indices into trainval_pool
+        # (not all_data), so re-indexing fraudgt_all_data with those would give wrong
+        # or empty results.  Applying _to_fraudgt_format_elliptic to the pre-split
+        # lists is simpler and always correct.
+        fgt_train = [_to_fraudgt_format_elliptic(g) for g in data_train]
+        fgt_val   = [_to_fraudgt_format_elliptic(g) for g in data_val]
+        fgt_test  = [_to_fraudgt_format_elliptic(g) for g in data_test]
 
-    xq_train_nets = [ibm_data_networks[i] for i in idx_tr      if i < n_ibm]
-    xq_val_nets   = [ibm_data_networks[i] for i in idx_val     if i < n_ibm]
-    xq_test_nets  = [ibm_data_networks[i] for i in idx_test_arr if i < n_ibm]
+    # ExSTraQt: IBM graphs use raw network dicts (full feature extraction);
+    # Elliptic graphs use PyG Data objects (approximated via _exstraqt_features routing).
+    xq_train_nets = [ibm_data_networks[i] if i < n_ibm else all_data[i] for i in idx_tr]
+    xq_val_nets   = [ibm_data_networks[i] if i < n_ibm else all_data[i] for i in idx_val]
+    xq_test_nets  = [ibm_data_networks[i] if i < n_ibm else all_data[i] for i in idx_test_arr]
 
     # ── 4. Optionally generate augmentation data ─────────────────────────────
     gen_data = []
@@ -1478,7 +1566,15 @@ def main():
             else:
                 encoder_e = load_simclr_encoder_elliptic(device)
 
-            diff_model_e, diffusion_e, x_mean_e, x_std_e, _max_n_e = load_diffusion_model_elliptic(device)
+            _ell_diff_path = None
+            if args.ckpt_dir:
+                _ell_d = Path(args.ckpt_dir) / "diffusion"
+                for _name in ("model.pt", "model_elliptic.pt"):
+                    if (_ell_d / _name).exists():
+                        _ell_diff_path = _ell_d / _name
+                        break
+            diff_model_e, diffusion_e, x_mean_e, x_std_e, _max_n_e = \
+                load_diffusion_model_elliptic(device, ckpt_path=_ell_diff_path)
             # Only encode training-fold graphs to avoid test leakage in the probe.
             # data_train has already been split off from the temporal train pool.
             H_all_e, y_all_e = encode_all_pyg_graphs(data_train, encoder_e, device)
@@ -1576,6 +1672,73 @@ def main():
                 print(f"Q-filter (threshold={args.q_threshold:.2f}): "
                       f"kept {len(gen_data)}/{before} generated graphs\n")
 
+        elif args.dataset == "ethereum":
+            # ── Ethereum augmentation path ────────────────────────────────
+            print(f"[Ethereum] Generating {args.n_gen} augmentation graphs …")
+            from generation.generation import (
+                load_simclr_encoder_ethereum,
+                load_diffusion_model_ethereum,
+                encode_all_pyg_graphs,
+                train_mlp_probe,
+                run_guided_generation_elliptic,   # compatible: same 5-dim node features
+            )
+            if args.encoder_dir is not None:
+                from simclr import GraphEncoder as _GE_eth
+                _ckpt_dir_eth = Path(args.encoder_dir)
+                _cands_eth    = list(_ckpt_dir_eth.glob("*.pt"))
+                _best_eth, _best_eth_loss = None, float("inf")
+                for _p in _cands_eth:
+                    try:
+                        _c = torch.load(_p, map_location="cpu", weights_only=False)
+                        if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _best_eth_loss:
+                            _best_eth_loss, _best_eth = _c["loss"], _p
+                    except Exception:
+                        pass
+                if _best_eth is None:
+                    raise FileNotFoundError(f"No valid checkpoint in {args.encoder_dir}")
+                print(f"Ablation encoder: {_best_eth.name}  (loss={_best_eth_loss:.4f})")
+                _ckpt_eth = torch.load(_best_eth, map_location=device, weights_only=False)
+                encoder_eth = _GE_eth(in_dim=5, hidden_dim=64, out_dim=128).to(device)
+                encoder_eth.load_state_dict(_ckpt_eth["encoder_state_dict"])
+                encoder_eth.eval()
+            else:
+                encoder_eth = load_simclr_encoder_ethereum(device)
+
+            diff_model_eth, diffusion_eth, x_mean_eth, x_std_eth, _max_n_eth = \
+                load_diffusion_model_ethereum(device)
+
+            H_all_eth, y_all_eth = encode_all_pyg_graphs(data_train, encoder_eth, device)
+            probe_eth = train_mlp_probe(H_all_eth, y_all_eth, device)
+
+            _eth_t_start = args.t_start if args.t_start is not None else 150
+            _eth_gs = args.guidance_scale
+            _eth_nw = args.novelty_weight
+            _eth_dp = args.degree_penalty
+
+            _gen_kwargs_eth = dict(n_gen=args.n_gen // 2, t_start=_eth_t_start)
+            if _eth_gs is not None: _gen_kwargs_eth["guidance_scale"] = _eth_gs
+            if _eth_nw is not None: _gen_kwargs_eth["novelty_weight"] = _eth_nw
+            if _eth_dp is not None: _gen_kwargs_eth["degree_penalty"] = _eth_dp
+
+            _gen_raw_eth = []
+            for _lbl in (1, 0):
+                _outs, _, _ = run_guided_generation_elliptic(
+                    data_train, encoder_eth, probe_eth,
+                    diff_model_eth, diffusion_eth,
+                    x_mean_eth, x_std_eth, H_all_eth, device,
+                    target_label=_lbl,
+                    dataset_name="Ethereum",
+                    **_gen_kwargs_eth,
+                )
+                _gen_raw_eth.extend(_outs)
+
+            for (x_denorm, adj_out, n_out, label) in _gen_raw_eth:
+                gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
+
+            n_ph_gen = sum(d.y.item() == 1 for d in gen_data)
+            print(f"Generated {len(gen_data)} augmentation graphs "
+                  f"(phishing={n_ph_gen}, clean={len(gen_data) - n_ph_gen})\n")
+
         elif not networks:
             # ── IBM networks missing ──────────────────────────────────────
             print("WARNING: --augment requires IBM networks for the diffusion+SimCLR "
@@ -1640,9 +1803,9 @@ def main():
                     _ckpt_ibm = torch.load(_best_ibm, map_location=device, weights_only=False)
                     _sd_ibm   = _ckpt_ibm["encoder_state_dict"]
                     from simclr import encoder_dims_from_state_dict as _edfs_ibm
-                    _in_dim_ibm, _hid_ibm, _n_lay_ibm, _bn_ibm = _edfs_ibm(_sd_ibm)
+                    _in_dim_ibm, _hid_ibm, _n_lay_ibm, _bn_ibm, _gin_ibm = _edfs_ibm(_sd_ibm)
                     encoder = _GE_ibm(in_dim=_in_dim_ibm, hidden_dim=_hid_ibm, out_dim=128,
-                                      n_layers=_n_lay_ibm, use_bn=_bn_ibm).to(device)
+                                      n_layers=_n_lay_ibm, use_bn=_bn_ibm, use_gin=_gin_ibm).to(device)
                     encoder.load_state_dict(_sd_ibm)
                     encoder.eval()
                     print(f"  in_dim={_in_dim_ibm}  hidden={_hid_ibm}  layers={_n_lay_ibm}")
@@ -1805,11 +1968,23 @@ def main():
     # ── 6. Run experiments ───────────────────────────────────────────────────
     _model_filter = {m.lower() for m in args.models} if args.models else None
 
+    # Derive feature count from the real training data (5 for Elliptic, 18 for IBM).
+    in_ch = data_train[0].x.shape[1] if data_train else IN_CHANNELS
+
+    # Generated graphs are padded to IN_CHANNELS by gen_output_to_pyg; truncate
+    # them to match real data when the two differ (Elliptic case).
+    if gen_data and gen_data[0].x.shape[1] != in_ch:
+        for _g in gen_data:
+            _g.x = _g.x[:, :in_ch]
+    if gen_data_selected and gen_data_selected[0].x.shape[1] != in_ch:
+        for _g in gen_data_selected:
+            _g.x = _g.x[:, :in_ch]
+
     models = [
-        ("GIN",              GINClassifier),
-        ("GraphTransformer", GraphTransformerClassifier),
-        ("GraphSAGE",        GraphSAGEClassifier),
-        ("DeepSets",         DeepSetsClassifier),
+        ("GIN",              functools.partial(GINClassifier,              in_channels=in_ch)),
+        ("GraphTransformer", functools.partial(GraphTransformerClassifier, in_channels=in_ch)),
+        ("GraphSAGE",        functools.partial(GraphSAGEClassifier,        in_channels=in_ch)),
+        ("DeepSets",         functools.partial(DeepSetsClassifier,         in_channels=in_ch)),
     ]
     if _model_filter is not None:
         models = [(n, c) for n, c in models if n.lower() in _model_filter]
@@ -1851,9 +2026,9 @@ def main():
                 k: _mean_std(v) for k, v in run_metrics.items()
             }
 
-    # ── 6b. FraudGT (IBM only — requires ego_id feature) ────────────────────
+    # ── 6b. FraudGT (IBM and Elliptic — requires ego_id feature) ───────────
     if fgt_train and (_model_filter is None or "fraudgt" in _model_filter):
-        _fgt_cls = functools.partial(FraudGTClassifier, in_channels=FRAUDGT_IN_CHANNELS)
+        _fgt_cls = functools.partial(FraudGTClassifier, in_channels=in_ch + 1)
         for condition in conditions:
             if condition == "baseline":
                 fgt_tr = list(fgt_train)
@@ -1888,10 +2063,18 @@ def main():
                 k: _mean_std(v) for k, v in run_metrics.items()
             }
     else:
-        print("[FraudGT] skipped — only runs on IBM data (ego_id requires network dicts)")
+        print("[FraudGT] skipped — no FraudGT-format data was prepared")
 
-    # ── 6c. ExSTraQt (IBM only — requires transaction-level network dicts) ───
-    if xq_train_nets and (_model_filter is None or "exstraqt" in _model_filter):
+    # ── 6c. ExSTraQt ─────────────────────────────────────────────────────────
+    # IBM: full feature extraction from raw transaction DataFrames + igraph objects.
+    # Elliptic / Ethereum: PyG Data objects — _exstraqt_features routes to
+    #   _extract_exstraqt_features_from_pyg which derives graph-topology features
+    #   (nodes, edges, degree stats, density, assortativity, biconnected components,
+    #   articulation points, source/target role counts) from edge_index; amount and
+    #   temporal columns are set to zero since those attributes are not stored in
+    #   the 5-dimensional structural node features.
+    if xq_train_nets \
+            and (_model_filter is None or "exstraqt" in _model_filter):
         for condition in conditions:
             if condition == "baseline":
                 xq_tr = list(xq_train_nets)
@@ -1918,7 +2101,7 @@ def main():
                 if k != "_clf"
             }
     else:
-        print("[ExSTraQt] skipped — only runs on IBM data (requires transaction dicts)")
+        print("[ExSTraQt] skipped — no training network data was prepared")
 
     # ── 6. Report ────────────────────────────────────────────────────────────
     _print_table(results)

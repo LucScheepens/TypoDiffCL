@@ -21,7 +21,7 @@ sys.path.insert(0, str(BASE_DIR.parent))
 
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import GINConv, global_mean_pool, global_max_pool
+from torch_geometric.nn import GINConv, GCNConv, global_mean_pool, global_max_pool
 import time
 
 import torch.nn as nn
@@ -104,7 +104,7 @@ def network_to_pyg_data_fast(network):
 
 
 def encoder_dims_from_state_dict(sd):
-    """Return (in_dim, hidden_dim, n_layers, use_bn) from a GraphEncoder state dict.
+    """Return (in_dim, hidden_dim, n_layers, use_bn, use_gin) from a GraphEncoder state dict.
 
     Handles both the current GINConv encoder (conv1.nn.0.weight) and legacy
     GCNConv checkpoints (conv1.lin.weight) so old checkpoints load cleanly.
@@ -113,12 +113,14 @@ def encoder_dims_from_state_dict(sd):
         in_dim     = sd["conv1.nn.0.weight"].shape[1]
         hidden_dim = sd["conv1.nn.0.weight"].shape[0]
         n_layers   = 3 if "conv3.nn.0.weight" in sd else 2
+        use_gin    = True
     else:                                   # GCNConv (legacy)
         in_dim     = sd["conv1.lin.weight"].shape[1]
         hidden_dim = sd["conv1.lin.weight"].shape[0]
         n_layers   = 3 if "conv3.lin.weight" in sd else 2
+        use_gin    = False
     use_bn = "bn1.weight" in sd
-    return in_dim, hidden_dim, n_layers, use_bn
+    return in_dim, hidden_dim, n_layers, use_bn, use_gin
 
 
 class GraphEncoder(nn.Module):
@@ -131,22 +133,28 @@ class GraphEncoder(nn.Module):
     n_layers / use_bn / hidden_dim are stored so encoder_dims_from_state_dict
     can reconstruct the exact architecture from a checkpoint's state_dict keys.
     """
-    def __init__(self, in_dim, hidden_dim=128, out_dim=128, n_layers=3, use_bn=True):
+    def __init__(self, in_dim, hidden_dim=128, out_dim=128, n_layers=3, use_bn=True, use_gin=True):
         super().__init__()
         self.n_layers = n_layers
         self.use_bn   = use_bn
+        self.use_gin  = use_gin
 
-        def _mlp(in_d, out_d):
-            return nn.Sequential(
-                nn.Linear(in_d, out_d),
-                nn.ReLU(),
-                nn.Linear(out_d, out_d),
-            )
-
-        self.conv1 = GINConv(_mlp(in_dim,    hidden_dim), train_eps=True)
-        self.conv2 = GINConv(_mlp(hidden_dim, hidden_dim), train_eps=True)
-        if n_layers >= 3:
-            self.conv3 = GINConv(_mlp(hidden_dim, hidden_dim), train_eps=True)
+        if use_gin:
+            def _mlp(in_d, out_d):
+                return nn.Sequential(
+                    nn.Linear(in_d, out_d),
+                    nn.ReLU(),
+                    nn.Linear(out_d, out_d),
+                )
+            self.conv1 = GINConv(_mlp(in_dim,    hidden_dim), train_eps=True)
+            self.conv2 = GINConv(_mlp(hidden_dim, hidden_dim), train_eps=True)
+            if n_layers >= 3:
+                self.conv3 = GINConv(_mlp(hidden_dim, hidden_dim), train_eps=True)
+        else:
+            self.conv1 = GCNConv(in_dim,     hidden_dim)
+            self.conv2 = GCNConv(hidden_dim, hidden_dim)
+            if n_layers >= 3:
+                self.conv3 = GCNConv(hidden_dim, hidden_dim)
 
         if use_bn:
             self.bn1 = nn.BatchNorm1d(hidden_dim)

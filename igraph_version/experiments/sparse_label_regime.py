@@ -1,50 +1,47 @@
 """
-low_data_regime.py
-──────────────────
-Experiment 3: how much does each augmentation method recover performance when
-labelled training data is scarce?
+sparse_label_regime.py
+──────────────────────
+Experiment: how do augmentation methods perform when only a fraction of
+training graphs have their labels revealed (sparse-label / semi-supervised
+setting)?
+
+Unlike the low-data experiment (which removes minority-class examples),
+here the full set of training graphs exists but only label_frac of them
+are annotated.  Augmentation methods operate on the labeled subset only.
 
 Conditions
 ──────────
-  baseline    — real training graphs only (no augmentation)
-  diffusion   — real + N_GEN diffusion-generated laundering graphs (current solution)
-                (skipped gracefully if no checkpoint is found)
-  graphsmote  — real + N_GEN GraphSMOTE synthetic laundering graphs
-  gan         — real + N_GEN WGAN-GP synthetic laundering graphs
-  diga        — real + N_GEN DiGa diffusion synthetic laundering graphs
+  baseline    — labeled graphs only, no augmentation
+  diffusion   — labeled + N_GEN diffusion-generated laundering graphs
+  graphsmote  — labeled + N_GEN GraphSMOTE synthetic graphs
+  gan         — labeled + N_GEN WGAN-GP synthetic graphs
+  diga        — labeled + N_GEN DiGa synthetic graphs
 
-Classifiers
-───────────
-  gin              — Graph Isomorphism Network
-  graphtransformer — Graph Transformer (TransformerConv, 4 heads)
-  graphsage        — GraphSAGE
-  fraudgt          — FraudGT (Graph Transformer + degree PE + residuals + LayerNorm)
+Label fractions
+───────────────
+  5% | 10% | 25% | 50% | 100% of all training graphs are labeled
 
-Training fractions
-──────────────────
-  5% | 10% | 25% | 50% | 100% of the original laundering training examples
-
-Seeds: 3 independent runs per (condition, classifier, fraction) combination
+Seeds: 3 independent runs per (condition, fraction) combination
 Metric: AUC-ROC + F1 (threshold tuned on validation set)
 
 Usage
 ─────
     # from igraph_version/ directory:
-    python experiments/low_data_regime.py
+    python experiments/sparse_label_regime.py
 
     # with options:
-    python experiments/low_data_regime.py \\
+    python experiments/sparse_label_regime.py \\
         --csv data/IBM/LI-Small_Trans.csv \\
         --n-gen 50 \\
         --fractions 0.05 0.1 0.25 0.5 1.0 \\
         --seeds 3 \\
-        --classifiers gin graphtransformer graphsage fraudgt \\
+        --classifier gin \\
         --out experiments/results
 
 Outputs
 ───────
-    experiments/results/low_data_results.csv     — full table (classifier × condition × fraction)
-    experiments/results/low_data_curves.png      — recovery curve grid (2 rows × n_classifiers cols)
+    experiments/results/sparse_label_results.csv
+    experiments/results/sparse_label_curves.png
 """
 
 import argparse
@@ -76,19 +73,19 @@ DEFAULT_CSV      = str(ROOT_DIR.parent / "data" / "IBM" / "LI-Small_Trans.csv")
 DIFF_CKPT        = ROOT_DIR / "checkpoints" / "LI-Small" / "diffusion" / "model.pt"
 SIMCLR_CKPT_DIR  = ROOT_DIR / "checkpoints" / "simclr_ibm"
 
-IN_CHANNELS   = 18     # laundering flag col excluded from classifier input
-HIDDEN        = 64
-NUM_LAYERS    = 3
-DROPOUT       = 0.3
-LR            = 1e-3
-WEIGHT_DECAY  = 1e-4
-EPOCHS        = 80
-BATCH_SIZE    = 32
+IN_CHANNELS  = 18
+HIDDEN       = 64
+NUM_LAYERS   = 3
+DROPOUT      = 0.3
+LR           = 1e-3
+WEIGHT_DECAY = 1e-4
+EPOCHS       = 80
+BATCH_SIZE   = 32
 
-DEFAULT_FRACTIONS   = [0.05, 0.10, 0.25, 0.50, 1.0]
-DEFAULT_N_GEN       = 50
-DEFAULT_SEEDS       = 3
-DEFAULT_CLASSIFIERS = ["gin", "graphtransformer", "graphsage", "fraudgt"]
+DEFAULT_FRACTIONS  = [0.05, 0.10, 0.25, 0.50, 1.0]
+DEFAULT_N_GEN      = 50
+DEFAULT_SEEDS      = 3
+DEFAULT_CLASSIFIER = "gin"
 
 
 # ── PyG imports ───────────────────────────────────────────────────────────────
@@ -103,7 +100,7 @@ from sklearn.metrics import roc_auc_score, f1_score
 from sklearn.model_selection import StratifiedShuffleSplit
 
 
-# ── Classifier models ─────────────────────────────────────────────────────────
+# ── Classifier models (same as low_data_regime) ───────────────────────────────
 
 class _GIN(nn.Module):
     def __init__(self):
@@ -174,7 +171,6 @@ class _GraphTransformer(nn.Module):
 
 
 class _FraudGT(nn.Module):
-    """Graph Transformer for fraud detection: degree PE, residuals, LayerNorm."""
     _HEADS   = 4
     _MAX_DEG = 63
 
@@ -219,7 +215,7 @@ CLASSIFIERS: dict[str, type] = {
 }
 
 
-# ── Training / evaluation helpers ─────────────────────────────────────────────
+# ── Training / evaluation helpers (identical to low_data_regime) ───────────────
 
 def _train_epoch(model, loader, opt, device, pos_weight):
     model.train()
@@ -255,7 +251,6 @@ def _best_f1(labels, probs):
 
 
 def train_and_eval(train_data, val_data, test_data, device, seed=0, model_cls=None):
-    """Train one graph classifier and return test AUC and F1."""
     if model_cls is None:
         model_cls = _GIN
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
@@ -292,14 +287,9 @@ def train_and_eval(train_data, val_data, test_data, device, seed=0, model_cls=No
     return auc, f1_te
 
 
-# ── Data loading ───────────────────────────────────────────────────────────────
+# ── Data loading (identical to low_data_regime) ───────────────────────────────
 
 def load_pyg_graphs(csv_path: Path, device):
-    """
-    Load IBM graphs from cache or build from CSV.
-    Returns (pyg_list, networks_list) where networks_list is used for
-    FraudGT / generation — may be None for cached PyG-only loading.
-    """
     from util import preprocess_df, extract_transaction_ego_networks
     from augmentation import build_igraph_from_transactions
     from diffusion.diff_util import network_to_dense as ntd
@@ -313,7 +303,7 @@ def load_pyg_graphs(csv_path: Path, device):
         for net in networks:
             net["graph"] = build_igraph_from_transactions(net["transactions"])
     else:
-        print(f"  Extracting networks from {csv_path.name} …")
+        print(f"  Extracting networks from {csv_path.name} ...")
         df = preprocess_df(str(csv_path))
         networks = extract_transaction_ego_networks(
             df, max_depth=2, max_nodes=50, n_pos=2000, neg_pos_ratio=10,
@@ -323,7 +313,7 @@ def load_pyg_graphs(csv_path: Path, device):
         to_cache = [{k: v for k, v in n.items() if k != "graph"} for n in networks]
         with open(cache_path, "wb") as f:
             pickle.dump(to_cache, f)
-        print(f"  Saved cache → {cache_path.name}")
+        print(f"  Saved cache -> {cache_path.name}")
 
     pyg_list       = []
     networks_valid = []
@@ -364,7 +354,6 @@ def load_pyg_graphs(csv_path: Path, device):
 
 
 def temporal_split(pyg_list, test_frac=0.20, val_frac=0.10):
-    """Temporal train/val/test split, with stratified fallback."""
     ts = np.array([getattr(d, "timestamp_val", -1.0) for d in pyg_list])
     labels = np.array([d.y.item() for d in pyg_list])
     n = len(pyg_list)
@@ -381,34 +370,41 @@ def temporal_split(pyg_list, test_frac=0.20, val_frac=0.10):
         idx_sub_tr, idx_sub_val = next(sss2.split(np.arange(len(idx_tv)), labels[idx_tv]))
         idx_tr, idx_val = idx_tv[idx_sub_tr], idx_tv[idx_sub_val]
 
-    tr  = [pyg_list[i] for i in idx_tr]
-    val = [pyg_list[i] for i in idx_val]
-    te  = [pyg_list[i] for i in idx_te]
-    return tr, val, te
+    return ([pyg_list[i] for i in idx_tr],
+            [pyg_list[i] for i in idx_val],
+            [pyg_list[i] for i in idx_te])
 
 
-def subsample_laundering(train_data: list, frac: float, seed: int = 42) -> list:
+# ── Sparse-label subsampling ──────────────────────────────────────────────────
+
+def reveal_labels(train_data: list, frac: float, seed: int = 42) -> list:
     """
-    Subsample the training set to `frac` of its laundering examples.
-    Clean graphs are kept in full to preserve the realistic class ratio.
+    Randomly reveal only `frac` of all training graph labels (both classes).
+    The rest are treated as unlabeled and excluded from training.
+    Stratified so both classes are represented proportionally.
     """
     if frac >= 1.0:
         return train_data
-    laund = [d for d in train_data if d.y.item() == 1]
-    clean = [d for d in train_data if d.y.item() == 0]
-    n_keep = max(2, int(len(laund) * frac))
+    labels = np.array([d.y.item() for d in train_data])
+    n_keep = max(2, int(len(train_data) * frac))
+    # stratified sample to preserve class ratio in the revealed set
     rng = np.random.default_rng(seed)
-    kept_laund = [laund[i] for i in rng.choice(len(laund), n_keep, replace=False)]
-    return kept_laund + clean
+    laund_idx = np.where(labels == 1)[0]
+    clean_idx = np.where(labels == 0)[0]
+    n_laund_keep = max(1, round(n_keep * len(laund_idx) / len(train_data)))
+    n_clean_keep = max(1, n_keep - n_laund_keep)
+    n_laund_keep = min(n_laund_keep, len(laund_idx))
+    n_clean_keep = min(n_clean_keep, len(clean_idx))
+    kept = np.concatenate([
+        rng.choice(laund_idx, n_laund_keep, replace=False),
+        rng.choice(clean_idx, n_clean_keep, replace=False),
+    ])
+    return [train_data[i] for i in sorted(kept)]
 
 
-# ── Augmentation helpers ───────────────────────────────────────────────────────
+# ── Augmentation helpers (identical to low_data_regime) ───────────────────────
 
 def load_generation_bundle(train_nets: list, device):
-    """
-    Load SimCLR encoder + probe + diffusion model for guided generation.
-    Returns (encoder, probe, diff_model, diffusion, x_mean, x_std, H_train) or None.
-    """
     if not DIFF_CKPT.exists() and not SIMCLR_CKPT_DIR.exists():
         return None
     try:
@@ -430,7 +426,6 @@ def load_generation_bundle(train_nets: list, device):
 
 
 def generate_guided_graphs(train_nets: list, bundle, n_gen: int, device) -> list[Data]:
-    """Generate n_gen laundering graphs using the full guided reverse diffusion."""
     from generation import run_guided_generation
     encoder, probe, diff_model, diffusion, x_mean, x_std, H_train = bundle
 
@@ -455,13 +450,11 @@ def generate_guided_graphs(train_nets: list, bundle, n_gen: int, device) -> list
         x = x[:, :IN_CHANNELS]
         result.append(Data(x=x, edge_index=ei,
                            y=torch.tensor([1], dtype=torch.long),
-                           timestamp_val=-1.0,
-                           net_idx=-1))
+                           timestamp_val=-1.0, net_idx=-1))
     return result
 
 
 def generate_graphsmote(train_data: list, n_gen: int) -> list[Data]:
-    """Generate n_gen GraphSMOTE synthetic laundering graphs."""
     sys.path.insert(0, str(_HERE))
     from graphsmote_augmentation import GraphSMOTEAugmenter
     laund = [d for d in train_data if d.y.item() == 1]
@@ -476,7 +469,6 @@ def generate_graphsmote(train_data: list, n_gen: int) -> list[Data]:
 
 
 def generate_gan(train_data: list, n_gen: int, device) -> list[Data]:
-    """Generate n_gen synthetic laundering graphs using a WGAN-GP in feature space."""
     sys.path.insert(0, str(_HERE))
     from gan_augmentation import GraphGANAugmenter
     laund = [d for d in train_data if d.y.item() == 1]
@@ -491,7 +483,6 @@ def generate_gan(train_data: list, n_gen: int, device) -> list[Data]:
 
 
 def generate_diga(train_data: list, n_gen: int, device) -> list[Data]:
-    """Generate n_gen laundering graphs using DiGa (unconditional DDPM, feature-level)."""
     sys.path.insert(0, str(_HERE))
     from diga_augmentation import DiGaAugmenter
     laund = [d for d in train_data if d.y.item() == 1]
@@ -509,12 +500,11 @@ def generate_diga(train_data: list, n_gen: int, device) -> list[Data]:
 
 def run_experiment(csv_path: Path, fractions: list[float], n_gen: int,
                    n_seeds: int, out_dir: Path, device: torch.device,
-                   classifier_names: list[str] | None = None):
+                   classifier_name: str = "gin"):
 
-    if classifier_names is None:
-        classifier_names = DEFAULT_CLASSIFIERS
+    model_cls = CLASSIFIERS[classifier_name]
 
-    print(f"\nLoading data from {csv_path.name} …")
+    print(f"\nLoading data from {csv_path.name} ...")
     pyg_list, networks_valid = load_pyg_graphs(csv_path, device)
 
     all_labels = np.array([d.y.item() for d in pyg_list])
@@ -527,12 +517,12 @@ def run_experiment(csv_path: Path, fractions: list[float], n_gen: int,
 
     train_full_nets = [networks_valid[d.net_idx] for d in train_full]
 
-    print("\nLoading guided generation bundle (encoder + probe + diffusion) …")
+    print("\nLoading guided generation bundle ...")
     gen_bundle = load_generation_bundle(train_full_nets, device)
     if gen_bundle is not None:
         print("  Guided generation bundle ready.")
     else:
-        print("  Could not load generation bundle — 'diffusion' condition will be skipped.")
+        print("  Could not load generation bundle -- 'diffusion' condition will be skipped.")
 
     CONDITIONS = ["baseline", "graphsmote", "gan", "diga"]
     if gen_bundle is not None:
@@ -542,73 +532,63 @@ def run_experiment(csv_path: Path, fractions: list[float], n_gen: int,
 
     for frac in fractions:
         for condition in CONDITIONS:
-            # Build augmented training sets once per (frac, condition) and reuse
-            # across classifiers to avoid redundant generation.
-            aug_sets: dict[int, tuple] = {}
+            aucs, f1s = [], []
             for seed in range(n_seeds):
-                train_sub = subsample_laundering(train_full, frac, seed=seed)
-                n_laund_sub = sum(d.y.item() == 1 for d in train_sub)
+                labeled = reveal_labels(train_full, frac, seed=seed)
+                n_pos = sum(d.y.item() == 1 for d in labeled)
+                n_total = len(labeled)
 
                 if condition == "baseline":
-                    train_aug = train_sub
+                    train_aug = labeled
                 elif condition == "diffusion":
-                    train_sub_nets = [networks_valid[d.net_idx] for d in train_sub]
-                    gen = generate_guided_graphs(train_sub_nets, gen_bundle, n_gen, device)
-                    train_aug = train_sub + gen
+                    labeled_nets = [networks_valid[d.net_idx] for d in labeled
+                                    if d.net_idx >= 0]
+                    gen = generate_guided_graphs(labeled_nets, gen_bundle, n_gen, device)
+                    train_aug = labeled + gen
                 elif condition == "graphsmote":
-                    gen = generate_graphsmote(train_sub, n_gen)
-                    train_aug = train_sub + gen
+                    gen = generate_graphsmote(labeled, n_gen)
+                    train_aug = labeled + gen
                 elif condition == "gan":
-                    gen = generate_gan(train_sub, n_gen, device)
-                    train_aug = train_sub + gen
+                    gen = generate_gan(labeled, n_gen, device)
+                    train_aug = labeled + gen
                 elif condition == "diga":
-                    gen = generate_diga(train_sub, n_gen, device)
-                    train_aug = train_sub + gen
+                    gen = generate_diga(labeled, n_gen, device)
+                    train_aug = labeled + gen
                 else:
-                    train_aug = train_sub
+                    train_aug = labeled
 
-                aug_sets[seed] = (n_laund_sub, train_aug)
+                n_pos_aug = sum(d.y.item() == 1 for d in train_aug)
+                if n_pos_aug < 2:
+                    print(f"  [SKIP] frac={frac:.0%} cond={condition} seed={seed}: "
+                          f"only {n_pos_aug} positive(s) after augmentation")
+                    continue
 
-            for clf_name in classifier_names:
-                model_cls = CLASSIFIERS[clf_name]
-                aucs, f1s = [], []
+                auc, f1 = train_and_eval(
+                    train_aug, val_data, test_data, device,
+                    seed=seed, model_cls=model_cls,
+                )
+                aucs.append(auc)
+                f1s.append(f1)
 
-                for seed in range(n_seeds):
-                    n_laund_sub, train_aug = aug_sets[seed]
+                print(f"  frac={frac:.0%}  cond={condition:<12}  seed={seed}  "
+                      f"labeled={n_total} (pos={n_pos})  "
+                      f"AUC={auc:.4f}  F1={f1:.4f}")
 
-                    n_pos = sum(d.y.item() == 1 for d in train_aug)
-                    if n_pos < 2:
-                        print(f"  [SKIP] frac={frac:.0%} cond={condition} "
-                              f"clf={clf_name} seed={seed}: only {n_pos} positive(s)")
-                        continue
+            if aucs:
+                records.append({
+                    "fraction":    frac,
+                    "condition":   condition,
+                    "auc_mean":    float(np.mean(aucs)),
+                    "auc_std":     float(np.std(aucs)),
+                    "f1_mean":     float(np.mean(f1s)),
+                    "f1_std":      float(np.std(f1s)),
+                    "n_seeds_run": len(aucs),
+                })
 
-                    auc, f1 = train_and_eval(
-                        train_aug, val_data, test_data, device,
-                        seed=seed, model_cls=model_cls,
-                    )
-                    aucs.append(auc); f1s.append(f1)
-
-                    print(f"  frac={frac:.0%}  cond={condition:<12}  "
-                          f"clf={clf_name:<16}  seed={seed}  "
-                          f"laund_train={n_laund_sub}  "
-                          f"AUC={auc:.4f}  F1={f1:.4f}")
-
-                if aucs:
-                    records.append({
-                        "classifier":  clf_name,
-                        "fraction":    frac,
-                        "condition":   condition,
-                        "auc_mean":    float(np.mean(aucs)),
-                        "auc_std":     float(np.std(aucs)),
-                        "f1_mean":     float(np.mean(f1s)),
-                        "f1_std":      float(np.std(f1s)),
-                        "n_seeds_run": len(aucs),
-                    })
-
-    return records, CONDITIONS, classifier_names
+    return records, CONDITIONS
 
 
-# ── CSV + print table + plot ──────────────────────────────────────────────────
+# ── Output helpers ────────────────────────────────────────────────────────────
 
 def save_csv(records: list[dict], out_path: Path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -619,48 +599,17 @@ def save_csv(records: list[dict], out_path: Path):
         writer = csv.DictWriter(f, fieldnames=list(records[0].keys()))
         writer.writeheader()
         writer.writerows(records)
-    print(f"\nResults saved → {out_path}")
+    print(f"\nResults saved -> {out_path}")
 
 
-def print_table(records: list[dict], conditions: list[str], classifiers: list[str]):
-    fracs = sorted(set(r["fraction"] for r in records))
-    col_w = 14
-
-    for clf in classifiers:
-        clf_recs = [r for r in records if r["classifier"] == clf]
-        if not clf_recs:
-            continue
-        header = f"{'Fraction':<10}" + "".join(
-            f"  {c+' AUC':>{col_w}}  {c+' F1':>{col_w}}" for c in conditions
-        )
-        sep = "─" * len(header)
-        print(f"\n{sep}")
-        print(f"CLASSIFIER: {clf.upper()}  —  LOW-DATA REGIME  (mean ± std across seeds)")
-        print(sep)
-        print(header)
-        print(sep)
-        for frac in fracs:
-            row = f"{frac:<10.0%}"
-            for cond in conditions:
-                m = [r for r in clf_recs
-                     if r["fraction"] == frac and r["condition"] == cond]
-                if m:
-                    row += f"  {m[0]['auc_mean']:.3f}±{m[0]['auc_std']:.3f}"
-                    row += f"  {m[0]['f1_mean']:.3f}±{m[0]['f1_std']:.3f}"
-                else:
-                    row += f"  {'N/A':>{col_w}}  {'N/A':>{col_w}}"
-            print(row)
-        print(sep)
-
-
-def plot_curves(records: list[dict], conditions: list[str],
-                classifiers: list[str], out_path: Path):
+def plot_curves(records: list[dict], conditions: list[str], out_path: Path,
+                classifier_name: str = "gin"):
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("  [SKIP] matplotlib not available — skipping plot")
+        print("  [SKIP] matplotlib not available")
         return
 
     fracs = sorted(set(r["fraction"] for r in records))
@@ -679,42 +628,42 @@ def plot_curves(records: list[dict], conditions: list[str],
         "diga":       "X",
     }
 
-    n_cls = len(classifiers)
-    fig, axes = plt.subplots(2, n_cls, figsize=(4.5 * n_cls, 8), squeeze=False)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
-    for col, clf in enumerate(classifiers):
-        clf_recs = [r for r in records if r["classifier"] == clf]
-        for row, (metric, ylabel) in enumerate([("auc", "AUC-ROC"), ("f1", "F1 Score")]):
-            ax = axes[row][col]
-            for cond in conditions:
-                xs, ys, errs = [], [], []
-                for frac in fracs:
-                    m = [r for r in clf_recs
-                         if r["fraction"] == frac and r["condition"] == cond]
-                    if m:
-                        xs.append(frac * 100)
-                        ys.append(m[0][f"{metric}_mean"])
-                        errs.append(m[0][f"{metric}_std"])
-                if xs:
-                    ax.errorbar(xs, ys, yerr=errs,
-                                label=cond,
-                                color=colours.get(cond, "grey"),
-                                marker=markers.get(cond, "o"),
-                                linewidth=1.8, markersize=6, capsize=3)
-            ax.set_title(f"{clf} — {ylabel}", fontsize=10)
-            ax.set_xlabel("Training fraction (%)", fontsize=9)
-            ax.set_ylabel(ylabel, fontsize=9)
-            ax.set_xscale("log")
-            ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.0f}%"))
-            ax.legend(fontsize=8)
-            ax.grid(True, which="both", linestyle="--", alpha=0.4)
+    for ax, metric, ylabel in [
+        (axes[0], "auc", "AUC-ROC"),
+        (axes[1], "f1",  "F1 Score"),
+    ]:
+        for cond in conditions:
+            xs, ys, errs = [], [], []
+            for frac in fracs:
+                m = [r for r in records if r["fraction"] == frac and r["condition"] == cond]
+                if m:
+                    xs.append(frac * 100)
+                    ys.append(m[0][f"{metric}_mean"])
+                    errs.append(m[0][f"{metric}_std"])
+            if xs:
+                ax.errorbar(xs, ys, yerr=errs, label=cond,
+                            color=colours.get(cond, "grey"),
+                            marker=markers.get(cond, "o"),
+                            linewidth=1.8, markersize=6, capsize=3)
 
-    fig.suptitle("Low-Data Regime: Augmentation Recovery by Classifier\n"
-                 "LI-Small AML Dataset", fontsize=12)
+        ax.set_xlabel("Labeled fraction (%)", fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_title(f"{ylabel} vs. label fraction", fontsize=11)
+        ax.set_xlim(0, 105)
+        ax.set_xticks([5, 10, 25, 50, 100])
+        ax.set_xticklabels(["5%", "10%", "25%", "50%", "100%"])
+        ax.legend(fontsize=9)
+        ax.grid(True, linestyle="--", alpha=0.4)
+
+    fig.suptitle(f"Sparse-Label Regime: Augmentation Recovery Curves\n"
+                 f"LI-Small AML Dataset  ({classifier_name.upper()})",
+                 fontsize=12, y=1.02)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
-    print(f"  Plot saved → {out_path}")
+    print(f"Plot saved -> {out_path}")
     plt.close(fig)
 
 
@@ -723,50 +672,45 @@ def plot_curves(records: list[dict], conditions: list[str],
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--csv", type=str, default=DEFAULT_CSV,
-                        help="Path to IBM AML CSV (default: LI-Small_Trans.csv)")
+    parser.add_argument("--csv", type=str, default=DEFAULT_CSV)
     parser.add_argument("--n-gen", type=int, default=DEFAULT_N_GEN,
-                        help=f"Generated graphs added per condition (default {DEFAULT_N_GEN})")
+                        help=f"Generated graphs per condition (default {DEFAULT_N_GEN})")
     parser.add_argument("--fractions", nargs="+", type=float, default=DEFAULT_FRACTIONS,
-                        help="Training laundering fractions to evaluate")
-    parser.add_argument("--seeds", type=int, default=DEFAULT_SEEDS,
-                        help=f"Seeds per (condition, classifier, fraction) combo "
-                             f"(default {DEFAULT_SEEDS})")
-    parser.add_argument("--classifiers", nargs="+", type=str,
-                        default=DEFAULT_CLASSIFIERS,
+                        help="Label fractions to evaluate")
+    parser.add_argument("--seeds", type=int, default=DEFAULT_SEEDS)
+    parser.add_argument("--classifier", type=str, default=DEFAULT_CLASSIFIER,
                         choices=list(CLASSIFIERS.keys()),
-                        help="Classifiers to evaluate "
-                             f"(default: {' '.join(DEFAULT_CLASSIFIERS)})")
-    parser.add_argument("--out", type=str, default=str(_HERE / "results"),
-                        help="Output directory")
+                        help=f"Downstream classifier (default: {DEFAULT_CLASSIFIER})")
+    parser.add_argument("--out", type=str, default=str(_HERE / "results"))
     args = parser.parse_args()
 
     device   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir  = Path(args.out)
     csv_path = Path(args.csv)
 
-    print(f"Device      : {device}")
-    print(f"CSV         : {csv_path}")
-    print(f"N_gen       : {args.n_gen}")
-    print(f"Fractions   : {args.fractions}")
-    print(f"Seeds       : {args.seeds}")
-    print(f"Classifiers : {args.classifiers}")
-    print(f"Output dir  : {out_dir}\n")
+    print(f"Device     : {device}")
+    print(f"CSV        : {csv_path}")
+    print(f"N_gen      : {args.n_gen}")
+    print(f"Fractions  : {args.fractions}")
+    print(f"Seeds      : {args.seeds}")
+    print(f"Classifier : {args.classifier}")
+    print(f"Output dir : {out_dir}\n")
 
     if not csv_path.exists():
         raise FileNotFoundError(
             f"CSV not found: {csv_path}\n"
-            "Set --csv to the path of LI-Small_Trans.csv (or another IBM AML CSV)."
+            "Set --csv to the path of LI-Small_Trans.csv."
         )
 
-    records, conditions, classifiers = run_experiment(
-        csv_path, args.fractions, args.n_gen, args.seeds, out_dir, device,
-        classifier_names=args.classifiers,
+    records, conditions = run_experiment(
+        csv_path, args.fractions, args.n_gen, args.seeds,
+        out_dir, device, classifier_name=args.classifier,
     )
 
-    print_table(records, conditions, classifiers)
-    save_csv(records, out_dir / "low_data_results.csv")
-    plot_curves(records, conditions, classifiers, out_dir / "low_data_curves.png")
+    save_csv(records, out_dir / "sparse_label_results.csv")
+    plot_curves(records, conditions,
+                out_dir / "sparse_label_curves.png",
+                classifier_name=args.classifier)
     print("\nDone.")
 
 

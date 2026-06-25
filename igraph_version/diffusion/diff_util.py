@@ -189,8 +189,15 @@ def network_to_dense(net, skip_patterns=False, skip_topology=False):
 
     # clamp to [0,1]: IBM data can have parallel edges (multigraph) so
     # get_adjacency() may return counts > 1 — we want a binary adjacency.
-    adj = torch.from_numpy(np.array(graph.get_adjacency().data, dtype=np.float32)).clamp(0, 1)
-    adj.fill_diagonal_(0.0)   # remove self-loops
+    # Reshape explicitly to (n, n) so 0-node graphs yield shape (0, 0)
+    # instead of a 1D tensor, which would crash fill_diagonal_.
+    adj = torch.from_numpy(
+        np.array(graph.get_adjacency().data, dtype=np.float32).reshape(n, n)
+    ).clamp(0, 1)
+    if n > 1:
+        adj.fill_diagonal_(0.0)   # remove self-loops
+    elif n == 1:
+        adj[0, 0] = 0.0
 
     return x, adj
 

@@ -331,11 +331,13 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run full ablation study for SimCLR + diffusion pipeline."
     )
-    parser.add_argument("--dataset", choices=["elliptic", "ibm", "both"],
+    parser.add_argument("--dataset", choices=["elliptic", "ibm", "both", "ethereum"],
                         default="elliptic",
                         help="Dataset (default: elliptic). "
                              "IBM uses ibm_simclr_train_ablation.py for encoder training; "
-                             "Elliptic uses elliptic_simclr_train_ablation.py.")
+                             "Elliptic uses elliptic_simclr_train_ablation.py. "
+                             "Ethereum uses elliptic_simclr_train_ablation.py with "
+                             "--dataset ethereum (same 5-dim structural features).")
     parser.add_argument("--n-gen",    type=int,   default=40,
                         help="Generated graphs per condition (default 40)")
     parser.add_argument("--low-data", type=float, default=0.01,
@@ -372,14 +374,21 @@ def main():
 
     # ── Select dataset-specific config ───────────────────────────────────────
     if args.dataset == "ibm":
-        train_script      = IBM_TRAIN_SCRIPT
+        train_script       = IBM_TRAIN_SCRIPT
         encoder_conditions = IBM_ENCODER_CONDITIONS
-        ckpt_root         = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
+        ckpt_root          = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
+    elif args.dataset == "ethereum":
+        # Ethereum uses the same 5-dim structural features as Elliptic, so the
+        # Elliptic SimCLR ablation script runs fine with --dataset ethereum passed
+        # through to evaluate_classifiers.py.
+        train_script       = ELLIPTIC_TRAIN_SCRIPT
+        encoder_conditions = ELLIPTIC_ENCODER_CONDITIONS
+        ckpt_root          = BASE_DIR / "checkpoints" / "simclr_ethereum_ablation"
     else:
         # "elliptic" or "both" — run encoder training on Elliptic
-        train_script      = ELLIPTIC_TRAIN_SCRIPT
+        train_script       = ELLIPTIC_TRAIN_SCRIPT
         encoder_conditions = ELLIPTIC_ENCODER_CONDITIONS
-        ckpt_root         = BASE_DIR / "checkpoints" / "simclr_elliptic_ablation"
+        ckpt_root          = BASE_DIR / "checkpoints" / "simclr_elliptic_ablation"
 
     ckpt_root.mkdir(parents=True, exist_ok=True)
 
@@ -387,7 +396,7 @@ def main():
     failures    = []
 
     # ── A. Encoder ablations ─────────────────────────────────────────────────
-    if not args.gen_only:
+    if not args.gen_only and not args.pattern_only:
         print("\n" + "="*60)
         print(f"PART A: SimCLR Encoder Ablations  [{args.dataset}]")
         print("="*60)
@@ -447,21 +456,31 @@ def main():
             all_results[label] = _read_csv_results(label, args.dataset)
 
     # ── B. Generation ablations ──────────────────────────────────────────────
-    if not args.encoder_only:
+    if not args.encoder_only and not args.pattern_only:
         print("\n" + "="*60)
         print("PART B: Generation Ablations  (default encoder)")
         print("="*60)
 
         # For IBM, Part B uses the "full" encoder trained in Part A as the base encoder.
         # For Elliptic, the default simclr_elliptic checkpoint is used (no override needed).
+        # For Ethereum, the ablation encoder from Part A is used similarly.
         _gen_encoder_args: list[str] = []
         if args.dataset in ("ibm", "both"):
-            _ibm_full_ckpt = ckpt_root / "full"
+            _ibm_ckpt_root = BASE_DIR / "checkpoints" / "simclr_ibm_ablation"
+            _ibm_full_ckpt = _ibm_ckpt_root / "full"
             if _ibm_full_ckpt.exists():
                 _gen_encoder_args = ["--encoder-dir", str(_ibm_full_ckpt)]
             else:
                 print(f"  [warn] IBM 'full' encoder not found at {_ibm_full_ckpt}.")
                 print("         Part A must complete before Part B for IBM.")
+        elif args.dataset == "ethereum":
+            _eth_ckpt_root = BASE_DIR / "checkpoints" / "simclr_ethereum_ablation"
+            _eth_full_ckpt = _eth_ckpt_root / "full"
+            if _eth_full_ckpt.exists():
+                _gen_encoder_args = ["--encoder-dir", str(_eth_full_ckpt)]
+            else:
+                print(f"  [warn] Ethereum 'full' encoder not found at {_eth_full_ckpt}.")
+                print("         Part A must complete before Part B for Ethereum.")
 
         for condition, description, extra_eval_args in GENERATION_CONDITIONS:
             if args.conditions and condition not in args.conditions:

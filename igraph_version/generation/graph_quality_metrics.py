@@ -47,21 +47,27 @@ _FEAT_NAMES = ["degree", "betweenness", "clustering", "pagerank", "assortativity
 
 def _embed_gen_data(gen_data, encoder, device, batch_size=64):
     """
-    Embed generated PyG graphs (5-dim node features) through the SimCLR
-    encoder (which expects 6-dim input).
+    Embed generated PyG graphs through the SimCLR encoder.
 
-    Generated graphs have laundering label 1, so we prepend a column of 1.0
-    to match the 6-dim convention used during SimCLR training.
+    Generated graphs may have been padded to IN_CHANNELS (IBM feature count)
+    by gen_output_to_pyg.  encoder.in_dim is used to strip that padding and,
+    for legacy 6-D Elliptic checkpoints, to prepend the graph label column.
 
     Returns
     -------
     H : Tensor [N_gen, 128]  L2-normalised embeddings
     """
+    enc_dim     = encoder.in_dim
+    needs_label = (enc_dim == 6)
+    n_real      = enc_dim - 1 if needs_label else enc_dim
+
     ext_graphs = []
     for g in gen_data:
-        # Generated graphs already have col 0 (laundering flag) excluded after
-        # the label-leakage fix — pass features directly without prepending.
-        ext_graphs.append(Data(x=g.x.clone(), edge_index=g.edge_index.clone()))
+        x = g.x[:, :n_real]            # strip padding if present
+        if needs_label:
+            lc = torch.full((x.shape[0], 1), float(g.y.item()))
+            x  = torch.cat([lc, x], dim=1)
+        ext_graphs.append(Data(x=x, edge_index=g.edge_index.clone()))
 
     H_list = []
     with torch.no_grad():
@@ -319,9 +325,16 @@ def compute_embedding_separation(data_list, labels, encoder, device):
     if len(np.unique(labels_arr)) < 2 or len(data_list) < 10:
         return {"silhouette": float("nan"), "linear_probe_auc": float("nan")}
 
-    # Encode all graphs
-    ext_graphs = [Data(x=g.x.clone(), edge_index=g.edge_index.clone())
-                  for g in data_list]
+    # Encode all graphs — handle legacy 6-D encoder (prepend label)
+    enc_dim      = encoder.in_dim
+    needs_label  = (enc_dim == 6)
+    ext_graphs = []
+    for g in data_list:
+        x = g.x.clone()
+        if needs_label:
+            lc = torch.full((x.shape[0], 1), float(g.y.item()))
+            x  = torch.cat([lc, x], dim=1)
+        ext_graphs.append(Data(x=x, edge_index=g.edge_index.clone()))
     H_list = []
     with torch.no_grad():
         for i in range(0, len(ext_graphs), 64):

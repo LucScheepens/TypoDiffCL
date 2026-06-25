@@ -137,7 +137,8 @@ def _compute_features(G: nx.Graph):
 # ─────────────────────────────────────────────────────────────────────────────
 # PyG conversion
 # ─────────────────────────────────────────────────────────────────────────────
-def _to_pyg(G_sub: nx.Graph, feat: np.ndarray, label: int, timestep: int = -1) -> Data:
+def _to_pyg(G_sub: nx.Graph, feat: np.ndarray, label: int,
+            timestep: int = -1, anchor_local_idx: int = 0) -> Data:
     nodes    = list(G_sub.nodes())
     node_idx = {v: i for i, v in enumerate(nodes)}
 
@@ -153,10 +154,12 @@ def _to_pyg(G_sub: nx.Graph, feat: np.ndarray, label: int, timestep: int = -1) -
         edge_index = torch.stack([idx, idx])    # self-loops for isolated nodes
 
     return Data(
-        x          = torch.tensor(feat, dtype=torch.float),
-        edge_index = edge_index,
-        y          = torch.tensor([label], dtype=torch.long),
-        timestep   = torch.tensor([timestep], dtype=torch.long),
+        x                = torch.tensor(feat, dtype=torch.float),
+        edge_index       = edge_index,
+        y                = torch.tensor([label], dtype=torch.long),
+        timestep         = torch.tensor([timestep], dtype=torch.long),
+        timestamp_val    = float(timestep),
+        anchor_local_idx = torch.tensor([anchor_local_idx], dtype=torch.long),
     )
 
 
@@ -278,9 +281,11 @@ def load_elliptic_pyg_graphs(
                     continue
                 seen_nodesets.add(key)
 
-            G_sub       = G.subgraph(ego_set).copy()
-            feat, _     = _compute_features(G_sub)
-            graphs.append(_to_pyg(G_sub, feat, label, timestep=ts))
+            G_sub            = G.subgraph(ego_set).copy()
+            feat, feat_nodes = _compute_features(G_sub)
+            anchor_local     = feat_nodes.index(anchor) if anchor in feat_nodes else 0
+            graphs.append(_to_pyg(G_sub, feat, label, timestep=ts,
+                                  anchor_local_idx=anchor_local))
 
     if verbose:
         n_ill = sum(d.y.item() == 1 for d in graphs)

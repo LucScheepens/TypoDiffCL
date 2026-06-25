@@ -29,7 +29,7 @@ import matplotlib.patches as mpatches
 import numpy as np
 
 BASE_DIR    = Path(__file__).resolve().parent
-RESULTS_DIR = BASE_DIR / "results"
+RESULTS_DIR = BASE_DIR / "results" / "ablation_full"
 PLOTS_DIR   = RESULTS_DIR / "plots"
 
 # ── condition ordering & labels ──────────────────────────────────────────────
@@ -82,6 +82,7 @@ DATASET_COLOURS = {
     "ibm":          ("#2563EB", "#93C5FD"),   # blue dark/light
     "elliptic":     ("#16A34A", "#86EFAC"),   # green dark/light
     "ibm_ld10":     ("#DC2626", "#FCA5A5"),   # red dark/light
+    "ibm_ld1":      ("#0D9488", "#99F6E4"),   # teal
     "ibm_ld20":     ("#9333EA", "#D8B4FE"),   # purple
     "elliptic_ld20":("#EA580C", "#FED7AA"),   # orange
 }
@@ -93,7 +94,7 @@ DEFAULT_COLOURS = ("#374151", "#9CA3AF")
 def _infer_condition(stem):
     s = stem.replace("classifier_comparison_", "")
     # More-specific prefixes must come before shorter ones (ibm_ld10 before ibm)
-    for ds in ("ibm_ld20", "ibm_ld10", "elliptic_ld20", "ibm", "elliptic"):
+    for ds in ("ibm_ld20", "ibm_ld10", "ibm_ld1", "elliptic_ld20", "ibm", "elliptic"):
         if s.startswith(ds + "_"):
             return ds, s[len(ds) + 1:]
         if s == ds:

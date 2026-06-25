@@ -1,13 +1,14 @@
 """
-Compute dataset statistics for the IBM AML benchmark table.
-Reads HI/LI × Small/Medium/Large files and prints #Accounts, #Trans,
-#Illicit, Illicit %, #Networks.
+Compute dataset statistics for the IBM AML benchmark table and the Elliptic
+Bitcoin dataset. Prints #Accounts/#Nodes, #Trans/#Edges, #Illicit, Illicit %,
+#Networks/#Timesteps.
 """
 
 import pandas as pd
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent / "data" / "IBM"
+ELLIPTIC_DIR = Path(__file__).parent / "data" / "elliptic_bitcoin_dataset"
 CONFIGS = ["HI", "LI"]
 SCALES  = ["Small", "Medium", "Large"]
 CHUNK   = 500_000  # rows per chunk for large transaction files
@@ -71,3 +72,35 @@ for config in CONFIGS:
 
 df = pd.DataFrame(rows)
 print("\n" + df.to_string(index=False))
+
+# ── Elliptic Bitcoin Dataset ──────────────────────────────────────────────────
+print("\nProcessing Elliptic...", flush=True)
+
+classes_path   = ELLIPTIC_DIR / "elliptic_txs_classes.csv"
+edgelist_path  = ELLIPTIC_DIR / "elliptic_txs_edgelist.csv"
+features_path  = ELLIPTIC_DIR / "elliptic_txs_features.csv"
+
+classes  = pd.read_csv(classes_path)
+n_nodes  = len(classes)
+n_edges  = sum(1 for _ in open(edgelist_path, "r", encoding="utf-8")) - 1  # minus header
+
+labeled   = classes[classes["class"] != "unknown"]
+n_illicit = int((labeled["class"] == "1").sum())
+n_licit   = int((labeled["class"] == "2").sum())
+illicit_pct = f"{n_illicit / (n_illicit + n_licit) * 100:.2f}%"
+
+# timestep is the second column (no header) of the features file
+features_head = pd.read_csv(features_path, header=None, usecols=[1])
+n_timesteps = features_head[1].nunique()
+
+elliptic_row = {
+    "Dataset":    "Elliptic Bitcoin",
+    "#Nodes":     n_nodes,
+    "#Edges":     n_edges,
+    "#Illicit":   n_illicit,
+    "#Licit":     n_licit,
+    "Illicit %":  illicit_pct,
+    "#Networks":  n_timesteps,
+}
+
+print("\n" + pd.DataFrame([elliptic_row]).to_string(index=False))
