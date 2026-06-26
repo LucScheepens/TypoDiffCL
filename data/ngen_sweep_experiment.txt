@@ -1,0 +1,1313 @@
+
+============================================================
+ n_gen=100  method=diffusion  ->  classifier_comparison_ethereum_ngen_100_diffusion.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum] Generating 100 augmentation graphs …
+Best Ethereum SimCLR checkpoint: best_model.pt  (loss=5.5758)
+Ethereum diffusion model loaded from C:\Users\lucsc\Thesis\grad\grad\igraph_version\checkpoints\diffusion_ethereum\model.pt  (max_nodes=100).
+MLP probe accuracy: 1.000
+  [validity] attempt 4: removed 1 disconnected node(s)
+  [validity] attempt 4 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] attempt 5: removed 14 disconnected node(s)
+  [validity] attempt 5 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 18: removed 2 disconnected node(s)
+  [validity] attempt 18 discarded: n_nodes 98 < 5th-pct (100), retrying...
+  [validity] attempt 28: removed 19 disconnected node(s)
+  [validity] attempt 28 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] 4/37 attempts discarded by structural checks (retried to reach 33)
+  [validity] attempt 3: removed 25 disconnected node(s)
+  [validity] attempt 3 discarded: n_nodes 75 < 5th-pct (100), retrying...
+  [validity] attempt 4: removed 1 disconnected node(s)
+  [validity] attempt 4 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] attempt 8: removed 14 disconnected node(s)
+  [validity] attempt 8 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 15: removed 19 disconnected node(s)
+  [validity] attempt 15 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 36: removed 7 disconnected node(s)
+  [validity] attempt 36 discarded: n_nodes 93 < 5th-pct (100), retrying...
+  [validity] 5/38 attempts discarded by structural checks (retried to reach 33)
+Generated 66 augmentation graphs (phishing=33, clean=33)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=204 (clean=163, laund=41)  running 3 seeds …
+  seed 0: AUC=0.981  F1=0.841
+  seed 1: AUC=0.983  F1=0.840
+  seed 2: AUC=0.986  F1=0.829
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.983±0.002  0.837±0.005  0.843±0.011  0.831±0.006
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.000
+    f1           +0.026
+    precision    +0.027
+    recall       +0.026
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_100_diffusion.csv
+
+============================================================
+ n_gen=100  method=gan  ->  classifier_comparison_ethereum_ngen_100_gan.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / gan] Generating 50 phishing + 50 clean graphs …
+Generated 100 augmentation graphs (phishing=50, clean=50)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=238 (clean=180, laund=58)  running 3 seeds …
+  seed 0: AUC=0.966  F1=0.793
+  seed 1: AUC=0.984  F1=0.800
+  seed 2: AUC=0.986  F1=0.846
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.979±0.009  0.813±0.023  0.843±0.021  0.785±0.026
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.005
+    f1           +0.003
+    precision    +0.027
+    recall       -0.020
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_100_gan.csv
+
+============================================================
+ n_gen=100  method=graphsmote  ->  classifier_comparison_ethereum_ngen_100_graphsmote.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / graphsmote] Generating 50 phishing + 50 clean graphs …
+Generated 100 augmentation graphs (phishing=50, clean=50)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=238 (clean=180, laund=58)  running 3 seeds …
+  seed 0: AUC=0.964  F1=0.755
+  seed 1: AUC=0.971  F1=0.772
+  seed 2: AUC=0.983  F1=0.783
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.973±0.008  0.770±0.011  0.793±0.061  0.754±0.038
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.011
+    f1           -0.040
+    precision    -0.023
+    recall       -0.051
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_100_graphsmote.csv
+
+============================================================
+ n_gen=100  method=diga  ->  classifier_comparison_ethereum_ngen_100_diga.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / diga] Generating 50 phishing + 50 clean graphs …
+Generated 100 augmentation graphs (phishing=50, clean=50)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=238 (clean=180, laund=58)  running 3 seeds …
+  seed 0: AUC=0.972  F1=0.790
+  seed 1: AUC=0.974  F1=0.789
+  seed 2: AUC=0.984  F1=0.801
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.977±0.005  0.794±0.005  0.843±0.018  0.750±0.013
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.007
+    f1           -0.017
+    precision    +0.027
+    recall       -0.055
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_100_diga.csv
+
+============================================================
+ n_gen=200  method=diffusion  ->  classifier_comparison_ethereum_ngen_200_diffusion.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum] Generating 200 augmentation graphs …
+Best Ethereum SimCLR checkpoint: best_model.pt  (loss=5.5758)
+Ethereum diffusion model loaded from C:\Users\lucsc\Thesis\grad\grad\igraph_version\checkpoints\diffusion_ethereum\model.pt  (max_nodes=100).
+MLP probe accuracy: 1.000
+  [validity] attempt 2: removed 14 disconnected node(s)
+  [validity] attempt 2 discarded: n_nodes 86 < 5th-pct (100), retrying...
+  [validity] attempt 7: removed 14 disconnected node(s)
+  [validity] attempt 7 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 34: removed 19 disconnected node(s)
+  [validity] attempt 34 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 60: removed 33 disconnected node(s)
+  [validity] attempt 60 discarded: density 0.029 > 2× target (0.013), retrying...
+  [validity] 4/62 attempts discarded by structural checks (retried to reach 58)
+  [validity] attempt 1: removed 14 disconnected node(s)
+  [validity] attempt 1 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 8: removed 35 disconnected node(s)
+  [validity] attempt 8 discarded: density 0.031 > 2× target (0.013), retrying...
+  [validity] attempt 40: removed 37 disconnected node(s)
+  [validity] attempt 40 discarded: density 0.033 > 2× target (0.013), retrying...
+  [validity] attempt 59: removed 14 disconnected node(s)
+  [validity] attempt 59 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 62: removed 1 disconnected node(s)
+  [validity] attempt 62 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] 5/63 attempts discarded by structural checks (retried to reach 58)
+Generated 116 augmentation graphs (phishing=58, clean=58)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=254 (clean=188, laund=66)  running 3 seeds …
+  seed 0: AUC=0.980  F1=0.822
+  seed 1: AUC=0.979  F1=0.809
+  seed 2: AUC=0.981  F1=0.831
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.980±0.001  0.820±0.009  0.850±0.016  0.793±0.011
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.003
+    f1           +0.010
+    precision    +0.034
+    recall       -0.012
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_200_diffusion.csv
+
+============================================================
+ n_gen=200  method=gan  ->  classifier_comparison_ethereum_ngen_200_gan.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / gan] Generating 100 phishing + 100 clean graphs …
+Generated 200 augmentation graphs (phishing=100, clean=100)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=338 (clean=230, laund=108)  running 3 seeds …
+  seed 0: AUC=0.968  F1=0.798
+  seed 1: AUC=0.977  F1=0.804
+  seed 2: AUC=0.984  F1=0.811
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.976±0.007  0.804±0.005  0.866±0.007  0.751±0.014
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.007
+    f1           -0.006
+    precision    +0.049
+    recall       -0.054
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_200_gan.csv
+
+============================================================
+ n_gen=200  method=graphsmote  ->  classifier_comparison_ethereum_ngen_200_graphsmote.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / graphsmote] Generating 100 phishing + 100 clean graphs …
+Generated 200 augmentation graphs (phishing=100, clean=100)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=338 (clean=230, laund=108)  running 3 seeds …
+  seed 0: AUC=0.973  F1=0.747
+  seed 1: AUC=0.972  F1=0.751
+  seed 2: AUC=0.978  F1=0.769
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.974±0.003  0.756±0.009  0.803±0.030  0.714±0.008
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.009
+    f1           -0.055
+    precision    -0.013
+    recall       -0.091
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_200_graphsmote.csv
+
+============================================================
+ n_gen=200  method=diga  ->  classifier_comparison_ethereum_ngen_200_diga.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / diga] Generating 100 phishing + 100 clean graphs …
+Generated 200 augmentation graphs (phishing=100, clean=100)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=338 (clean=230, laund=108)  running 3 seeds …
+  seed 0: AUC=0.972  F1=0.715
+  seed 1: AUC=0.975  F1=0.771
+  seed 2: AUC=0.976  F1=0.782
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.974±0.002  0.756±0.029  0.814±0.023  0.707±0.037
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.009
+    f1           -0.054
+    precision    -0.002
+    recall       -0.098
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_200_diga.csv
+
+============================================================
+ n_gen=400  method=diffusion  ->  classifier_comparison_ethereum_ngen_400_diffusion.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum] Generating 400 augmentation graphs …
+Best Ethereum SimCLR checkpoint: best_model.pt  (loss=5.5758)
+Ethereum diffusion model loaded from C:\Users\lucsc\Thesis\grad\grad\igraph_version\checkpoints\diffusion_ethereum\model.pt  (max_nodes=100).
+MLP probe accuracy: 1.000
+  [validity] attempt 5: removed 27 disconnected node(s)
+  [validity] attempt 5 discarded: n_nodes 73 < 5th-pct (100), retrying...
+  [validity] attempt 8: removed 14 disconnected node(s)
+  [validity] attempt 8 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 10: removed 19 disconnected node(s)
+  [validity] attempt 10 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 75: removed 14 disconnected node(s)
+  [validity] attempt 75 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 88: removed 35 disconnected node(s)
+  [validity] attempt 88 discarded: density 0.031 > 2× target (0.013), retrying...
+  [validity] attempt 98: removed 2 disconnected node(s)
+  [validity] attempt 98 discarded: n_nodes 98 < 5th-pct (100), retrying...
+  [validity] attempt 107: removed 24 disconnected node(s)
+  [validity] attempt 107 discarded: n_nodes 76 < 5th-pct (100), retrying...
+  [validity] attempt 113: removed 32 disconnected node(s)
+  [validity] attempt 113 discarded: density 0.028 > 2× target (0.013), retrying...
+  [validity] attempt 116: removed 18 disconnected node(s)
+  [validity] attempt 116 discarded: density 0.027 > 2× target (0.013), retrying...
+  [validity] 9/117 attempts discarded by structural checks (retried to reach 108)
+  [validity] attempt 2: removed 17 disconnected node(s)
+  [validity] attempt 2 discarded: n_nodes 83 < 5th-pct (100), retrying...
+  [validity] attempt 3: removed 14 disconnected node(s)
+  [validity] attempt 3 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 12: removed 19 disconnected node(s)
+  [validity] attempt 12 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 48: removed 11 disconnected node(s)
+  [validity] attempt 48 discarded: n_nodes 89 < 5th-pct (100), retrying...
+  [validity] attempt 59: removed 14 disconnected node(s)
+  [validity] attempt 59 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 87: removed 6 disconnected node(s)
+  [validity] attempt 87 discarded: n_nodes 94 < 5th-pct (100), retrying...
+  [validity] attempt 110: removed 34 disconnected node(s)
+  [validity] attempt 110 discarded: density 0.030 > 2× target (0.013), retrying...
+  [validity] attempt 111: removed 14 disconnected node(s)
+  [validity] attempt 111 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] 8/116 attempts discarded by structural checks (retried to reach 108)
+Generated 216 augmentation graphs (phishing=108, clean=108)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=354 (clean=238, laund=116)  running 3 seeds …
+  seed 0: AUC=0.973  F1=0.825
+  seed 1: AUC=0.967  F1=0.798
+  seed 2: AUC=0.981  F1=0.826
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.973±0.006  0.816±0.013  0.854±0.014  0.782±0.012
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.010
+    f1           +0.006
+    precision    +0.038
+    recall       -0.023
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_400_diffusion.csv
+
+============================================================
+ n_gen=400  method=gan  ->  classifier_comparison_ethereum_ngen_400_gan.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / gan] Generating 200 phishing + 200 clean graphs …
+Generated 400 augmentation graphs (phishing=200, clean=200)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=538 (clean=330, laund=208)  running 3 seeds …
+  seed 0: AUC=0.974  F1=0.802
+  seed 1: AUC=0.974  F1=0.789
+  seed 2: AUC=0.979  F1=0.781
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.976±0.003  0.791±0.009  0.816±0.030  0.768±0.026
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.008
+    f1           -0.020
+    precision    -0.000
+    recall       -0.037
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_400_gan.csv
+
+============================================================
+ n_gen=400  method=graphsmote  ->  classifier_comparison_ethereum_ngen_400_graphsmote.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / graphsmote] Generating 200 phishing + 200 clean graphs …
+Generated 400 augmentation graphs (phishing=200, clean=200)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=538 (clean=330, laund=208)  running 3 seeds …
+  seed 0: AUC=0.973  F1=0.776
+  seed 1: AUC=0.973  F1=0.770
+  seed 2: AUC=0.965  F1=0.782
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.970±0.003  0.776±0.005  0.829±0.005  0.730±0.006
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.013
+    f1           -0.034
+    precision    +0.013
+    recall       -0.075
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_400_graphsmote.csv
+
+============================================================
+ n_gen=400  method=diga  ->  classifier_comparison_ethereum_ngen_400_diga.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / diga] Generating 200 phishing + 200 clean graphs …
+Generated 400 augmentation graphs (phishing=200, clean=200)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=538 (clean=330, laund=208)  running 3 seeds …
+  seed 0: AUC=0.976  F1=0.763
+  seed 1: AUC=0.976  F1=0.771
+  seed 2: AUC=0.974  F1=0.792
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.975±0.001  0.775±0.012  0.809±0.040  0.747±0.027
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.008
+    f1           -0.035
+    precision    -0.007
+    recall       -0.058
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_400_diga.csv
+
+============================================================
+ n_gen=800  method=diffusion  ->  classifier_comparison_ethereum_ngen_800_diffusion.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum] Generating 800 augmentation graphs …
+Best Ethereum SimCLR checkpoint: best_model.pt  (loss=5.5758)
+Ethereum diffusion model loaded from C:\Users\lucsc\Thesis\grad\grad\igraph_version\checkpoints\diffusion_ethereum\model.pt  (max_nodes=100).
+MLP probe accuracy: 1.000
+  [validity] attempt 1: removed 19 disconnected node(s)
+  [validity] attempt 1 discarded: n_nodes 81 < 5th-pct (100), retrying...
+  [validity] attempt 3: removed 14 disconnected node(s)
+  [validity] attempt 3 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 28: removed 4 disconnected node(s)
+  [validity] attempt 28 discarded: n_nodes 96 < 5th-pct (100), retrying...
+  [validity] attempt 60: removed 18 disconnected node(s)
+  [validity] attempt 60 discarded: n_nodes 82 < 5th-pct (100), retrying...
+  [validity] attempt 72: removed 14 disconnected node(s)
+  [validity] attempt 72 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 118: removed 27 disconnected node(s)
+  [validity] attempt 118 discarded: n_nodes 73 < 5th-pct (100), retrying...
+  [validity] attempt 126: removed 19 disconnected node(s)
+  [validity] attempt 126 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 139: removed 11 disconnected node(s)
+  [validity] attempt 139 discarded: n_nodes 89 < 5th-pct (100), retrying...
+  [validity] attempt 141: removed 14 disconnected node(s)
+  [validity] attempt 141 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 146: removed 1 disconnected node(s)
+  [validity] attempt 146 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] 10/148 attempts discarded by structural checks (retried to reach 138)
+  [validity] attempt 1: removed 25 disconnected node(s)
+  [validity] attempt 1 discarded: density 0.039 > 2× target (0.013), retrying...
+  [validity] attempt 5: removed 4 disconnected node(s)
+  [validity] attempt 5 discarded: n_nodes 96 < 5th-pct (100), retrying...
+  [validity] attempt 67: removed 19 disconnected node(s)
+  [validity] attempt 67 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 73: removed 25 disconnected node(s)
+  [validity] attempt 73 discarded: n_nodes 75 < 5th-pct (100), retrying...
+  [validity] attempt 102: removed 30 disconnected node(s)
+  [validity] attempt 102 discarded: density 0.027 > 2× target (0.013), retrying...
+  [validity] attempt 128: removed 14 disconnected node(s)
+  [validity] attempt 128 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 139: removed 14 disconnected node(s)
+  [validity] attempt 139 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 143: removed 7 disconnected node(s)
+  [validity] attempt 143 discarded: n_nodes 93 < 5th-pct (100), retrying...
+  [validity] 8/146 attempts discarded by structural checks (retried to reach 138)
+Generated 276 augmentation graphs (phishing=138, clean=138)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=414 (clean=268, laund=146)  running 3 seeds …
+  seed 0: AUC=0.976  F1=0.827
+  seed 1: AUC=0.980  F1=0.815
+  seed 2: AUC=0.981  F1=0.824
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.979±0.002  0.822±0.005  0.829±0.016  0.816±0.017
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.005
+    f1           +0.012
+    precision    +0.013
+    recall       +0.011
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_800_diffusion.csv
+
+============================================================
+ n_gen=800  method=gan  ->  classifier_comparison_ethereum_ngen_800_gan.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / gan] Generating 400 phishing + 400 clean graphs …
+Generated 800 augmentation graphs (phishing=400, clean=400)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=938 (clean=530, laund=408)  running 3 seeds …
+  seed 0: AUC=0.956  F1=0.789
+  seed 1: AUC=0.970  F1=0.760
+  seed 2: AUC=0.970  F1=0.791
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.965±0.006  0.780±0.014  0.838±0.066  0.734±0.029
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.018
+    f1           -0.031
+    precision    +0.022
+    recall       -0.071
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_800_gan.csv
+
+============================================================
+ n_gen=800  method=graphsmote  ->  classifier_comparison_ethereum_ngen_800_graphsmote.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / graphsmote] Generating 400 phishing + 400 clean graphs …
+Generated 800 augmentation graphs (phishing=400, clean=400)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=938 (clean=530, laund=408)  running 3 seeds …
+  seed 0: AUC=0.973  F1=0.771
+  seed 1: AUC=0.965  F1=0.776
+  seed 2: AUC=0.960  F1=0.759
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.966±0.005  0.768±0.007  0.830±0.018  0.716±0.009
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.017
+    f1           -0.042
+    precision    +0.013
+    recall       -0.089
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_800_graphsmote.csv
+
+============================================================
+ n_gen=800  method=diga  ->  classifier_comparison_ethereum_ngen_800_diga.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / diga] Generating 400 phishing + 400 clean graphs …
+Generated 800 augmentation graphs (phishing=400, clean=400)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=938 (clean=530, laund=408)  running 3 seeds …
+  seed 0: AUC=0.963  F1=0.771
+  seed 1: AUC=0.957  F1=0.767
+  seed 2: AUC=0.973  F1=0.761
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.964±0.006  0.767±0.004  0.812±0.020  0.727±0.017
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.019
+    f1           -0.044
+    precision    -0.004
+    recall       -0.078
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_800_diga.csv
+
+============================================================
+ n_gen=1600  method=diffusion  ->  classifier_comparison_ethereum_ngen_1600_diffusion.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum] Generating 1600 augmentation graphs …
+Best Ethereum SimCLR checkpoint: best_model.pt  (loss=5.5758)
+Ethereum diffusion model loaded from C:\Users\lucsc\Thesis\grad\grad\igraph_version\checkpoints\diffusion_ethereum\model.pt  (max_nodes=100).
+MLP probe accuracy: 1.000
+  [validity] attempt 1: removed 16 disconnected node(s)
+  [validity] attempt 1 discarded: n_nodes 43 < 5th-pct (100), retrying...
+  [validity] attempt 3: removed 2 disconnected node(s)
+  [validity] attempt 3 discarded: n_nodes 98 < 5th-pct (100), retrying...
+  [validity] attempt 37: removed 33 disconnected node(s)
+  [validity] attempt 37 discarded: density 0.029 > 2× target (0.013), retrying...
+  [validity] attempt 58: removed 19 disconnected node(s)
+  [validity] attempt 58 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 98: removed 14 disconnected node(s)
+  [validity] attempt 98 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 120: removed 1 disconnected node(s)
+  [validity] attempt 120 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] attempt 139: removed 14 disconnected node(s)
+  [validity] attempt 139 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 141: removed 7 disconnected node(s)
+  [validity] attempt 141 discarded: n_nodes 93 < 5th-pct (100), retrying...
+  [validity] 8/146 attempts discarded by structural checks (retried to reach 138)
+  [validity] attempt 3: removed 14 disconnected node(s)
+  [validity] attempt 3 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 7: removed 1 disconnected node(s)
+  [validity] attempt 7 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] attempt 8: removed 13 disconnected node(s)
+  [validity] attempt 8 discarded: n_nodes 87 < 5th-pct (100), retrying...
+  [validity] attempt 96: removed 19 disconnected node(s)
+  [validity] attempt 96 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 113: removed 13 disconnected node(s)
+  [validity] attempt 113 discarded: n_nodes 87 < 5th-pct (100), retrying...
+  [validity] attempt 125: removed 21 disconnected node(s)
+  [validity] attempt 125 discarded: n_nodes 79 < 5th-pct (100), retrying...
+  [validity] attempt 135: removed 14 disconnected node(s)
+  [validity] attempt 135 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 141: removed 14 disconnected node(s)
+  [validity] attempt 141 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 143: removed 1 disconnected node(s)
+  [validity] attempt 143 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] attempt 146: removed 12 disconnected node(s)
+  [validity] attempt 146 discarded: n_nodes 88 < 5th-pct (100), retrying...
+  [validity] 10/148 attempts discarded by structural checks (retried to reach 138)
+Generated 276 augmentation graphs (phishing=138, clean=138)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=414 (clean=268, laund=146)  running 3 seeds …
+  seed 0: AUC=0.970  F1=0.823
+  seed 1: AUC=0.980  F1=0.830
+  seed 2: AUC=0.988  F1=0.827
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.979±0.007  0.827±0.003  0.846±0.027  0.810±0.019
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.004
+    f1           +0.016
+    precision    +0.030
+    recall       +0.005
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_1600_diffusion.csv
+
+============================================================
+ n_gen=1600  method=gan  ->  classifier_comparison_ethereum_ngen_1600_gan.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / gan] Generating 800 phishing + 800 clean graphs …
+Generated 1600 augmentation graphs (phishing=800, clean=800)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=1738 (clean=930, laund=808)  running 3 seeds …
+  seed 0: AUC=0.958  F1=0.786
+  seed 1: AUC=0.930  F1=0.761
+  seed 2: AUC=0.963  F1=0.759
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.951±0.014  0.768±0.012  0.858±0.017  0.696±0.011
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.033
+    f1           -0.042
+    precision    +0.042
+    recall       -0.109
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_1600_gan.csv
+
+============================================================
+ n_gen=1600  method=graphsmote  ->  classifier_comparison_ethereum_ngen_1600_graphsmote.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / graphsmote] Generating 800 phishing + 800 clean graphs …
+Generated 1600 augmentation graphs (phishing=800, clean=800)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=1738 (clean=930, laund=808)  running 3 seeds …
+  seed 0: AUC=0.967  F1=0.732
+  seed 1: AUC=0.956  F1=0.769
+  seed 2: AUC=0.964  F1=0.780
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.962±0.005  0.760±0.020  0.794±0.048  0.731±0.004
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.021
+    f1           -0.050
+    precision    -0.022
+    recall       -0.074
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_1600_graphsmote.csv
+
+============================================================
+ n_gen=1600  method=diga  ->  classifier_comparison_ethereum_ngen_1600_diga.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / diga] Generating 800 phishing + 800 clean graphs …
+Generated 1600 augmentation graphs (phishing=800, clean=800)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=1738 (clean=930, laund=808)  running 3 seeds …
+  seed 0: AUC=0.960  F1=0.751
+  seed 1: AUC=0.963  F1=0.742
+  seed 2: AUC=0.954  F1=0.724
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.959±0.004  0.739±0.011  0.792±0.022  0.694±0.036
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.025
+    f1           -0.072
+    precision    -0.024
+    recall       -0.111
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_1600_diga.csv
+
+============================================================
+ n_gen=3200  method=diffusion  ->  classifier_comparison_ethereum_ngen_3200_diffusion.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum] Generating 3200 augmentation graphs …
+Best Ethereum SimCLR checkpoint: best_model.pt  (loss=5.5758)
+Ethereum diffusion model loaded from C:\Users\lucsc\Thesis\grad\grad\igraph_version\checkpoints\diffusion_ethereum\model.pt  (max_nodes=100).
+MLP probe accuracy: 1.000
+  [validity] attempt 2: removed 13 disconnected node(s)
+  [validity] attempt 2 discarded: n_nodes 87 < 5th-pct (100), retrying...
+  [validity] attempt 8: removed 21 disconnected node(s)
+  [validity] attempt 8 discarded: density 0.031 > 2× target (0.013), retrying...
+  [validity] attempt 59: removed 19 disconnected node(s)
+  [validity] attempt 59 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 83: removed 13 disconnected node(s)
+  [validity] attempt 83 discarded: n_nodes 87 < 5th-pct (100), retrying...
+  [validity] attempt 123: removed 14 disconnected node(s)
+  [validity] attempt 123 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 125: removed 4 disconnected node(s)
+  [validity] attempt 125 discarded: n_nodes 96 < 5th-pct (100), retrying...
+  [validity] attempt 140: removed 30 disconnected node(s)
+  [validity] attempt 140 discarded: density 0.027 > 2× target (0.013), retrying...
+  [validity] 7/145 attempts discarded by structural checks (retried to reach 138)
+  [validity] attempt 2: removed 14 disconnected node(s)
+  [validity] attempt 2 discarded: n_nodes 45 < 5th-pct (100), retrying...
+  [validity] attempt 3: removed 29 disconnected node(s)
+  [validity] attempt 3 discarded: n_nodes 71 < 5th-pct (100), retrying...
+  [validity] attempt 7: removed 1 disconnected node(s)
+  [validity] attempt 7 discarded: n_nodes 99 < 5th-pct (100), retrying...
+  [validity] attempt 10: removed 16 disconnected node(s)
+  [validity] attempt 10 discarded: n_nodes 84 < 5th-pct (100), retrying...
+  [validity] attempt 74: removed 19 disconnected node(s)
+  [validity] attempt 74 discarded: density 0.043 > 2× target (0.013), retrying...
+  [validity] attempt 75: removed 14 disconnected node(s)
+  [validity] attempt 75 discarded: density 0.200 > 2× target (0.013), retrying...
+  [validity] attempt 124: removed 4 disconnected node(s)
+  [validity] attempt 124 discarded: n_nodes 96 < 5th-pct (100), retrying...
+  [validity] attempt 140: removed 19 disconnected node(s)
+  [validity] attempt 140 discarded: density 0.028 > 2× target (0.013), retrying...
+  [validity] attempt 141: removed 30 disconnected node(s)
+  [validity] attempt 141 discarded: density 0.027 > 2× target (0.013), retrying...
+  [validity] attempt 145: removed 2 disconnected node(s)
+  [validity] attempt 145 discarded: n_nodes 98 < 5th-pct (100), retrying...
+  [validity] attempt 148: removed 41 disconnected node(s)
+  [validity] attempt 148 discarded: density 0.037 > 2× target (0.013), retrying...
+  [validity] 11/149 attempts discarded by structural checks (retried to reach 138)
+Generated 276 augmentation graphs (phishing=138, clean=138)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=414 (clean=268, laund=146)  running 3 seeds …
+  seed 0: AUC=0.966  F1=0.822
+  seed 1: AUC=0.976  F1=0.800
+  seed 2: AUC=0.974  F1=0.814
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.972±0.004  0.812±0.009  0.825±0.020  0.802±0.033
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.012
+    f1           +0.002
+    precision    +0.008
+    recall       -0.003
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_3200_diffusion.csv
+
+============================================================
+ n_gen=3200  method=gan  ->  classifier_comparison_ethereum_ngen_3200_gan.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / gan] Generating 1600 phishing + 1600 clean graphs …
+Generated 3200 augmentation graphs (phishing=1600, clean=1600)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=3338 (clean=1730, laund=1608)  running 3 seeds …
+  seed 0: AUC=0.953  F1=0.763
+  seed 1: AUC=0.948  F1=0.776
+  seed 2: AUC=0.970  F1=0.744
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.957±0.009  0.761±0.013  0.853±0.027  0.688±0.032
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.026
+    f1           -0.049
+    precision    +0.037
+    recall       -0.117
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_3200_gan.csv
+
+============================================================
+ n_gen=3200  method=graphsmote  ->  classifier_comparison_ethereum_ngen_3200_graphsmote.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / graphsmote] Generating 1600 phishing + 1600 clean graphs …
+Generated 3200 augmentation graphs (phishing=1600, clean=1600)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=3338 (clean=1730, laund=1608)  running 3 seeds …
+  seed 0: AUC=0.962  F1=0.748
+  seed 1: AUC=0.951  F1=0.751
+  seed 2: AUC=0.973  F1=0.757
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.962±0.009  0.752±0.004  0.782±0.030  0.727±0.034
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.021
+    f1           -0.059
+    precision    -0.034
+    recall       -0.078
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_3200_graphsmote.csv
+
+============================================================
+ n_gen=3200  method=diga  ->  classifier_comparison_ethereum_ngen_3200_diga.csv
+============================================================
+Device: cpu
+
+Loading Ethereum graphs from cache: ethereum_graphs_cache.pt …
+  19907 graphs loaded (1164 phishing, 18743 clean)
+
+Total PyG graphs: 19907  (1164 illicit/laundering, 18743 clean)
+Removed top-100 highest-degree anchor nodes: 19907 -> 19807 graphs
+
+Temporal split: 13864 train | 1981 val | 3962 test
+  train positive rate: 5.5%  test positive rate: 5.5%
+Low-data mode: keeping 138 / 13864 training graphs (1%)
+
+[Ethereum / diga] Generating 1600 phishing + 1600 clean graphs …
+Generated 3200 augmentation graphs (phishing=1600, clean=1600)
+
+[FraudGT / baseline]  train=138 (clean=130, laund=8)  running 3 seeds …
+  seed 0: AUC=0.985  F1=0.794
+  seed 1: AUC=0.981  F1=0.805
+  seed 2: AUC=0.985  F1=0.832
+[FraudGT / augmented]  train=3338 (clean=1730, laund=1608)  running 3 seeds …
+  seed 0: AUC=0.966  F1=0.774
+  seed 1: AUC=0.963  F1=0.755
+  seed 2: AUC=0.957  F1=0.756
+[ExSTraQt] skipped — no training network data was prepared
+
+────────────────────────────────────────────────────────────────────────────────────────────
+RESULTS  (mean ± std over 3 seeds, held-out test set)
+────────────────────────────────────────────────────────────────────────────────────────────
+Model / Condition                  AUC-ROC            F1     Precision        Recall
+────────────────────────────────────────────────────────────────────────────────────────────
+FraudGT [baseline]            0.984±0.002  0.810±0.016  0.816±0.014  0.805±0.021
+FraudGT [augmented]           0.962±0.004  0.762±0.009  0.823±0.029  0.711±0.029
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Augmentation delta (augmented − baseline):
+  FraudGT:
+    auc          -0.021
+    f1           -0.048
+    precision    +0.007
+    recall       -0.094
+Saved → C:\Users\lucsc\Thesis\grad\grad\igraph_version\results\classifier_comparison_ethereum_ld1_ngen_3200_diga.csv
+  WARNING: classifier_comparison_ethereum_ngen_100_diffusion.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_100_gan.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_100_graphsmote.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_100_diga.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_200_diffusion.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_200_gan.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_200_graphsmote.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_200_diga.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_400_diffusion.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_400_gan.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_400_graphsmote.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_400_diga.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_800_diffusion.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_800_gan.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_800_graphsmote.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_800_diga.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_1600_diffusion.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_1600_gan.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_1600_graphsmote.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_1600_diga.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_3200_diffusion.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_3200_gan.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_3200_graphsmote.csv not found -- skipped
+  WARNING: classifier_comparison_ethereum_ngen_3200_diga.csv not found -- skipped
+No results to display.
