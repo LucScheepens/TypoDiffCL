@@ -1214,6 +1214,21 @@ def main():
     parser.add_argument("--elliptic-depth", type=int, default=4,
                         help="BFS hop depth for Elliptic subgraph extraction (default 4). "
                              "Higher values produce larger ego-subgraphs; try 2-6.")
+    parser.add_argument("--n-runs", type=int, default=None,
+                        help="Override the number of seeds (default 3). "
+                             "Use 1 for quick sensitivity sweeps.")
+    parser.add_argument("--augment-method",
+                        choices=["diffusion", "gan", "graphsmote", "diga"],
+                        default="diffusion",
+                        help="Augmentation method when --augment is used. "
+                             "'diffusion': guided DDPM (default, TypoDiffCL). "
+                             "'gan': WGAN-GP in mean-pooled feature space. "
+                             "'graphsmote': k-NN interpolation in feature space. "
+                             "'diga': unconditional DDPM in feature space.")
+    parser.add_argument("--remove-top-degree", type=int, default=0, metavar="N",
+                        help="Remove the N test ego-subgraphs whose anchor node has "
+                             "the highest degree in the local subgraph. Use to evaluate "
+                             "on non-hub nodes only (default: 0 = no filtering).")
     # ── Direction 3: embedding separation diagnostic ──────────────────────────
     parser.add_argument("--sep-check", action="store_true",
                         help="After loading the SimCLR encoder, compute and print silhouette "
@@ -1254,6 +1269,10 @@ def main():
         args.augment = True
     if args.tune_guidance:
         args.augment = True   # tuning implies we'll generate augmentation data
+
+    # Override global N_RUNS if --n-runs is specified
+    if args.n_runs is not None:
+        globals()['N_RUNS'] = args.n_runs
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
@@ -1390,6 +1409,25 @@ def main():
     n_laund = int(all_labels_np.sum())
     print(f"\nTotal PyG graphs: {len(all_data)}  "
           f"({n_laund} illicit/laundering, {len(all_data) - n_laund} clean)")
+
+    # ── Remove top-degree anchor nodes from the full dataset ─────────────────
+    # Applied before the train/val/test split so those nodes appear in no split,
+    # approximating "remove hub nodes before subgraph extraction".
+    if args.remove_top_degree > 0 and all_data:
+        def _anchor_degree(d):
+            if not hasattr(d, "anchor_local_idx"):
+                return 0
+            idx = d.anchor_local_idx.item()
+            ei  = d.edge_index
+            return int((ei[0] == idx).sum() + (ei[1] == idx).sum())
+        _deg_order = sorted(range(len(all_data)),
+                            key=lambda i: _anchor_degree(all_data[i]), reverse=True)
+        _remove    = set(_deg_order[:args.remove_top_degree])
+        _before    = len(all_data)
+        all_data   = [g for i, g in enumerate(all_data) if i not in _remove]
+        all_labels_np = np.array([d.y.item() for d in all_data])
+        print(f"Removed top-{args.remove_top_degree} highest-degree anchor nodes: "
+              f"{_before} -> {len(all_data)} graphs\n")
 
     if len(all_data) == 0:
         raise RuntimeError(
@@ -1674,70 +1712,109 @@ def main():
 
         elif args.dataset == "ethereum":
             # ── Ethereum augmentation path ────────────────────────────────
-            print(f"[Ethereum] Generating {args.n_gen} augmentation graphs …")
-            from generation.generation import (
-                load_simclr_encoder_ethereum,
-                load_diffusion_model_ethereum,
-                encode_all_pyg_graphs,
-                train_mlp_probe,
-                run_guided_generation_elliptic,   # compatible: same 5-dim node features
-            )
-            if args.encoder_dir is not None:
-                from simclr import GraphEncoder as _GE_eth
-                _ckpt_dir_eth = Path(args.encoder_dir)
-                _cands_eth    = list(_ckpt_dir_eth.glob("*.pt"))
-                _best_eth, _best_eth_loss = None, float("inf")
-                for _p in _cands_eth:
-                    try:
-                        _c = torch.load(_p, map_location="cpu", weights_only=False)
-                        if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _best_eth_loss:
-                            _best_eth_loss, _best_eth = _c["loss"], _p
-                    except Exception:
-                        pass
-                if _best_eth is None:
-                    raise FileNotFoundError(f"No valid checkpoint in {args.encoder_dir}")
-                print(f"Ablation encoder: {_best_eth.name}  (loss={_best_eth_loss:.4f})")
-                _ckpt_eth = torch.load(_best_eth, map_location=device, weights_only=False)
-                encoder_eth = _GE_eth(in_dim=5, hidden_dim=64, out_dim=128).to(device)
-                encoder_eth.load_state_dict(_ckpt_eth["encoder_state_dict"])
-                encoder_eth.eval()
+            if args.augment_method in ("gan", "graphsmote", "diga"):
+                # ── Baseline feature-space augmenters (50/50 per class) ───
+                if args.augment_method == "graphsmote":
+                    from experiments.graphsmote_augmentation import GraphSMOTEAugmenter
+                    _AugClass = GraphSMOTEAugmenter
+                    _aug_kwargs = {"k": 5, "random_state": 42}
+                elif args.augment_method == "gan":
+                    from experiments.gan_augmentation import GraphGANAugmenter
+                    _AugClass = GraphGANAugmenter
+                    _aug_kwargs = {"latent_dim": 32, "epochs": 200, "random_state": 42}
+                else:
+                    from experiments.diga_augmentation import DiGaAugmenter
+                    _AugClass = DiGaAugmenter
+                    _aug_kwargs = {"epochs": 300, "random_state": 42}
+
+                _n_each = args.n_gen // 2
+
+                def _gen_class(graphs_for_class, out_label):
+                    # Augmenters filter and produce y=1 — temporarily relabel
+                    # so clean graphs (y=0) are accepted, then fix output label.
+                    _tmp = [Data(x=g.x, edge_index=g.edge_index,
+                                 y=torch.tensor([1], dtype=torch.long),
+                                 timestamp_val=-1.0)
+                            for g in graphs_for_class]
+                    _synth = _AugClass(**_aug_kwargs).fit_generate(_tmp, n=_n_each)
+                    if out_label == 0:
+                        for _g in _synth:
+                            _g.y = torch.tensor([0], dtype=torch.long)
+                    return _synth
+
+                _train_phishing = [g for g in data_train if g.y.item() == 1]
+                _train_clean    = [g for g in data_train if g.y.item() == 0]
+                print(f"[Ethereum / {args.augment_method}] Generating "
+                      f"{_n_each} phishing + {_n_each} clean graphs …")
+                gen_data = _gen_class(_train_phishing, 1) + _gen_class(_train_clean, 0)
+                print(f"Generated {len(gen_data)} augmentation graphs "
+                      f"(phishing={_n_each}, clean={_n_each})\n")
             else:
-                encoder_eth = load_simclr_encoder_ethereum(device)
-
-            diff_model_eth, diffusion_eth, x_mean_eth, x_std_eth, _max_n_eth = \
-                load_diffusion_model_ethereum(device)
-
-            H_all_eth, y_all_eth = encode_all_pyg_graphs(data_train, encoder_eth, device)
-            probe_eth = train_mlp_probe(H_all_eth, y_all_eth, device)
-
-            _eth_t_start = args.t_start if args.t_start is not None else 150
-            _eth_gs = args.guidance_scale
-            _eth_nw = args.novelty_weight
-            _eth_dp = args.degree_penalty
-
-            _gen_kwargs_eth = dict(n_gen=args.n_gen // 2, t_start=_eth_t_start)
-            if _eth_gs is not None: _gen_kwargs_eth["guidance_scale"] = _eth_gs
-            if _eth_nw is not None: _gen_kwargs_eth["novelty_weight"] = _eth_nw
-            if _eth_dp is not None: _gen_kwargs_eth["degree_penalty"] = _eth_dp
-
-            _gen_raw_eth = []
-            for _lbl in (1, 0):
-                _outs, _, _ = run_guided_generation_elliptic(
-                    data_train, encoder_eth, probe_eth,
-                    diff_model_eth, diffusion_eth,
-                    x_mean_eth, x_std_eth, H_all_eth, device,
-                    target_label=_lbl,
-                    dataset_name="Ethereum",
-                    **_gen_kwargs_eth,
+                # ── TypoDiffCL diffusion path ─────────────────────────────────
+                print(f"[Ethereum] Generating {args.n_gen} augmentation graphs …")
+                from generation.generation import (
+                    load_simclr_encoder_ethereum,
+                    load_diffusion_model_ethereum,
+                    encode_all_pyg_graphs,
+                    train_mlp_probe,
+                    run_guided_generation_elliptic,   # compatible: same 5-dim node features
                 )
-                _gen_raw_eth.extend(_outs)
+                if args.encoder_dir is not None:
+                    from simclr import GraphEncoder as _GE_eth
+                    _ckpt_dir_eth = Path(args.encoder_dir)
+                    _cands_eth    = list(_ckpt_dir_eth.glob("*.pt"))
+                    _best_eth, _best_eth_loss = None, float("inf")
+                    for _p in _cands_eth:
+                        try:
+                            _c = torch.load(_p, map_location="cpu", weights_only=False)
+                            if isinstance(_c, dict) and "loss" in _c and _c["loss"] < _best_eth_loss:
+                                _best_eth_loss, _best_eth = _c["loss"], _p
+                        except Exception:
+                            pass
+                    if _best_eth is None:
+                        raise FileNotFoundError(f"No valid checkpoint in {args.encoder_dir}")
+                    print(f"Ablation encoder: {_best_eth.name}  (loss={_best_eth_loss:.4f})")
+                    _ckpt_eth = torch.load(_best_eth, map_location=device, weights_only=False)
+                    encoder_eth = _GE_eth(in_dim=5, hidden_dim=64, out_dim=128).to(device)
+                    encoder_eth.load_state_dict(_ckpt_eth["encoder_state_dict"])
+                    encoder_eth.eval()
+                else:
+                    encoder_eth = load_simclr_encoder_ethereum(device)
 
-            for (x_denorm, adj_out, n_out, label) in _gen_raw_eth:
-                gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
+                diff_model_eth, diffusion_eth, x_mean_eth, x_std_eth, _max_n_eth = \
+                    load_diffusion_model_ethereum(device)
 
-            n_ph_gen = sum(d.y.item() == 1 for d in gen_data)
-            print(f"Generated {len(gen_data)} augmentation graphs "
-                  f"(phishing={n_ph_gen}, clean={len(gen_data) - n_ph_gen})\n")
+                H_all_eth, y_all_eth = encode_all_pyg_graphs(data_train, encoder_eth, device)
+                probe_eth = train_mlp_probe(H_all_eth, y_all_eth, device)
+
+                _eth_t_start = args.t_start if args.t_start is not None else 150
+                _eth_gs = args.guidance_scale
+                _eth_nw = args.novelty_weight
+                _eth_dp = args.degree_penalty
+
+                _gen_kwargs_eth = dict(n_gen=args.n_gen // 2, t_start=_eth_t_start)
+                if _eth_gs is not None: _gen_kwargs_eth["guidance_scale"] = _eth_gs
+                if _eth_nw is not None: _gen_kwargs_eth["novelty_weight"] = _eth_nw
+                if _eth_dp is not None: _gen_kwargs_eth["degree_penalty"] = _eth_dp
+
+                _gen_raw_eth = []
+                for _lbl in (1, 0):
+                    _outs, _, _ = run_guided_generation_elliptic(
+                        data_train, encoder_eth, probe_eth,
+                        diff_model_eth, diffusion_eth,
+                        x_mean_eth, x_std_eth, H_all_eth, device,
+                        target_label=_lbl,
+                        dataset_name="Ethereum",
+                        **_gen_kwargs_eth,
+                    )
+                    _gen_raw_eth.extend(_outs)
+
+                for (x_denorm, adj_out, n_out, label) in _gen_raw_eth:
+                    gen_data.append(gen_output_to_pyg(x_denorm, adj_out, n_out, label))
+
+                n_ph_gen = sum(d.y.item() == 1 for d in gen_data)
+                print(f"Generated {len(gen_data)} augmentation graphs "
+                      f"(phishing={n_ph_gen}, clean={len(gen_data) - n_ph_gen})\n")
 
         elif not networks:
             # ── IBM networks missing ──────────────────────────────────────

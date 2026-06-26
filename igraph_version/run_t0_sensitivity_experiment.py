@@ -25,7 +25,7 @@ Usage
   python run_t0_sensitivity_experiment.py
 
 Results are written to:
-  results/classifier_comparison_elliptic_t0_<T>.csv
+  results/classifier_comparison_ethereum_t0_<T>.csv
 A summary table is printed and saved to:
   results/t0_sensitivity_summary.csv
 """
@@ -42,23 +42,25 @@ SCRIPT   = Path(__file__).resolve().parent / "generation" / "evaluate_classifier
 RESULTS  = Path(__file__).resolve().parent / "results"
 T0_VALUES = [50, 100, 150, 200, 250]   # t_start values to sweep
 N_GEN     = 40                          # generated graphs per run (keep small for speed)
-MODELS    = None                        # None = all classifiers
+MODELS    = ["GIN", "DeepSets"]         # Subset for speed
+N_RUNS    = 1                           # 1 seed (sufficient for sensitivity trend)
 
 
 def run_t0(t0: int) -> Path:
     label  = f"t0_{t0}"
-    outcsv = RESULTS / f"classifier_comparison_elliptic_{label}.csv"
+    outcsv = RESULTS / f"classifier_comparison_ethereum_{label}.csv"
     if outcsv.exists():
         print(f"\n[t0={t0}] Cache found — skipping run ({outcsv.name})")
         return outcsv
 
     cmd = [
-        sys.executable, str(SCRIPT),
-        "--dataset",        "elliptic",
+        sys.executable, "-u", str(SCRIPT),
+        "--dataset",        "ethereum",
         "--augment",
         "--t-start",        str(t0),
         "--n-gen",          str(N_GEN),
         "--ablation-label", label,
+        "--n-runs",         str(N_RUNS),
     ]
     if MODELS:
         cmd += ["--models"] + MODELS
@@ -85,7 +87,7 @@ def build_summary(t0_values: list[int]) -> list[dict]:
     summary = []
     for t0 in t0_values:
         label  = f"t0_{t0}"
-        outcsv = RESULTS / f"classifier_comparison_elliptic_{label}.csv"
+        outcsv = RESULTS / f"classifier_comparison_ethereum_{label}.csv"
         if not outcsv.exists():
             print(f"  WARNING: {outcsv.name} not found — t0={t0} skipped")
             continue

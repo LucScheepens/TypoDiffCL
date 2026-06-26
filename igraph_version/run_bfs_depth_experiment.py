@@ -33,7 +33,8 @@ os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 SCRIPT   = Path(__file__).resolve().parent / "generation" / "evaluate_classifiers.py"
 RESULTS  = Path(__file__).resolve().parent / "results"
 DEPTHS   = [2, 3, 4, 6]          # BFS hop depths to test
-MODELS   = None                   # None = all classifiers; or e.g. ["GIN", "DeepSets"]
+MODELS   = ["GIN", "DeepSets"]   # Subset for speed; covers GNN and feature-only baselines
+N_RUNS   = 1                      # 1 seed per depth (sufficient for sensitivity trend)
 
 
 def run_depth(depth: int) -> Path:
@@ -44,10 +45,11 @@ def run_depth(depth: int) -> Path:
         return outcsv
 
     cmd = [
-        sys.executable, str(SCRIPT),
+        sys.executable, "-u", str(SCRIPT),
         "--dataset",        "elliptic",
         "--elliptic-depth", str(depth),
         "--ablation-label", label,
+        "--n-runs",         str(N_RUNS),
     ]
     if MODELS:
         cmd += ["--models"] + MODELS
