@@ -653,7 +653,7 @@ def plot_curves(records: list[dict], conditions: list[str], out_path: Path,
         ax.set_title(f"{ylabel} vs. label fraction", fontsize=11)
         ax.set_xlim(0, 105)
         ax.set_xticks([5, 10, 25, 50, 100])
-        ax.set_xticklabels(["5%", "10%", "25%", "50%", "100%"])
+        ax.set_xticklabels(["5", "10", "25%", "50%", "100%"])
         ax.legend(fontsize=9)
         ax.grid(True, linestyle="--", alpha=0.4)
 

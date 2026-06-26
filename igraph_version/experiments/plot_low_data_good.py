@@ -61,7 +61,7 @@ for metric, ax, ylabel in [("auc", axes[0], "AUC-ROC"), ("f1", axes[1], "F1 Scor
     ax.legend(fontsize=13)
     ax.set_xlim(0, 105)
     ax.set_xticks([5, 10, 25, 50, 100])
-    ax.set_xticklabels(["5%", "10%", "25%", "50%", "100%"])
+    ax.set_xticklabels(["5", "10", "25%", "50%", "100%"])
     ax.grid(True, linestyle="--", alpha=0.4)
 
 fig.suptitle("Low-Data Regime: Augmentation Recovery Curves", fontsize=12, y=1.01)
