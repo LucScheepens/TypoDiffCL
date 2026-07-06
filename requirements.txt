@@ -7,3 +7,9 @@ torch==1.12.1+cu113
 dgl-cu113==0.8.1
 igraph==0.9.8
 torchvision
+torch_geometric
+matplotlib
+tqdm
+xgboost
+optuna
+umap-learn
