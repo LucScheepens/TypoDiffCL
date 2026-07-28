@@ -124,7 +124,8 @@ python _run_gallery.py                                 # rebuild generated_galle
 
 # Hyperparameters
 
-## Fixed hyperparameters shared across all IBM AML experiments
+## Fixed hyperparameters
+Shared across all IBM AML experiments.
 
 | Component | Setting |
 |-----------|---------|
@@ -137,7 +138,8 @@ python _run_gallery.py                                 # rebuild generated_galle
 | Early stopping criterion | Validation F1 |
 | Random seeds | 3 |
 
-## Per-dataset tuned hyperparameters via Bayesian optimization (20 trials)
+## Optimized hyperparameters
+Tuned for each dataset, via Bayesian optimization (20 trials).
 
 | Dataset | Hidden Dimensions | Layers | Dropout | Learning Rate | Weight Decay | Batch Size | Epochs | AUC |
 |---------|-------------------|--------|---------|---------------|--------------|------------|--------|----|
