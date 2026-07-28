@@ -117,8 +117,33 @@ single evaluation conditions directly.
 
 ```bash
 python visualize_augmentations.py --out figures        # illustrate the 4 SimCLR structural augmentations
-python viz_real_generated.py --out figures_real         # real vs. augmented vs. diffusion-generated subgraphs
-python _run_pipeline.py                                 # rebuild generation_pipeline.png from cache only
-python _run_gallery.py                                  # rebuild generated_gallery.png from cache only
+python viz_real_generated.py --out figures_real        # real vs. augmented vs. diffusion-generated subgraphs
+python _run_pipeline.py                                # rebuild generation_pipeline.png from cache only
+python _run_gallery.py                                 # rebuild generated_gallery.png from cache only
 ```
 
+# Hyperparameters
+
+## Fixed hyperparameters shared across all IBM AML experiments {#hp-fixed}
+
+| Component | Setting |
+|-----------|---------|
+| Encoder output dimension | 128 |
+| Projection head dimension | 64 |
+| Diffusion steps (T) | 500 |
+| DDIM sampling start step | t₀ = 150 |
+| Optimizer | Adam |
+| Learning-rate schedule | Cosine annealing |
+| Early stopping criterion | Validation F1 |
+| Random seeds | 3 |
+
+## Per-dataset tuned hyperparameters via Bayesian optimization (20 trials) {#hp-optimized}
+
+| Dataset | Hidden Dimensions | Layers | Dropout | Learning Rate | Weight Decay | Batch Size | Epochs | AUC |
+|---------|-------------------|--------|---------|---------------|--------------|------------|--------|----|
+| HI-Small | 256               | 3      | 0.35    | 3.3×10⁻³      | 5.2×10⁻⁵     | 256        | 22     | 0.954 |
+| HI-Medium | 64                | 3      | 0.12    | 1.6×10⁻³      | 2.2×10⁻⁵     | 256        | 26     | 0.980 |
+| HI-Large | 128               | 2      | 0.23    | 2.3×10⁻⁴      | 3.8×10⁻⁴     | 128        | 17     | 0.996 |
+| LI-Small | 64                | 3      | 0.24    | 3.4×10⁻³      | 2.3×10⁻⁴     | 256        | 27     | 0.949 |
+| LI-Medium | 128               | 4      | 0.23    | 1.5×10⁻³      | 3.6×10⁻⁵     | 256        | 23     | 0.978 |
+| LI-Large | 32                | 3      | 0.39    | 6.3×10⁻³      | 3.0×10⁻⁵     | 64         | 15     | 0.994 |
